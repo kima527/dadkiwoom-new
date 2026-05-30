@@ -1,0 +1,17 @@
+# Environments
+.env
+.env.example
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data files
+my_pick.xlsx
+
+# IDEs and editors
+.vscode/
+.idea/
+.gemini/
