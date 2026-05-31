@@ -21,17 +21,68 @@ def calculate_wma(prices, period):
             wma.append(None)
     return wma
 
-def calculate_indicators_pure(candles, use_compressed_peak=True):
+def calculate_ema(prices, period):
+    """
+    Calculates Exponential Moving Average (지수이동평균).
+    Handles None values in input for chained EMA calculations (e.g., EMA of EMA).
+    First valid EMA value is seeded with SMA of the first 'period' non-None values.
+    """
+    n = len(prices)
+    ema = [None] * n
+    k = 2.0 / (period + 1)
+
+    # Find the first index where we have 'period' consecutive non-None values
+    seed_start = None
+    for i in range(n - period + 1):
+        window = prices[i:i + period]
+        if all(v is not None for v in window):
+            seed_start = i
+            break
+
+    if seed_start is None:
+        return ema  # Not enough data
+
+    # Seed EMA with SMA of the first valid window
+    seed_end = seed_start + period - 1
+    ema[seed_end] = sum(prices[seed_start:seed_end + 1]) / float(period)
+
+    # Calculate remaining EMA values
+    for i in range(seed_end + 1, n):
+        if prices[i] is not None and ema[i - 1] is not None:
+            ema[i] = prices[i] * k + ema[i - 1] * (1 - k)
+
+    return ema
+
+def calculate_tema(prices, period):
+    """
+    Calculates Triple Exponential Moving Average (TEMA / 삼중지수이동평균).
+    TEMA = 3*EMA1 - 3*EMA2 + EMA3
+    where EMA1 = EMA(close, period), EMA2 = EMA(EMA1, period), EMA3 = EMA(EMA2, period)
+    """
+    ema1 = calculate_ema(prices, period)
+    ema2 = calculate_ema(ema1, period)
+    ema3 = calculate_ema(ema2, period)
+
+    tema = []
+    for i in range(len(prices)):
+        if ema1[i] is not None and ema2[i] is not None and ema3[i] is not None:
+            tema.append(3.0 * ema1[i] - 3.0 * ema2[i] + ema3[i])
+        else:
+            tema.append(None)
+    return tema
+
+def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5, tema_period2=20):
     """
     Calculates technical indicators for a list of candle dictionaries in-place.
     Each candle should have 'close' (float).
     
     Adds fields:
       - sma5, sma20, sma60
-      - K
-      - L
+      - K, L
       - wma5, wma20
       - signal_buy_prep, signal_buy, signal_sell
+      - tema1, tema2, tema_gate_line, disparity_pct
+      - signal_buy_prep_tema, signal_buy_tema
     """
     n = len(candles)
     if n == 0:
@@ -112,7 +163,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True):
         candles[i]['wma5'] = wma5[i]
         candles[i]['wma20'] = wma20[i]
 
-    # 5. Signals
+    # 5. Signals (existing K/L-based)
     for i in range(n):
         c = candles[i]
         c_prev = candles[i-1] if i > 0 else None
@@ -134,11 +185,64 @@ def calculate_indicators_pure(candles, use_compressed_peak=True):
             c['signal_sell'] = (c['wma5'] < c['wma20']) and (c_prev['wma5'] >= c_prev['wma20'])
         else:
             c['signal_sell'] = False
+
+    # 6. TEMA Gate Line (테마급등관문선)
+    # TEMA1 = TEMA(close, 기간1), TEMA2 = TEMA(close, 기간2)
+    # 조건 = CrossUp(TEMA1, TEMA2)
+    # 관문선 = ValueWhen(1, 조건, TEMA1)
+    tema1 = calculate_tema(closes, tema_period1)
+    tema2 = calculate_tema(closes, tema_period2)
+
+    gate_line_val = None
+    for i in range(n):
+        candles[i]['tema1'] = tema1[i]
+        candles[i]['tema2'] = tema2[i]
+
+        # CrossUp: TEMA1이 TEMA2를 상향돌파하는 순간
+        if (i > 0
+                and tema1[i] is not None and tema2[i] is not None
+                and tema1[i-1] is not None and tema2[i-1] is not None):
+            if tema1[i-1] < tema2[i-1] and tema1[i] >= tema2[i]:
+                gate_line_val = tema1[i]  # ValueWhen(1, 조건, TEMA1)
+
+        candles[i]['tema_gate_line'] = gate_line_val
+
+        # Disparity: 현재가와 관문선의 이격도 (%)
+        if gate_line_val is not None and gate_line_val > 0:
+            candles[i]['disparity_pct'] = abs(candles[i]['close'] - gate_line_val) / gate_line_val * 100.0
+        else:
+            candles[i]['disparity_pct'] = None
+
+    # 7. TEMA Gate Line Signals (관문선 기반 매매 시그널)
+    for i in range(n):
+        c = candles[i]
+        c_prev = candles[i-1] if i > 0 else None
+
+        # Buy Prep (TEMA): 현재가가 관문선 1% 이내 밑에 도달
+        if c['tema_gate_line'] is not None:
+            c['signal_buy_prep_tema'] = (
+                c['close'] >= c['tema_gate_line'] * 0.99
+                and c['close'] < c['tema_gate_line']
+            )
+        else:
+            c['signal_buy_prep_tema'] = False
+
+        # Buy (TEMA): 현재가가 관문선을 상향돌파
+        if (c['tema_gate_line'] is not None
+                and c_prev is not None
+                and c_prev.get('tema_gate_line') is not None):
+            c['signal_buy_tema'] = (
+                c['close'] >= c['tema_gate_line']
+                and c_prev['close'] < c_prev['tema_gate_line']
+            )
+        else:
+            c['signal_buy_tema'] = False
             
     return candles
 
 if __name__ == "__main__":
     print("Testing pure Python technical indicator logic...")
+    print("TEMA Period1=5, Period2=20")
     # We need at least 80 bars to test SMA 60 properly.
     # 0 to 59: flat at 100.0
     prices = [100.0] * 60
@@ -161,14 +265,14 @@ if __name__ == "__main__":
     prices.append(125.0) # drop again
     
     mock_candles = [{'close': p} for p in prices]
-    res = calculate_indicators_pure(mock_candles, use_compressed_peak=True)
+    res = calculate_indicators_pure(mock_candles, use_compressed_peak=True, tema_period1=5, tema_period2=20)
     
     print("\nSample Results (Tail where indicators are active):")
-    fmt = "{:<5} | {:<7} | {:<7} | {:<7} | {:<7} | {:<7} | {:<5} | {:<5} | {:<5}"
-    print(fmt.format("Index", "Close", "SMA5", "SMA60", "K", "L", "B_Prep", "Buy", "Sell"))
-    print("-" * 75)
-    for idx, c in enumerate(res[65:]):
-        real_idx = 65 + idx
+    fmt = "{:<5} | {:<7} | {:<7} | {:<7} | {:<7} | {:<7} | {:<10} | {:<8} | {:<5} | {:<5} | {:<5}"
+    print(fmt.format("Index", "Close", "SMA5", "SMA60", "K", "L", "TEMA_Gate", "Disp%", "B_Prep", "Buy", "Sell"))
+    print("-" * 105)
+    for idx, c in enumerate(res[55:]):
+        real_idx = 55 + idx
         print(fmt.format(
             real_idx,
             c['close'],
@@ -176,8 +280,9 @@ if __name__ == "__main__":
             round(c['sma60'], 2) if c['sma60'] else "None",
             round(c['K'], 2) if c['K'] else "None",
             round(c['L'], 2) if c['L'] else "None",
+            round(c['tema_gate_line'], 2) if c.get('tema_gate_line') else "None",
+            round(c['disparity_pct'], 2) if c.get('disparity_pct') is not None else "None",
             str(c['signal_buy_prep']),
             str(c['signal_buy']),
             str(c['signal_sell'])
         ))
-

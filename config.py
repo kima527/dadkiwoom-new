@@ -23,6 +23,10 @@ KAKAO_REFRESH_TOKEN = os.getenv("KAKAO_REFRESH_TOKEN", "")
 # Watchlist Excel File Name
 WATCHLIST_FILE = "my_pick.xlsx"
 
+# TEMA Gate Line Settings (테마급등관문선)
+TEMA_PERIOD_SHORT = int(os.getenv("TEMA_PERIOD_SHORT", "5"))   # 기간1 (단기)
+TEMA_PERIOD_LONG = int(os.getenv("TEMA_PERIOD_LONG", "20"))    # 기간2 (장기)
+
 def print_config():
     print("=" * 40)
     print("         SYSTEM CONFIGURATION")
