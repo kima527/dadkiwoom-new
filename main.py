@@ -1,7 +1,7 @@
 import time
 import os
 import logging
-from datetime import datetime, time as dt_time
+from datetime import datetime, timezone, timedelta, time as dt_time
 import openpyxl
 import config
 from kiwoom_client import KiwoomClient
@@ -57,7 +57,8 @@ def load_watchlist(filepath: str) -> list:
 
 def is_market_open() -> bool:
     """Checks if the Korean stock market is currently open (Mon-Fri 09:00 - 15:30 KST)."""
-    now = datetime.now()
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
     # 0 = Monday, 6 = Sunday
     if now.weekday() >= 5:
         return False
@@ -77,15 +78,17 @@ def run_trading_bot():
     client = KiwoomClient()
     notifier = Notifier()
     
-    # 2. Export holdings to my_pick.xlsx on startup
-    try:
-        export_holdings_to_excel(client, WATCHLIST_PATH)
-    except Exception as e:
-        logger.error(f"Failed to export holdings on startup: {e}")
-        # Continue if file already exists
-        if not os.path.exists(WATCHLIST_PATH):
+    # 2. Export holdings to my_pick.xlsx on startup (only if the file doesn't exist)
+    if not os.path.exists(WATCHLIST_PATH):
+        logger.info(f"Watchlist file '{WATCHLIST_PATH}' not found. Initializing with current holdings...")
+        try:
+            export_holdings_to_excel(client, WATCHLIST_PATH)
+        except Exception as e:
+            logger.error(f"Failed to export holdings on startup: {e}")
             logger.error("No my_pick.xlsx file found and export failed. Exiting.")
             return
+    else:
+        logger.info(f"Existing watchlist file '{WATCHLIST_PATH}' found. Skipping automatic holdings export to preserve user's watchlist.")
 
     # Keep track of sent alerts to prevent duplicate notifications for the same candle
     # Format: { stock_code: { 'buy_prep': 'last_time', ... } }
@@ -103,8 +106,8 @@ def run_trading_bot():
     while True:
         # For mock testing, ignore market hours so user can test on weekends
         if not config.KIWOOM_IS_MOCK and not is_market_open():
-            logger.info("Market is closed. Sleeping for 1 hour...")
-            time.sleep(3600)
+            logger.info("Market is closed. Sleeping for 10 minutes...")
+            time.sleep(600)
             continue
             
         logger.info("Polling market data...")
