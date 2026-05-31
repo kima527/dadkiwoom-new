@@ -41,7 +41,7 @@ def run_git_commands():
         subprocess.run(['git', 'add', '.'], check=True, cwd=WATCH_DIR)
         
         # 2. git status로 실제 변경 사항이 존재하는지 검증
-        status_res = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True, check=True, cwd=WATCH_DIR)
+        status_res = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True, encoding='utf-8', check=True, cwd=WATCH_DIR)
         if not status_res.stdout.strip():
             print("커밋할 변경 사항이 없습니다.")
             return
@@ -52,7 +52,7 @@ def run_git_commands():
         print(f"성공적으로 로컬 커밋 완료: {commit_msg}")
         
         # 4. git push
-        push_res = subprocess.run(['git', 'push', 'origin', 'main'], capture_output=True, text=True, cwd=WATCH_DIR)
+        push_res = subprocess.run(['git', 'push', 'origin', 'main'], capture_output=True, text=True, encoding='utf-8', cwd=WATCH_DIR)
         if push_res.returncode == 0:
             print("원격 저장소(GitHub)로 푸시 완료!")
         else:
