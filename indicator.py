@@ -163,7 +163,12 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         candles[i]['wma5'] = wma5[i]
         candles[i]['wma20'] = wma20[i]
 
-    # 5. Signals (existing K/L-based)
+    # 5. Signals & State Tracking (K/L, Whale line, Surge, Sell, Rebuy)
+    last_whale = None
+    is_surged = False
+    recent_sell = False
+    neg_count = 0
+    
     for i in range(n):
         c = candles[i]
         c_prev = candles[i-1] if i > 0 else None
@@ -179,12 +184,62 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             c['signal_buy'] = (c['close'] >= c['L']) and (c_prev['close'] < c_prev['L'])
         else:
             c['signal_buy'] = False
-            
-        # Sell: WMA 5 crosses below WMA 20
-        if c['wma5'] is not None and c['wma20'] is not None and c_prev is not None and c_prev['wma5'] is not None and c_prev['wma20'] is not None:
-            c['signal_sell'] = (c['wma5'] < c['wma20']) and (c_prev['wma5'] >= c_prev['wma20'])
-        else:
-            c['signal_sell'] = False
+
+        # Whale Line (세력선): valuewhen(1, crossup(sma5, L), sma5)
+        if i > 0 and c['sma5'] is not None and c['L'] is not None and c_prev['sma5'] is not None and c_prev['L'] is not None:
+            if c_prev['sma5'] < c_prev['L'] and c['sma5'] >= c['L']:
+                last_whale = c['sma5']
+                is_surged = False  # Reset surge state when whale line updates
+        c['whale_line'] = last_whale
+
+        # Check for Surge (관문선과 세력선폭의 2배이상 상승)
+        if c['K'] is not None and c['whale_line'] is not None:
+            width = abs(c['K'] - c['whale_line'])
+            target_price = c['K'] + (width * 2)
+            if c['high'] >= target_price:
+                is_surged = True
+        
+        c['is_surged'] = is_surged
+
+        # Sell Condition 1: Surge & Drop below L (기준선 안으로 캔들이 들어올때)
+        signal_sell_1 = False
+        if is_surged and c['L'] is not None and c_prev is not None and c_prev['L'] is not None:
+            # Drop below L (crossdown L)
+            if c_prev['close'] >= c_prev['L'] and c['close'] < c['L']:
+                signal_sell_1 = True
+                is_surged = False  # Reset after sell
+
+        # Sell Condition 2: 5 SMA dead crosses 20 SMA
+        signal_sell_2 = False
+        if c['sma5'] is not None and c['sma20'] is not None and c_prev is not None and c_prev['sma5'] is not None and c_prev['sma20'] is not None:
+            if c['sma5'] < c['sma20'] and c_prev['sma5'] >= c_prev['sma20']:
+                signal_sell_2 = True
+                
+        c['signal_sell_market_1'] = signal_sell_1
+        c['signal_sell_market_2'] = signal_sell_2
+        
+        # Legacy sell signal mapping
+        c['signal_sell'] = signal_sell_1 or signal_sell_2
+
+        # Rebuy Condition: After sell, 1st or 2nd negative candle where SMA 5 turns upward
+        signal_rebuy = False
+        if signal_sell_1 or signal_sell_2:
+            recent_sell = True
+            neg_count = 0
+        elif recent_sell:
+            # Check if it's a negative candle (음봉)
+            # Assuming we only have 'close' in mock, but real API gives 'open'. If 'open' is missing, fallback to c_prev['close'] > c['close']
+            open_price = c.get('open', c_prev['close'] if c_prev else c['close'])
+            if c['close'] < open_price:
+                neg_count += 1
+                if i > 0 and c['sma5'] is not None and c_prev['sma5'] is not None:
+                    if c['sma5'] > c_prev['sma5']:
+                        signal_rebuy = True
+                        recent_sell = False  # Reset after rebuy
+                if neg_count >= 2:
+                    recent_sell = False  # Stop tracking after 2nd negative candle
+                    
+        c['signal_rebuy'] = signal_rebuy
 
     # 6. TEMA Gate Line (테마급등관문선)
     # TEMA1 = TEMA(close, 기간1), TEMA2 = TEMA(close, 기간2)
@@ -237,6 +292,25 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             )
         else:
             c['signal_buy_tema'] = False
+
+    # 8. Dynamic Buy Signal (상승장 vs 하락장 반등 매수 전략 구분)
+    # 상승중(sma5 > sma20)일 때는 L선 상향돌파(signal_buy)를 매수 신호로 함
+    # 하락 후 반등중(sma5 <= sma20)일 때는 TEMA 관문선 돌파(signal_buy_tema)를 매수 신호로 함
+    for i in range(n):
+        c = candles[i]
+        s5 = c.get('sma5')
+        s20 = c.get('sma20')
+        
+        if s5 is not None and s20 is not None:
+            if s5 > s20:
+                c['signal_buy_dynamic'] = c.get('signal_buy', False)
+                c['buy_condition_type'] = "L-line (Uptrend)"
+            else:
+                c['signal_buy_dynamic'] = c.get('signal_buy_tema', False)
+                c['buy_condition_type'] = "TEMA Gate (Rebound)"
+        else:
+            c['signal_buy_dynamic'] = False
+            c['buy_condition_type'] = "N/A"
             
     return candles
 

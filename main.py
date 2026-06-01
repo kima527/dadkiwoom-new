@@ -1,3 +1,16 @@
+import sys
+import io
+
+# Windows 콘솔에서 한국어(UTF-8)가 깨지지 않도록 안전하게 설정
+if sys.platform.startswith("win"):
+    try:
+        if sys.stdout and not sys.stdout.closed:
+            sys.stdout.reconfigure(encoding="utf-8")
+        if sys.stderr and not sys.stderr.closed:
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 import time
 import os
 import logging
@@ -78,17 +91,25 @@ def run_trading_bot():
     client = KiwoomClient()
     notifier = Notifier()
     
-    # 2. Export holdings to my_pick.xlsx on startup (only if the file doesn't exist)
+    # 2. Initialize my_pick.xlsx with a sample watchlist if it doesn't exist
     if not os.path.exists(WATCHLIST_PATH):
-        logger.info(f"Watchlist file '{WATCHLIST_PATH}' not found. Initializing with current holdings...")
+        logger.info(f"Watchlist file '{WATCHLIST_PATH}' not found. Initializing with sample stocks...")
         try:
-            export_holdings_to_excel(client, WATCHLIST_PATH)
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "My Pick"
+            ws.append(["종목코드", "종목명", "보유수량", "매입단가", "현재가"])
+            ws.append(["005930", "삼성전자", "", "", ""])
+            ws.append(["000660", "SK하이닉스", "", "", ""])
+            ws.append(["086960", "MDS테크", "", "", ""])
+            wb.save(WATCHLIST_PATH)
+            logger.info(f"Successfully initialized template watchlist file at {WATCHLIST_PATH}.")
         except Exception as e:
-            logger.error(f"Failed to export holdings on startup: {e}")
-            logger.error("No my_pick.xlsx file found and export failed. Exiting.")
+            logger.error(f"Failed to initialize watchlist template: {e}")
+            logger.error("No my_pick.xlsx file found and initialization failed. Exiting.")
             return
     else:
-        logger.info(f"Existing watchlist file '{WATCHLIST_PATH}' found. Skipping automatic holdings export to preserve user's watchlist.")
+        logger.info(f"Existing watchlist file '{WATCHLIST_PATH}' found. Loaded for monitoring.")
 
     # Keep track of sent alerts to prevent duplicate notifications for the same candle
     # Format: { stock_code: { 'buy_prep': 'last_time', ... } }
@@ -202,84 +223,136 @@ def run_trading_bot():
             disp_str = f"{disparity:.2f}%" if disparity is not None else "N/A"
             gate_str = f"{gate_line:,.0f}원" if gate_line is not None else "N/A"
 
-            # ── TEMA Gate Line Alerts (관문선 기반) ──
+            # ── Dynamic Buy Alerts (추세별 동적 매수 알림) ──
+            
+            # --- 일봉 기준 매수 금지 조건 계산 (단순3이평 < 단순5이평) ---
+            daily_closes_dict = {}
+            for c in candles: # candles는 시간순(오름차순) 정렬되어 있으므로 마지막 값이 해당 일자의 최종 종가(또는 현재가)
+                daily_closes_dict[c["date"]] = c["close"]
+            daily_closes = list(daily_closes_dict.values())
+            
+            daily_buy_prohibited = False
+            daily_sma_msg = ""
+            if len(daily_closes) >= 5:
+                daily_sma3 = sum(daily_closes[-3:]) / 3.0
+                daily_sma5 = sum(daily_closes[-5:]) / 5.0
+                if daily_sma3 < daily_sma5:
+                    daily_buy_prohibited = True
+                    daily_sma_msg = f" (일봉 3이평 {daily_sma3:,.0f} < 5이평 {daily_sma5:,.0f} 매수금지)"
 
-            # TEMA Buy Prep: 현재가가 관문선 1% 이내 밑에 도달
-            if latest.get("signal_buy_prep_tema") and gate_line is not None:
-                if sent_alerts[code]["buy_prep_tema"] != candle_time:
-                    msg = (
-                        f"⚠️ <b>[매수준비 - 관문선 접근]</b>\n"
-                        f"📊 우선순위: #{rank} (이격도: {disp_str})\n"
-                        f"종목: {name} ({code})\n"
-                        f"현재가: {close_price:,.0f}원\n"
-                        f"관문선(TEMA): {gate_str}\n"
-                        f"시간: {candle_time}\n"
-                        f"<i>(현재가가 TEMA 관문선 1% 이내 밑에 도달)</i>"
-                    )
-                    notifier.send_all(msg)
-                    sent_alerts[code]["buy_prep_tema"] = candle_time
+            # 1. Check Buy Prep
+            is_buy_prep = False
+            prep_msg_detail = ""
+            prep_target_price_str = ""
+            
+            s5 = latest.get("sma5")
+            s20 = latest.get("sma20")
+            
+            if s5 is not None and s20 is not None:
+                if s5 > s20: # 상승중
+                    if latest.get("signal_buy_prep") and l_line is not None:
+                        is_buy_prep = True
+                        prep_msg_detail = "기준선 L 접근 (상승 추세)"
+                        prep_target_price_str = f"기준선(L): {l_line:,.0f}원"
+                else: # 하락후반등
+                    if latest.get("signal_buy_prep_tema") and gate_line is not None:
+                        is_buy_prep = True
+                        prep_msg_detail = "관문선 TEMA 접근 (하락 후 반등)"
+                        prep_target_price_str = f"관문선(TEMA): {gate_str}"
 
-            # TEMA Buy: 현재가가 관문선 상향돌파
-            if latest.get("signal_buy_tema") and gate_line is not None:
-                if sent_alerts[code]["buy_tema"] != candle_time:
-                    msg = (
-                        f"🚀 <b>[매수신호 - 관문선 돌파!]</b>\n"
-                        f"📊 우선순위: #{rank} (이격도: {disp_str})\n"
-                        f"종목: {name} ({code})\n"
-                        f"현재가: {close_price:,.0f}원\n"
-                        f"관문선(TEMA): {gate_str}\n"
-                        f"시간: {candle_time}\n"
-                        f"<b>TEMA 관문선 돌파 매수 포인트!</b>"
-                    )
-                    notifier.send_all(msg)
-                    sent_alerts[code]["buy_tema"] = candle_time
-
-            # ── Existing L-line Alerts (기존 기준선 기반) ──
-
-            # Check Buy Prep Signal (L-line)
-            if latest["signal_buy_prep"] and l_line is not None:
+            if is_buy_prep and not daily_buy_prohibited:
                 if sent_alerts[code]["buy_prep"] != candle_time:
                     msg = (
-                        f"⚠️ <b>[매수준비 알림]</b>\n"
+                        f"⚠️ <b>[매수준비 - {prep_msg_detail}]</b>\n"
                         f"📊 우선순위: #{rank} (이격도: {disp_str})\n"
                         f"종목: {name} ({code})\n"
                         f"현재가: {close_price:,.0f}원\n"
-                        f"기준선(L): {l_line:,.0f}원\n"
+                        f"{prep_target_price_str}\n"
                         f"시간: {candle_time}\n"
-                        f"<i>(현재가가 기준선 1% 이내 밑에 도달하였습니다.)</i>"
+                        f"<i>(현재가가 매수 기준선 1% 이내 밑에 도달)</i>"
                     )
                     notifier.send_all(msg)
                     sent_alerts[code]["buy_prep"] = candle_time
-                    
-            # Check Buy Signal (Cross up L-line)
-            if latest["signal_buy"] and l_line is not None:
+
+            # 2. Check Buy Trigger
+            if latest.get("signal_buy_dynamic") and not daily_buy_prohibited:
                 if sent_alerts[code]["buy"] != candle_time:
+                    cond_type = latest.get("buy_condition_type", "N/A")
                     msg = (
-                        f"🚀 <b>[매수신호 발생]</b>\n"
+                        f"🚀 <b>[매수신호 발생 - {cond_type}!]</b>\n"
                         f"📊 우선순위: #{rank} (이격도: {disp_str})\n"
                         f"종목: {name} ({code})\n"
                         f"현재가: {close_price:,.0f}원\n"
-                        f"기준선(L): {l_line:,.0f}원\n"
                         f"시간: {candle_time}\n"
-                        f"<b>기준선 돌파 매수 포인트!</b>"
+                        f"<b>{cond_type} 매수 포인트!</b>"
                     )
                     notifier.send_all(msg)
                     sent_alerts[code]["buy"] = candle_time
                     
-            # Check Sell Signal (WMA 5 crosses below WMA 20)
-            if latest["signal_sell"] and w5 is not None and w20 is not None:
+                    # Execute Initial Market Buy (1,000,000 KRW / current_price)
+                    buy_amount_krw = 1000000
+                    if close_price > 0:
+                        qty_to_buy = int(buy_amount_krw / close_price)
+                        if qty_to_buy > 0:
+                            client.send_market_order(code, qty_to_buy, is_buy=True)
+                        else:
+                            logger.info(f"Price is too high ({close_price:,.0f}원) to buy even 1 share with {buy_amount_krw:,.0f}원.")
+                    
+            # 3. Check Sell Signals
+            if latest.get("signal_sell_market_1") or latest.get("signal_sell_market_2"):
                 if sent_alerts[code]["sell"] != candle_time:
+                    # Determine reason
+                    if latest.get("signal_sell_market_1"):
+                        reason = "관문선과 세력선 폭 2배 상승 후 기준선 하향 돌파"
+                    else:
+                        reason = "5이평 20이평 데드크로스"
+                        
                     msg = (
-                        f"📉 <b>[매도알림 발생]</b>\n"
+                        f"📉 <b>[시장가 매도알림 발생]</b>\n"
                         f"종목: {name} ({code})\n"
                         f"현재가: {close_price:,.0f}원\n"
-                        f"WMA 5: {w5:,.1f}원\n"
-                        f"WMA 20: {w20:,.1f}원\n"
+                        f"사유: {reason}\n"
                         f"시간: {candle_time}\n"
-                        f"<b>5이평 가중이 20이평 가중 아래로 데드크로스 하향돌파!</b>"
+                        f"<b>시장가 매도 주문을 실행합니다!</b>"
                     )
                     notifier.send_all(msg)
                     sent_alerts[code]["sell"] = candle_time
+                    
+                    # Fetch real-time holdings to determine quantity to sell
+                    current_holdings = client.get_holdings()
+                    qty_to_sell = 0
+                    for h in current_holdings:
+                        if h["code"] == code:
+                            qty_to_sell = h["quantity"]
+                            break
+                            
+                    if qty_to_sell > 0:
+                        client.send_market_order(code, qty_to_sell, is_buy=False)
+                        sent_alerts[code]["sold_qty"] = qty_to_sell  # Save sold quantity for rebuy
+                    else:
+                        logger.info(f"No holdings found for {name} ({code}). Skipping actual sell order.")
+
+            # 4. Check Rebuy Signal
+            if latest.get("signal_rebuy"):
+                if sent_alerts[code].get("rebuy", "") != candle_time:
+                    msg = (
+                        f"🔄 <b>[재매수 신호 발생]</b>\n"
+                        f"종목: {name} ({code})\n"
+                        f"현재가: {close_price:,.0f}원\n"
+                        f"사유: 매도 후 음봉에서 5이평선 상승 반전\n"
+                        f"시간: {candle_time}\n"
+                        f"<b>시장가 재매수 주문을 실행합니다!</b>"
+                    )
+                    notifier.send_all(msg)
+                    sent_alerts[code]["rebuy"] = candle_time
+                    
+                    # Execute market rebuy (same quantity as previously sold)
+                    qty_to_rebuy = sent_alerts[code].get("sold_qty", 0)
+                    if qty_to_rebuy > 0:
+                        client.send_market_order(code, qty_to_rebuy, is_buy=True)
+                        sent_alerts[code]["sold_qty"] = 0  # Reset after rebuy
+                    else:
+                        logger.info(f"No previous sold quantity found for {name} ({code}) to rebuy. Skipping rebuy order.")
                     
         # Poll interval: check every 2 minutes (120 seconds)
         logger.info("Completed polling cycle. Sleeping for 2 minutes...")

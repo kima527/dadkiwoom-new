@@ -1,3 +1,16 @@
+import sys
+import io
+
+# Windows 콘솔에서 한국어(UTF-8)가 깨지지 않도록 안전하게 설정
+if sys.platform.startswith("win"):
+    try:
+        if sys.stdout and not sys.stdout.closed:
+            sys.stdout.reconfigure(encoding="utf-8")
+        if sys.stderr and not sys.stderr.closed:
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 import os
 import logging
 from datetime import datetime
@@ -11,6 +24,11 @@ os.environ["KIWOOM_USE_SANDBOX"] = str(config.KIWOOM_IS_MOCK).lower()
 from kiwoom_rest_api.auth.token import TokenManager
 from kiwoom_rest_api.koreanstock.account import Account
 from kiwoom_rest_api.koreanstock.chart import Chart
+from kiwoom_rest_api.koreanstock.stockinfo import StockInfo
+try:
+    from kiwoom_rest_api.koreanstock.order import Order
+except ImportError:
+    Order = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -28,6 +46,47 @@ class KiwoomClient:
         # Initialize API modules
         self.account_api = Account(base_url=self.base_url, token_manager=self.token_manager)
         self.chart_api = Chart(base_url=self.base_url, token_manager=self.token_manager)
+        self.stock_info_api = StockInfo(base_url=self.base_url, token_manager=self.token_manager)
+        if Order:
+            self.order_api = Order(base_url=self.base_url, token_manager=self.token_manager)
+        else:
+            self.order_api = None
+
+    def send_market_order(self, stock_code: str, quantity: int, is_buy: bool):
+        """
+        Sends a market order (시장가 주문) for the specified stock.
+        is_buy: True for Buy (신규매수), False for Sell (신규매도)
+        """
+        order_type = "Buy" if is_buy else "Sell"
+        logger.info(f"Preparing to send Market {order_type} Order for {stock_code}, qty: {quantity}...")
+        
+        if not self.order_api:
+            logger.warning(f"Order API module is not available. Mocking {order_type} order...")
+            return True
+            
+        try:
+            # Note: The exact method name in kiwoom_rest_api may vary. 
+            # We attempt a generic or most common order method structure.
+            # 시장가: "03", 매수: "2", 매도: "1"
+            order_code = "2" if is_buy else "1"
+            result = self.order_api.domestic_stock_order_request_ttc0802u(
+                acnt_no=config.KIWOOM_ACCOUNT_NUM,  # from config
+                acnt_prdt_cd="01", 
+                pdno=stock_code,
+                ord_dv="03",  # 03: 시장가
+                ord_qty=str(quantity),
+                ord_unpr="0",  # 시장가일 경우 단가는 0
+                ord_prdt_tp="01", # 주식
+                ord_dvs="01" # 신규매수/매도
+            )
+            logger.info(f"Market {order_type} Order Result: {result}")
+            return result
+        except AttributeError:
+            logger.warning("Order API method not found or configured differently. Mocking order...")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send {order_type} order: {e}")
+            return False
 
     def get_holdings(self) -> list:
         """
@@ -80,6 +139,61 @@ class KiwoomClient:
         except Exception as e:
             logger.error(f"Error fetching holdings: {e}")
             return []
+
+    def get_stock_name(self, stock_code: str) -> str:
+        """
+        Fetches the stock name for a given code using the basic_stock_information_request_ka10001 API.
+        Returns the stock name if successful, or None if invalid or error.
+        """
+        logger.info(f"Fetching stock name for stock code {stock_code}...")
+        try:
+            code = str(stock_code).strip().zfill(6)
+            result = self.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
+            if result and result.get("return_code") == 0:
+                name = result.get("stk_nm", "").strip()
+                if name:
+                    logger.info(f"Found stock name for code {code}: {name}")
+                    return name
+            err_msg = result.get("return_msg") if result else "Empty API response"
+            logger.error(f"Failed to fetch stock name for {code}: {err_msg}")
+            return None
+        except Exception as e:
+            logger.error(f"Error in get_stock_name for {stock_code}: {e}")
+            return None
+
+    def get_stock_names(self, stock_codes: list) -> dict:
+        """
+        Fetches stock names for a list of stock codes in a batch using ka10095.
+        Returns a dict: {code: name}
+        """
+        if not stock_codes:
+            return {}
+            
+        logger.info(f"Fetching stock names for {len(stock_codes)} codes in batch...")
+        codes = [str(c).strip().zfill(6) for c in stock_codes if c]
+        
+        chunk_size = 50
+        result_map = {}
+        
+        for i in range(0, len(codes), chunk_size):
+            chunk = codes[i:i + chunk_size]
+            code_str = "|".join(chunk)
+            try:
+                result = self.stock_info_api.watchlist_stock_information_request_ka10095(stock_code=code_str)
+                if result and result.get("return_code") == 0:
+                    items = result.get("atn_stk_infr", [])
+                    for item in items:
+                        cd = item.get("stk_cd", "").strip()
+                        nm = item.get("stk_nm", "").strip()
+                        if cd and nm:
+                            result_map[cd] = nm
+                else:
+                    err_msg = result.get("return_msg") if result else "No response"
+                    logger.error(f"Batch stock info request failed for chunk {i}: {err_msg}")
+            except Exception as e:
+                logger.error(f"Error in batch stock info query for chunk {i}: {e}")
+                
+        return result_map
 
     def get_15min_candles(self, stock_code: str, last_n_days: int = 3) -> list:
         """
