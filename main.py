@@ -20,6 +20,7 @@ import config
 from kiwoom_client import KiwoomClient
 from indicator import calculate_indicators_pure
 from notifier import Notifier
+from data_collector import DataCollector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -76,8 +77,8 @@ def is_market_open() -> bool:
     if now.weekday() >= 5:
         return False
         
-    market_start = dt_time(9, 0, 0)
-    market_end = dt_time(15, 30, 0)
+    market_start = dt_time(8, 0, 0)
+    market_end = dt_time(20, 0, 0)
     current_time = now.time()
     
     return market_start <= current_time <= market_end
@@ -87,9 +88,11 @@ def run_trading_bot():
     logger.info("Starting Kiwoom 15-Min Chart Trading Alert Bot...")
     logger.info(f"TEMA Settings: Period1={config.TEMA_PERIOD_SHORT}, Period2={config.TEMA_PERIOD_LONG}")
     
-    # 1. Initialize Kiwoom client and notifier
+    # 1. Initialize Kiwoom client, notifier, and DataCollector
     client = KiwoomClient()
     notifier = Notifier()
+    data_collector = DataCollector(client, interval_seconds=180)
+    data_collector.start()
     
     # 2. Initialize my_pick.xlsx with a sample watchlist if it doesn't exist
     if not os.path.exists(WATCHLIST_PATH):
@@ -133,19 +136,31 @@ def run_trading_bot():
             
         logger.info("Polling market data...")
         
-        # Load watchlist dynamically in case user edited the file
-        watchlist = load_watchlist(WATCHLIST_PATH)
-        if not watchlist:
-            logger.warning("Watchlist is empty. Sleeping for 1 minute...")
+        # Get intersected stocks from the background collector
+        intersected = data_collector.get_intersected_stocks()
+        
+        # Always monitor current holdings so we don't miss sell signals
+        holdings = client.get_holdings()
+        
+        # Build the final monitor list (Intersection + Holdings)
+        monitor_dict = {s["code"]: s for s in intersected}
+        for h in holdings:
+            if h["code"] not in monitor_dict:
+                monitor_dict[h["code"]] = {"code": h["code"], "name": h["name"]}
+                
+        monitor_list = list(monitor_dict.values())
+
+        if not monitor_list:
+            logger.warning("No intersected stocks and no holdings to monitor. Sleeping for 1 minute...")
             time.sleep(60)
             continue
 
         # ────────────────────────────────────────────────────────────
-        # Phase 1: Collect data and calculate indicators for all stocks
+        # Phase 1: Collect data and calculate indicators for target stocks
         # ────────────────────────────────────────────────────────────
         stock_results = []
 
-        for stock in watchlist:
+        for stock in monitor_list:
             code = stock["code"]
             name = stock["name"]
             
@@ -166,7 +181,35 @@ def run_trading_bot():
                 tema_period2=config.TEMA_PERIOD_LONG
             )
             
+            # Fetch and calculate daily breakout conditions
+            daily_candles = client.get_daily_candles(code, last_n_days=90)
+            daily_breakout_ok = False
+            prev_d = None
+            if daily_candles and len(daily_candles) >= 2:
+                calculate_indicators_pure(
+                    daily_candles,
+                    use_compressed_peak=True,
+                    tema_period1=config.TEMA_PERIOD_SHORT,
+                    tema_period2=config.TEMA_PERIOD_LONG
+                )
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                if daily_candles[-1]['date'] == today_str:
+                    if len(daily_candles) >= 2:
+                        prev_d = daily_candles[-2]
+                else:
+                    prev_d = daily_candles[-1]
+                
+                if prev_d:
+                    daily_L = prev_d.get('L')
+                    daily_whale = prev_d.get('whale_line')
+                    if daily_L is not None and daily_whale is not None:
+                        daily_breakout_ok = (prev_d['close'] >= daily_L * 0.97) and (prev_d['close'] >= daily_whale * 0.97)
+            
             latest = candles[-1]
+            latest['daily_breakout_ok'] = daily_breakout_ok
+            latest['daily_L'] = prev_d.get('L') if prev_d else None
+            latest['daily_whale_line'] = prev_d.get('whale_line') if prev_d else None
+            
             disparity = latest.get("disparity_pct")
 
             stock_results.append({
@@ -195,7 +238,7 @@ def run_trading_bot():
                 logger.info(
                     f"  #{rank} {sr['name']}({sr['code']}) | "
                     f"현재가: {sr['latest']['close']:,.0f} | "
-                    f"관문선: {gate_str} | 이격도: {disp}"
+                    f"관문선: {gate_str} | 이격도: {disp} | 일봉돌파: {sr['latest'].get('daily_breakout_ok', False)}"
                 )
 
         # ────────────────────────────────────────────────────────────
@@ -275,9 +318,18 @@ def run_trading_bot():
                     sent_alerts[code]["buy_prep"] = candle_time
 
             # 2. Check Buy Trigger
-            if latest.get("signal_buy_dynamic") and not daily_buy_prohibited:
+            sugeub_daily_ok = True
+            if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
+                sugeub_daily_ok = latest.get("daily_breakout_ok", False)
+
+            if (latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and not daily_buy_prohibited and sugeub_daily_ok:
                 if sent_alerts[code]["buy"] != candle_time:
-                    cond_type = latest.get("buy_condition_type", "N/A")
+                    if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
+                        cond_type = "수급완벽돌파"
+                        sent_alerts[code]["buy_reason"] = "sugeub"
+                    else:
+                        cond_type = latest.get("buy_condition_type", "N/A")
+                        sent_alerts[code]["buy_reason"] = "dynamic"
                     msg = (
                         f"🚀 <b>[매수신호 발생 - {cond_type}!]</b>\n"
                         f"📊 우선순위: #{rank} (이격도: {disp_str})\n"
@@ -333,7 +385,7 @@ def run_trading_bot():
                         logger.info(f"No holdings found for {name} ({code}). Skipping actual sell order.")
 
             # 4. Check Rebuy Signal
-            if latest.get("signal_rebuy"):
+            if latest.get("signal_rebuy") and sent_alerts[code].get("buy_reason") == "dynamic":
                 if sent_alerts[code].get("rebuy", "") != candle_time:
                     msg = (
                         f"🔄 <b>[재매수 신호 발생]</b>\n"

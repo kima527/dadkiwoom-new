@@ -14,8 +14,6 @@ if sys.platform.startswith("win"):
 import os
 import logging
 from datetime import datetime
-import requests
-import json
 import config
 
 # Set environment variables required by the kiwoom-rest-api library
@@ -26,11 +24,8 @@ os.environ["KIWOOM_USE_SANDBOX"] = str(config.KIWOOM_IS_MOCK).lower()
 from kiwoom_rest_api.auth.token import TokenManager
 from kiwoom_rest_api.koreanstock.account import Account
 from kiwoom_rest_api.koreanstock.chart import Chart
-from kiwoom_rest_api.koreanstock.stockinfo import StockInfo
-try:
-    from kiwoom_rest_api.koreanstock.order import Order
-except ImportError:
-    Order = None
+from kiwoom_rest_api.koreanstock.order import Order
+from kiwoom_rest_api.koreanstock.rank_info import RankInfo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,47 +43,8 @@ class KiwoomClient:
         # Initialize API modules
         self.account_api = Account(base_url=self.base_url, token_manager=self.token_manager)
         self.chart_api = Chart(base_url=self.base_url, token_manager=self.token_manager)
-        self.stock_info_api = StockInfo(base_url=self.base_url, token_manager=self.token_manager)
-        if Order:
-            self.order_api = Order(base_url=self.base_url, token_manager=self.token_manager)
-        else:
-            self.order_api = None
-
-    def send_market_order(self, stock_code: str, quantity: int, is_buy: bool):
-        """
-        Sends a market order (시장가 주문) for the specified stock.
-        is_buy: True for Buy (신규매수), False for Sell (신규매도)
-        """
-        order_type = "Buy" if is_buy else "Sell"
-        logger.info(f"Preparing to send Market {order_type} Order for {stock_code}, qty: {quantity}...")
-        
-        if not self.order_api:
-            logger.warning(f"Order API module is not available. Mocking {order_type} order...")
-            return True
-            
-        try:
-            # Note: The exact method name in kiwoom_rest_api may vary. 
-            # We attempt a generic or most common order method structure.
-            # 시장가: "03", 매수: "2", 매도: "1"
-            order_code = "2" if is_buy else "1"
-            result = self.order_api.domestic_stock_order_request_ttc0802u(
-                acnt_no=config.KIWOOM_ACCOUNT_NUM,  # from config
-                acnt_prdt_cd="01", 
-                pdno=stock_code,
-                ord_dv="03",  # 03: 시장가
-                ord_qty=str(quantity),
-                ord_unpr="0",  # 시장가일 경우 단가는 0
-                ord_prdt_tp="01", # 주식
-                ord_dvs="01" # 신규매수/매도
-            )
-            logger.info(f"Market {order_type} Order Result: {result}")
-            return result
-        except AttributeError:
-            logger.warning("Order API method not found or configured differently. Mocking order...")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to send {order_type} order: {e}")
-            return False
+        self.order_api = Order(base_url=self.base_url, token_manager=self.token_manager)
+        self.rank_api = RankInfo(base_url=self.base_url, token_manager=self.token_manager)
 
     def get_holdings(self) -> list:
         """
@@ -141,158 +97,6 @@ class KiwoomClient:
         except Exception as e:
             logger.error(f"Error fetching holdings: {e}")
             return []
-
-    def get_top_increasing_stocks(self, limit: int = 50) -> list:
-        """
-        Fetches top increasing stocks using ka10027 (전일대비등락률상위요청).
-        Returns a list of dicts: [{'code': '005930', 'name': '삼성전자', 'fluctuation_rate': 2.5, ...}]
-        """
-        logger.info(f"Fetching top {limit} increasing stocks (ka10027)...")
-        try:
-            url = f"{self.base_url}/api/dostk/rkinfo"
-            headers = {
-                "Authorization": f"Bearer {self.token_manager.access_token}",
-                "appkey": config.KIWOOM_APP_KEY,
-                "appsecret": config.KIWOOM_APP_SECRET,
-                "tr_id": "ka10027",
-                "api-id": "ka10027",
-                "cont-yn": "N",
-                "next-key": "0",
-                "content-type": "application/json"
-            }
-            body = {
-                "mrkt_tp": "0",       # 0: 전체
-                "sort_tp": "1",       # 1: 상승률
-                "trde_qty_cnd": "0"   # 0: 전체조회
-            }
-            res = requests.post(url, headers=headers, json=body)
-            res.raise_for_status()
-            data = res.json()
-            
-            if data.get("return_code") != 0:
-                logger.error(f"Error from ka10027 API: {data.get('return_msg')}")
-                return []
-                
-            items = data.get("out_block_1", [])[:limit]
-            results = []
-            for item in items:
-                raw_code = item.get("stk_cd", "").strip()
-                code = raw_code[1:] if raw_code.startswith("A") else raw_code
-                try:
-                    flu_rt = float(item.get("flu_rt", 0.0))
-                except ValueError:
-                    flu_rt = 0.0
-                results.append({
-                    "code": code,
-                    "name": item.get("stk_nm", "").strip(),
-                    "fluctuation_rate": flu_rt
-                })
-            logger.info(f"Retrieved {len(results)} top increasing stocks.")
-            return results
-        except Exception as e:
-            logger.error(f"Error fetching top increasing stocks: {e}")
-            return []
-
-    def get_top_trading_value_stocks(self, limit: int = 30) -> list:
-        """
-        Fetches top stocks by trading value using ka10032 (거래대금상위요청).
-        Returns a list of dicts: [{'code': '005930', 'name': '삼성전자', ...}]
-        """
-        logger.info(f"Fetching top {limit} stocks by trading value (ka10032)...")
-        try:
-            url = f"{self.base_url}/api/dostk/rkinfo"
-            headers = {
-                "Authorization": f"Bearer {self.token_manager.access_token}",
-                "appkey": config.KIWOOM_APP_KEY,
-                "appsecret": config.KIWOOM_APP_SECRET,
-                "tr_id": "ka10032",
-                "api-id": "ka10032",
-                "cont-yn": "N",
-                "next-key": "0",
-                "content-type": "application/json"
-            }
-            body = {
-                "mrkt_tp": "0",         # 0: 전체
-                "mang_stk_incls": "0",  # 0: 관리종목 제외
-                "stex_tp": "0"          # 0: 전체
-            }
-            res = requests.post(url, headers=headers, json=body)
-            res.raise_for_status()
-            data = res.json()
-            
-            if data.get("return_code") != 0:
-                logger.error(f"Error from ka10032 API: {data.get('return_msg')}")
-                return []
-                
-            items = data.get("out_block_1", [])[:limit]
-            results = []
-            for item in items:
-                raw_code = item.get("stk_cd", "").strip()
-                code = raw_code[1:] if raw_code.startswith("A") else raw_code
-                results.append({
-                    "code": code,
-                    "name": item.get("stk_nm", "").strip()
-                })
-            logger.info(f"Retrieved {len(results)} top trading value stocks.")
-            return results
-        except Exception as e:
-            logger.error(f"Error fetching top trading value stocks: {e}")
-            return []
-
-    def get_stock_name(self, stock_code: str) -> str:
-        """
-        Fetches the stock name for a given code using the basic_stock_information_request_ka10001 API.
-        Returns the stock name if successful, or None if invalid or error.
-        """
-        logger.info(f"Fetching stock name for stock code {stock_code}...")
-        try:
-            code = str(stock_code).strip().zfill(6)
-            result = self.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
-            if result and result.get("return_code") == 0:
-                name = result.get("stk_nm", "").strip()
-                if name:
-                    logger.info(f"Found stock name for code {code}: {name}")
-                    return name
-            err_msg = result.get("return_msg") if result else "Empty API response"
-            logger.error(f"Failed to fetch stock name for {code}: {err_msg}")
-            return None
-        except Exception as e:
-            logger.error(f"Error in get_stock_name for {stock_code}: {e}")
-            return None
-
-    def get_stock_names(self, stock_codes: list) -> dict:
-        """
-        Fetches stock names for a list of stock codes in a batch using ka10095.
-        Returns a dict: {code: name}
-        """
-        if not stock_codes:
-            return {}
-            
-        logger.info(f"Fetching stock names for {len(stock_codes)} codes in batch...")
-        codes = [str(c).strip().zfill(6) for c in stock_codes if c]
-        
-        chunk_size = 50
-        result_map = {}
-        
-        for i in range(0, len(codes), chunk_size):
-            chunk = codes[i:i + chunk_size]
-            code_str = "|".join(chunk)
-            try:
-                result = self.stock_info_api.watchlist_stock_information_request_ka10095(stock_code=code_str)
-                if result and result.get("return_code") == 0:
-                    items = result.get("atn_stk_infr", [])
-                    for item in items:
-                        cd = item.get("stk_cd", "").strip()
-                        nm = item.get("stk_nm", "").strip()
-                        if cd and nm:
-                            result_map[cd] = nm
-                else:
-                    err_msg = result.get("return_msg") if result else "No response"
-                    logger.error(f"Batch stock info request failed for chunk {i}: {err_msg}")
-            except Exception as e:
-                logger.error(f"Error in batch stock info query for chunk {i}: {e}")
-                
-        return result_map
 
     def get_15min_candles(self, stock_code: str, last_n_days: int = 3) -> list:
         """
@@ -438,6 +242,230 @@ class KiwoomClient:
         except Exception as e:
             logger.error(f"Error fetching daily candles for {stock_code}: {e}")
             return []
+
+    def _determine_exchange_and_order_type(self, order_type: str, price: float = None) -> tuple:
+        """
+        Determines the domestic exchange type (dmst_stex_tp), actual trade type (trde_tp), 
+        and limit price based on the current time and mock trading settings.
+        
+        NXT sessions:
+          - Pre-market: 08:00 ~ 08:50 (Limit order only, no market order)
+          - Main-market: 09:00:30 ~ 15:20 (Market & Limit allowed)
+          - After-market: 15:40 ~ 20:00 (Limit order only, no market order)
+        
+        Returns:
+            (dmst_stex_tp, trde_tp, price_val)
+        """
+        import datetime
+        from datetime import timezone, timedelta
+        
+        # 1. If Mock trading, SOR and NXT are NOT supported by Kiwoom Mock API
+        if self.is_mock:
+            return "KRX", order_type, price
+            
+        # 2. Real Trading: determine session
+        kst = timezone(timedelta(hours=9))
+        now = datetime.datetime.now(kst)
+        current_time = now.time()
+        
+        t_0800 = datetime.time(8, 0, 0)
+        t_0850 = datetime.time(8, 50, 0)
+        t_1540 = datetime.time(15, 40, 0)
+        t_2000 = datetime.time(20, 0, 0)
+        
+        is_pre_market = (t_0800 <= current_time < t_0850)
+        is_after_market = (t_1540 <= current_time < t_2000)
+        
+        # In Pre-market and After-market, NXT only supports Limit orders ('0')
+        if (is_pre_market or is_after_market) and order_type == "3":
+            if price is not None:
+                logger.info("Extended trading hours session detected. Converting Market order to Limit order.")
+                return "SOR", "0", price
+            else:
+                logger.warning("Extended hours detected but no price was provided for conversion. Fallback to market.")
+                return "SOR", order_type, price
+                
+        # Main market or fallback
+        return "SOR", order_type, price
+
+    def place_buy_order(self, stock_code: str, quantity: int, price: float = None, order_type: str = "3") -> dict:
+        """
+        Places a buy order for a stock code.
+        order_type: '0' for Limit (지정가), '3' for Market (시장가)
+        """
+        dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
+        price_int = int(actual_price) if actual_price is not None else None
+        
+        logger.info(
+            f"Placing buy order for {stock_code}: quantity={quantity}, price={price_int}, "
+            f"type={actual_order_type}, exchange={dmst_stex_tp}"
+        )
+        try:
+            qty_str = str(quantity)
+            price_str = str(price_int) if price_int is not None else ""
+            
+            result = self.order_api.stock_buy_order_request_kt10000(
+                dmst_stex_tp=dmst_stex_tp,
+                stk_cd=stock_code,
+                ord_qty=qty_str,
+                trde_tp=actual_order_type,
+                ord_uv=price_str
+            )
+            logger.info(f"Buy order response: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error placing buy order for {stock_code}: {e}")
+            return None
+
+    def place_sell_order(self, stock_code: str, quantity: int, price: float = None, order_type: str = "3") -> dict:
+        """
+        Places a sell order for a stock code.
+        order_type: '0' for Limit (지정가), '3' for Market (시장가)
+        """
+        dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
+        price_int = int(actual_price) if actual_price is not None else None
+        
+        logger.info(
+            f"Placing sell order for {stock_code}: quantity={quantity}, price={price_int}, "
+            f"type={actual_order_type}, exchange={dmst_stex_tp}"
+        )
+        try:
+            qty_str = str(quantity)
+            price_str = str(price_int) if price_int is not None else ""
+            
+            result = self.order_api.stock_sell_order_request_kt10001(
+                dmst_stex_tp=dmst_stex_tp,
+                stk_cd=stock_code,
+                ord_qty=qty_str,
+                trde_tp=actual_order_type,
+                ord_uv=price_str
+            )
+            logger.info(f"Sell order response: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error placing sell order for {stock_code}: {e}")
+            return None
+
+    def get_cash_balance(self) -> float:
+        """
+        Gets the available cash (deposit asset amount) in the account.
+        """
+        logger.info("Fetching cash balance...")
+        try:
+            result = self.account_api.account_evaluation_balance_detail_request_kt00018(
+                query_type="2",
+                domestic_exchange_type="KRX"
+            )
+            if not result:
+                logger.error("Empty response received from balance inquiry.")
+                return 0.0
+            
+            # prsm_dpst_aset_amt contains the cash/deposit asset amount
+            cash_str = result.get("prsm_dpst_aset_amt", "0")
+            cash = float(cash_str)
+            logger.info(f"Available Cash Balance: {cash:,.0f} KRW")
+            return cash
+        except Exception as e:
+            logger.error(f"Error fetching cash balance: {e}")
+            return 0.0
+
+    def get_top_trading_value_stocks(self, market_type: str = "000", limit: int = 100) -> list:
+        """
+        Fetches top trading value stocks.
+        market_type: "000" (All), "001" (KOSPI), "101" (KOSDAQ)
+        Returns a list of stock codes: ['005930', '000660', ...]
+        """
+        logger.info("Fetching top trading value stocks...")
+        try:
+            result = self.rank_api.top_trading_value_request_ka10032(
+                mrkt_tp=market_type,
+                mang_stk_incls="0",
+                stex_tp="3"
+            )
+            if not result:
+                return []
+            
+            raw_list = result.get("trde_prica_upper", [])
+            codes = []
+            for item in raw_list[:limit]:
+                code = item.get("stk_cd", "").strip()
+                if code:
+                    codes.append(code)
+            return codes
+        except Exception as e:
+            logger.error(f"Error fetching top trading value stocks: {e}")
+            return []
+
+    def get_top_fluctuation_stocks(self, market_type: str = "000", limit: int = 100) -> list:
+        """
+        Fetches top day-over-day price change rate stocks (descending).
+        market_type: "000" (All), "001" (KOSPI), "101" (KOSDAQ)
+        Returns a list of stock codes: ['005930', '000660', ...]
+        """
+        logger.info("Fetching top price change rate stocks...")
+        try:
+            result = self.rank_api.top_day_over_day_change_rate_request_ka10027(
+                mrkt_tp=market_type,
+                sort_tp="1", # 대비 상승률순
+                trde_qty_cnd="0000",
+                stk_cnd="0",
+                crd_cnd="0",
+                updown_incls="1",
+                pric_cnd="0",
+                trde_prica_cnd="0",
+                stex_tp="3"
+            )
+            if not result:
+                return []
+            
+            raw_list = result.get("pred_pre_flu_rt_upper", [])
+            codes = []
+            for item in raw_list[:limit]:
+                code = item.get("stk_cd", "").strip()
+                if code:
+                    codes.append(code)
+            return codes
+        except Exception as e:
+            logger.error(f"Error fetching top price change rate stocks: {e}")
+            return []
+
+    # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
+    # ── get_top_fluctuation_stocks_with_rates (실시간 등락률 조회 모듈) ──
+    def get_top_fluctuation_stocks_with_rates(self, market_type: str = "000", limit: int = 100) -> dict:
+        """
+        Fetches top price change rate stocks along with their rates.
+        Returns a dict: {'005930': 3.45, '000660': -1.20, ...}
+        """
+        logger.info("Fetching top price change rate stocks with rates...")
+        try:
+            result = self.rank_api.top_day_over_day_change_rate_request_ka10027(
+                mrkt_tp=market_type,
+                sort_tp="1", # 대비 상승률순
+                trde_qty_cnd="0000",
+                stk_cnd="0",
+                crd_cnd="0",
+                updown_incls="1",
+                pric_cnd="0",
+                trde_prica_cnd="0",
+                stex_tp="3"
+            )
+            if not result:
+                return {}
+            
+            raw_list = result.get("pred_pre_flu_rt_upper", [])
+            rates_map = {}
+            for item in raw_list[:limit]:
+                code = item.get("stk_cd", "").strip()
+                flu_rt_str = item.get("flu_rt", "0").strip()
+                if code:
+                    try:
+                        rates_map[code] = float(flu_rt_str)
+                    except ValueError:
+                        rates_map[code] = 0.0
+            return rates_map
+        except Exception as e:
+            logger.error(f"Error fetching top price change rate stocks with rates: {e}")
+            return {}
 
 if __name__ == "__main__":
     # Test client (Note: will only succeed if .env credentials are valid)

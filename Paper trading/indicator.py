@@ -71,6 +71,36 @@ def calculate_tema(prices, period):
             tema.append(None)
     return tema
 
+def calculate_bollinger_bands(prices, period, num_std=2.0):
+    """Calculates Bollinger Bands upper, mid, lower bands."""
+    import math
+    upper_band = []
+    lower_band = []
+    mid_band = []
+    
+    sma = calculate_sma(prices, period)
+    
+    for i in range(len(prices)):
+        if i >= period - 1:
+            window = prices[i - period + 1 : i + 1]
+            mean = sma[i]
+            if mean is None:
+                mid_band.append(None)
+                upper_band.append(None)
+                lower_band.append(None)
+                continue
+            variance = sum((x - mean) ** 2 for x in window) / float(period)
+            std_dev = math.sqrt(variance)
+            mid_band.append(mean)
+            upper_band.append(mean + num_std * std_dev)
+            lower_band.append(mean - num_std * std_dev)
+        else:
+            mid_band.append(None)
+            upper_band.append(None)
+            lower_band.append(None)
+            
+    return upper_band, mid_band, lower_band
+
 def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5, tema_period2=20):
     """
     Calculates technical indicators for a list of candle dictionaries in-place.
@@ -80,7 +110,10 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
       - sma5, sma20, sma60
       - K, L
       - wma5, wma20
+      - ema40
       - signal_buy_prep, signal_buy, signal_sell
+      - signal_sell_l_break  : L선 하향 이탈 (상승 후 L선 안으로 진입)
+      - signal_buy_ema40     : EMA40 접셨 (저가 ≤ EMA40 ≤ 고가)
       - tema1, tema2, tema_gate_line, disparity_pct
       - signal_buy_prep_tema, signal_buy_tema
       - sugeub, signal_sugeub_spike, signal_perfect_breakout
@@ -113,6 +146,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             if s5 > s20 and s20 > s60:
                 last_K = c['close']
         c['K'] = last_K
+        c['K_static'] = last_K
 
     # 3. L-line (valuewhen of K peaks)
     last_L = None
@@ -156,6 +190,16 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                         last_L = k_1
             candles[i]['L'] = last_L
 
+    # 3-b. Whale Line (세력선): valuewhen(1, crossup(sma5, L), sma5)
+    last_whale = None
+    for i in range(n):
+        c = candles[i]
+        c_prev = candles[i-1] if i > 0 else None
+        if i > 0 and c['sma5'] is not None and c['L'] is not None and c_prev['sma5'] is not None and c_prev['L'] is not None:
+            if c_prev['sma5'] < c_prev['L'] and c['sma5'] >= c['L']:
+                last_whale = c['sma5']
+        c['whale_line'] = last_whale
+
     # 4. WMAs
     wma5 = calculate_wma(closes, 5)
     wma20 = calculate_wma(closes, 20)
@@ -164,88 +208,29 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         candles[i]['wma5'] = wma5[i]
         candles[i]['wma20'] = wma20[i]
 
-    # 5. Signals & State Tracking (K/L, Whale line, Surge, Sell, Rebuy)
-    last_whale = None
-    is_surged = False
-    recent_sell = False
-    neg_count = 0
-    
+    # 4-b. EMA40 (지수이동평균 40스 접선)
+    ema40 = calculate_ema(closes, 40)
     for i in range(n):
-        c = candles[i]
-        c_prev = candles[i-1] if i > 0 else None
-        
-        # Buy Prep: Close is within 1% under L (L * 0.99 <= Close < L)
-        if c['L'] is not None:
-            c['signal_buy_prep'] = (c['close'] >= c['L'] * 0.99) and (c['close'] < c['L'])
-        else:
-            c['signal_buy_prep'] = False
-            
-        # Buy: Close passes L (Close >= L) and previous Close was below previous L
-        if c['L'] is not None and c_prev is not None and c_prev['L'] is not None:
-            c['signal_buy'] = (c['close'] >= c['L']) and (c_prev['close'] < c_prev['L'])
-        else:
-            c['signal_buy'] = False
+        candles[i]['ema40'] = ema40[i]
 
-        # Whale Line (세력선): valuewhen(1, crossup(sma5, L), sma5)
-        if i > 0 and c['sma5'] is not None and c['L'] is not None and c_prev['sma5'] is not None and c_prev['L'] is not None:
-            if c_prev['sma5'] < c_prev['L'] and c['sma5'] >= c['L']:
-                last_whale = c['sma5']
-                is_surged = False  # Reset surge state when whale line updates
-        c['whale_line'] = last_whale
+    # 4-c. TEMA 3 (삼중지수이동평균 3)
+    tema3 = calculate_tema(closes, 3)
+    for i in range(n):
+        candles[i]['tema3'] = tema3[i]
 
-        # Check for Surge (관문선과 세력선폭의 2배이상 상승)
-        if c['K'] is not None and c['whale_line'] is not None:
-            width = abs(c['K'] - c['whale_line'])
-            target_price = c['K'] + (width * 2)
-            if c['high'] >= target_price:
-                is_surged = True
-        
-        c['is_surged'] = is_surged
+    # 4-d. Bollinger Bands (5 and 20 periods)
+    bb5_upper, bb5_mid, bb5_lower = calculate_bollinger_bands(closes, 5, 2.0)
+    bb20_upper, bb20_mid, bb20_lower = calculate_bollinger_bands(closes, 20, 2.0)
+    for i in range(n):
+        candles[i]['bb5_upper'] = bb5_upper[i]
+        candles[i]['bb5_mid'] = bb5_mid[i]
+        candles[i]['bb5_lower'] = bb5_lower[i]
+        candles[i]['bb20_upper'] = bb20_upper[i]
+        candles[i]['bb20_mid'] = bb20_mid[i]
+        candles[i]['bb20_lower'] = bb20_lower[i]
 
-        # Sell Condition 1: Surge & Drop below L (기준선 안으로 캔들이 들어올때)
-        signal_sell_1 = False
-        if is_surged and c['L'] is not None and c_prev is not None and c_prev['L'] is not None:
-            # Drop below L (crossdown L)
-            if c_prev['close'] >= c_prev['L'] and c['close'] < c['L']:
-                signal_sell_1 = True
-                is_surged = False  # Reset after sell
-
-        # Sell Condition 2: 5 SMA dead crosses 20 SMA
-        signal_sell_2 = False
-        if c['sma5'] is not None and c['sma20'] is not None and c_prev is not None and c_prev['sma5'] is not None and c_prev['sma20'] is not None:
-            if c['sma5'] < c['sma20'] and c_prev['sma5'] >= c_prev['sma20']:
-                signal_sell_2 = True
-                
-        c['signal_sell_market_1'] = signal_sell_1
-        c['signal_sell_market_2'] = signal_sell_2
-        
-        # Legacy sell signal mapping
-        c['signal_sell'] = signal_sell_1 or signal_sell_2
-
-        # Rebuy Condition: After sell, 1st or 2nd negative candle where SMA 5 turns upward
-        signal_rebuy = False
-        if signal_sell_1 or signal_sell_2:
-            recent_sell = True
-            neg_count = 0
-        elif recent_sell:
-            # Check if it's a negative candle (음봉)
-            # Assuming we only have 'close' in mock, but real API gives 'open'. If 'open' is missing, fallback to c_prev['close'] > c['close']
-            open_price = c.get('open', c_prev['close'] if c_prev else c['close'])
-            if c['close'] < open_price:
-                neg_count += 1
-                if i > 0 and c['sma5'] is not None and c_prev['sma5'] is not None:
-                    if c['sma5'] > c_prev['sma5']:
-                        signal_rebuy = True
-                        recent_sell = False  # Reset after rebuy
-                if neg_count >= 2:
-                    recent_sell = False  # Stop tracking after 2nd negative candle
-                    
-        c['signal_rebuy'] = signal_rebuy
-
-    # 6. TEMA Gate Line (테마급등관문선)
-    # TEMA1 = TEMA(close, 기간1), TEMA2 = TEMA(close, 기간2)
-    # 조건 = CrossUp(TEMA1, TEMA2)
-    # 관문선 = ValueWhen(1, 조건, TEMA1)
+    # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
+    # ── 4-e. TEMA Gate Line (calculated early to be used as stop loss) ──
     tema1 = calculate_tema(closes, tema_period1)
     tema2 = calculate_tema(closes, tema_period2)
 
@@ -259,64 +244,162 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                 and tema1[i] is not None and tema2[i] is not None
                 and tema1[i-1] is not None and tema2[i-1] is not None):
             if tema1[i-1] < tema2[i-1] and tema1[i] >= tema2[i]:
-                gate_line_val = tema1[i]  # ValueWhen(1, 조건, TEMA1)
+                gate_line_val = tema1[i]
 
         candles[i]['tema_gate_line'] = gate_line_val
 
-        # Disparity: 현재가와 관문선의 이격도 (%)
+    # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
+    # ── 5. Signals and Custom State Machine (TEMA 3 & SMA 60 Golden/Dead Cross + BB 5/20 Upper Sell & Lower Rebuy) ──
+    virtual_holding = False
+    has_seen_new_alignment_since_buy = False
+    monitoring_sell = False
+    has_crossed_bb5_upper = False
+    waiting_for_bb_rebuy = False
+    trade_K = None
+
+    for i in range(n):
+        c = candles[i]
+        c_prev = candles[i-1] if i > 0 else None
+
+        # Time window extraction for synchronization (09:00~10:00 only for first buy)
+        try:
+            t_part = c["time"].split(" ")[1]
+            h = int(t_part.split(":")[0])
+            is_buy_window = (h == 9)
+        except Exception:
+            is_buy_window = True
+
+        # Initialize new signal fields
+        c['signal_buy'] = False
+        c['signal_sell_cond1'] = False
+        c['signal_sell_cond2'] = False
+        c['signal_sell'] = False
+        c['sell_reason'] = None
+        c['buy_condition_type'] = "N/A"
+        c['signal_buy_bb_rebound'] = False
+
+        # Preserve prep/rebound fields for backward compatibility to prevent Flask errors
+        c['signal_buy_prep'] = False
+        c['signal_buy_prep_tema'] = False
+        c['signal_buy_tema'] = False
+        c['signal_buy_ema40'] = False
+        c['signal_buy_sma20_rebound'] = False
+        c['signal_sell_second_line'] = False
+        c['second_line_val'] = None
+
+        # 1. Buy Signal (TEMA 3 > SMA 60)
+        is_buy_signal = False
+        if c['tema3'] is not None and c['sma60'] is not None:
+            if c['tema3'] > c['sma60']:
+                is_buy_signal = True
+
+        # 2. Sell Signal Condition 1 (TEMA 3 & SMA 60 Dead Cross)
+        is_sell_dead_signal = False
+        if (c['tema3'] is not None and c['sma60'] is not None
+                and c_prev is not None
+                and c_prev.get('tema3') is not None
+                and c_prev.get('sma60') is not None):
+            if c_prev['tema3'] >= c_prev['sma60'] and c['tema3'] < c['sma60']:
+                is_sell_dead_signal = True
+
+        # 3. Custom Virtual Trade Tracker / State Machine
+        if not virtual_holding:
+            if waiting_for_bb_rebuy:
+                # Reset rebuy wait if trend breaks
+                if c['tema3'] is not None and c['sma60'] is not None and c['tema3'] < c['sma60']:
+                    waiting_for_bb_rebuy = False
+                
+                # Check for rebuy rebound
+                if waiting_for_bb_rebuy and c['bb5_lower'] is not None and c['low'] <= c['bb5_lower'] * 1.005:
+                    virtual_holding = True
+                    has_seen_new_alignment_since_buy = False
+                    monitoring_sell = False
+                    has_crossed_bb5_upper = False
+                    waiting_for_bb_rebuy = False
+                    trade_K = c['K_static'] if (c.get('K_static') is not None and c['K_static'] < c['close']) else None
+                    c['signal_buy_bb_rebound'] = True
+                    c['signal_buy_sma20_rebound'] = True  # For backward compatibility
+                    c['buy_condition_type'] = "BB5 Lower Rebound"
+            else:
+                if is_buy_signal and is_buy_window:
+                    virtual_holding = True
+                    has_seen_new_alignment_since_buy = False
+                    monitoring_sell = False
+                    has_crossed_bb5_upper = False
+                    waiting_for_bb_rebuy = False
+                    trade_K = c['K_static'] if (c.get('K_static') is not None and c['K_static'] < c['close']) else None
+                    c['signal_buy'] = True
+                    c['buy_condition_type'] = "TEMA 3 > SMA 60"
+        else:
+            # Holding state
+            # Check for perfect alignment (K line generated/updated for current trade)
+            s5 = c.get('sma5')
+            s20 = c.get('sma20')
+            s60 = c.get('sma60')
+            if s5 is not None and s20 is not None and s60 is not None:
+                if s5 > s20 and s20 > s60:
+                    has_seen_new_alignment_since_buy = True
+                    trade_K = c['close']
+
+            # Bollinger Band sell conditions
+            # 1) 20상한선을 돌파하면 매도관찰 진입
+            if c['bb20_upper'] is not None and c['high'] >= c['bb20_upper']:
+                monitoring_sell = True
+
+            # 2) 매도관찰 상태에서 5볼린저 상한선까지 추가 돌파
+            if monitoring_sell and c['bb5_upper'] is not None and c['high'] >= c['bb5_upper']:
+                has_crossed_bb5_upper = True
+
+            # 3) 5상한선 돌파 후 상승이 끝나면 (종가가 전일종가보다 낮아질 때)
+            is_bb_sell = False
+            if has_crossed_bb5_upper and c_prev is not None:
+                if c['close'] < c_prev['close']:
+                    is_bb_sell = True
+
+            # Check Sell Conditions
+            is_sell_cond2 = False
+            # Condition 2 (Stop Loss): 관문선 이하 1% 하락 시 손절 매도
+            if c.get('tema_gate_line') is not None:
+                if c['close'] < c['tema_gate_line'] * 0.99:
+                    is_sell_cond2 = True
+
+            if is_bb_sell:
+                c['signal_sell'] = True
+                c['sell_reason'] = "BB5 Upper Reversal"
+                virtual_holding = False  # Reset virtual trade state
+                waiting_for_bb_rebuy = True
+            elif is_sell_cond2:
+                c['signal_sell_cond2'] = True
+                c['signal_sell'] = True
+                c['sell_reason'] = "Gate-line 1% Stop Loss"
+                virtual_holding = False  # Reset virtual trade state
+                waiting_for_bb_rebuy = False
+            elif is_sell_dead_signal:
+                c['signal_sell_cond1'] = True
+                c['signal_sell'] = True
+                c['sell_reason'] = "TEMA 3 Dead Cross"
+                virtual_holding = False  # Reset virtual trade state
+                waiting_for_bb_rebuy = False
+
+        # Overwrite candle K-line with trade-specific K-line for orders & display
+        c['K'] = trade_K
+        # Map to dynamic buy signal for main.py integration
+        c['signal_buy_dynamic'] = c['signal_buy']
+
+        # Daily Close Reset logic removed to allow overnight holding.
+
+    # 6. Disparity calculation (TEMA Gate Line was already calculated before)
+    for i in range(n):
+        gate_line_val = candles[i].get('tema_gate_line')
+        # Disparity
         if gate_line_val is not None and gate_line_val > 0:
             candles[i]['disparity_pct'] = abs(candles[i]['close'] - gate_line_val) / gate_line_val * 100.0
         else:
             candles[i]['disparity_pct'] = None
 
-    # 7. TEMA Gate Line Signals (관문선 기반 매매 시그널)
-    for i in range(n):
-        c = candles[i]
-        c_prev = candles[i-1] if i > 0 else None
-
-        # Buy Prep (TEMA): 현재가가 관문선 1% 이내 밑에 도달
-        if c['tema_gate_line'] is not None:
-            c['signal_buy_prep_tema'] = (
-                c['close'] >= c['tema_gate_line'] * 0.99
-                and c['close'] < c['tema_gate_line']
-            )
-        else:
-            c['signal_buy_prep_tema'] = False
-
-        # Buy (TEMA): 현재가가 관문선을 상향돌파
-        if (c['tema_gate_line'] is not None
-                and c_prev is not None
-                and c_prev.get('tema_gate_line') is not None):
-            c['signal_buy_tema'] = (
-                c['close'] >= c['tema_gate_line']
-                and c_prev['close'] < c_prev['tema_gate_line']
-            )
-        else:
-            c['signal_buy_tema'] = False
-
-    # 8. Dynamic Buy Signal (상승장 vs 하락장 반등 매수 전략 구분)
-    # 상승중(sma5 > sma20)일 때는 L선 상향돌파(signal_buy)를 매수 신호로 함
-    # 하락 후 반등중(sma5 <= sma20)일 때는 TEMA 관문선 돌파(signal_buy_tema)를 매수 신호로 함
-    for i in range(n):
-        c = candles[i]
-        s5 = c.get('sma5')
-        s20 = c.get('sma20')
-        
-        if s5 is not None and s20 is not None:
-            if s5 > s20:
-                c['signal_buy_dynamic'] = c.get('signal_buy', False)
-                c['buy_condition_type'] = "L-line (Uptrend)"
-            else:
-                c['signal_buy_dynamic'] = c.get('signal_buy_tema', False)
-                c['buy_condition_type'] = "TEMA Gate (Rebound)"
-        else:
-            c['signal_buy_dynamic'] = False
-            c['buy_condition_type'] = "N/A"
-
     # 9. 수급(거래대금) 급증 및 돌파 시그널 계산
     for i in range(n):
         c = candles[i]
-        c_prev = candles[i-1] if i > 0 else None
         h = float(c.get('high', c['close']))
         l = float(c.get('low', c['close']))
         o = float(c.get('open', c['close']))
@@ -346,6 +429,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
 
         # 10. 기준선(L) & 세력선(whale_line) 동시 상향 돌파 시그널 (빨간 다이아몬드 지점)
         is_perfect_breakout = False
+        c_prev = candles[i-1] if i > 0 else None
         if (is_sugeub_spike and 
             c.get('L') is not None and c.get('whale_line') is not None and 
             c_prev is not None and c_prev.get('L') is not None and c_prev.get('whale_line') is not None):
@@ -356,7 +440,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             if above_lines and was_below:
                 is_perfect_breakout = True
         c['signal_perfect_breakout'] = is_perfect_breakout
-            
+
     return candles
 
 if __name__ == "__main__":
@@ -383,7 +467,13 @@ if __name__ == "__main__":
     prices.append(135.0) # peak 2
     prices.append(125.0) # drop again
     
-    mock_candles = [{'close': p} for p in prices]
+    mock_candles = [{
+        'close': p,
+        'open': p * 0.99,
+        'high': p * 1.02,
+        'low': p * 0.98,
+        'volume': 10000000 if idx % 5 == 0 else 100000
+    } for idx, p in enumerate(prices)]
     res = calculate_indicators_pure(mock_candles, use_compressed_peak=True, tema_period1=5, tema_period2=20)
     
     print("\nSample Results (Tail where indicators are active):")

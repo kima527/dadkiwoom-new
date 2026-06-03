@@ -17,68 +17,10 @@ from flask import Flask, jsonify, render_template, request
 import config
 from kiwoom_client import KiwoomClient
 from indicator import calculate_indicators_pure
-from main import load_watchlist
+from main import load_watchlist, BOT_STATE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
-
-def add_to_excel(filepath: str, code: str, name: str):
-    import openpyxl
-    wb = None
-    if os.path.exists(filepath):
-        try:
-            wb = openpyxl.load_workbook(filepath)
-            ws = wb.active
-        except Exception as e:
-            logger.error(f"Failed to load Excel file {filepath}: {e}")
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "My Pick"
-            ws.append(["종목코드", "종목명", "보유수량", "매입단가", "현재가"])
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "My Pick"
-        ws.append(["종목코드", "종목명", "보유수량", "매입단가", "현재가"])
-        
-    # Check for duplicate
-    duplicate = False
-    for r in range(2, ws.max_row + 1):
-        code_cell = ws.cell(row=r, column=1).value
-        if code_cell:
-            formatted_code = str(code_cell).strip().zfill(6)
-            if formatted_code == code.strip().zfill(6):
-                duplicate = True
-                # Update name if changed
-                ws.cell(row=r, column=2, value=name)
-                break
-                
-    if not duplicate:
-        ws.append([code.strip().zfill(6), name.strip(), "", "", ""])
-    wb.save(filepath)
-
-def delete_from_excel(filepath: str, code: str):
-    import openpyxl
-    if not os.path.exists(filepath):
-        return
-    try:
-        wb = openpyxl.load_workbook(filepath)
-        ws = wb.active
-    except Exception as e:
-        logger.error(f"Failed to load Excel for deletion: {e}")
-        return
-        
-    rows_to_delete = []
-    for r in range(2, ws.max_row + 1):
-        code_cell = ws.cell(row=r, column=1).value
-        if code_cell:
-            formatted_code = str(code_cell).strip().zfill(6)
-            if formatted_code == code.strip().zfill(6):
-                rows_to_delete.append(r)
-                
-    for r in sorted(rows_to_delete, reverse=True):
-        ws.delete_rows(r)
-    wb.save(filepath)
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -219,149 +161,14 @@ def run_backtest_simulation(candles, mode="tema", fee_tax_pct=0.20):
 def index():
     return render_template("index.html")
 
-@app.route('/api/watchlist', methods=['GET'])
-def api_get_watchlist():
-    WATCHLIST_PATH = config.WATCHLIST_FILE
-    watchlist = load_watchlist(WATCHLIST_PATH)
-    return jsonify({
-        "success": True,
-        "watchlist": watchlist
-    })
+@app.route('/live')
+def live():
+    return render_template("live.html")
 
-@app.route('/api/watchlist/add', methods=['POST'])
-def api_add_watchlist():
-    data = request.get_json() or {}
-    code = data.get("code", "").strip()
-    if not code:
-        return jsonify({"success": False, "error": "종목코드를 입력해주세요."}), 400
-        
-    code = code.zfill(6)
-    
-    # Query stock name using kiwoom_client to validate and get real name
-    name = kiwoom_client.get_stock_name(code)
-    if not name:
-        return jsonify({"success": False, "error": "유효하지 않은 종목코드이거나 API 조회에 실패했습니다."}), 400
-        
-    WATCHLIST_PATH = config.WATCHLIST_FILE
-    try:
-        add_to_excel(WATCHLIST_PATH, code, name)
-        # Reload watchlist to return updated list
-        watchlist = load_watchlist(WATCHLIST_PATH)
-        return jsonify({
-            "success": True,
-            "message": f"{name}({code}) 종목이 관심종목에 추가되었습니다.",
-            "watchlist": watchlist
-        })
-    except Exception as e:
-        logger.error(f"Error adding to watchlist: {e}")
-        return jsonify({"success": False, "error": f"관심종목 저장 중 오류가 발생했습니다: {e}"}), 500
-
-@app.route('/api/watchlist/delete', methods=['POST'])
-def api_delete_watchlist():
-    data = request.get_json() or {}
-    code = data.get("code", "").strip()
-    if not code:
-        return jsonify({"success": False, "error": "종목코드가 제공되지 않았습니다."}), 400
-        
-    code = code.zfill(6)
-    WATCHLIST_PATH = config.WATCHLIST_FILE
-    try:
-        delete_from_excel(WATCHLIST_PATH, code)
-        watchlist = load_watchlist(WATCHLIST_PATH)
-        return jsonify({
-            "success": True,
-            "message": f"종목코드 {code}가 관심종목에서 삭제되었습니다.",
-            "watchlist": watchlist
-        })
-    except Exception as e:
-        logger.error(f"Error deleting from watchlist: {e}")
-        return jsonify({"success": False, "error": f"관심종목 삭제 중 오류가 발생했습니다: {e}"}), 500
-
-@app.route('/api/holdings', methods=['GET'])
-def api_get_holdings():
-    try:
-        holdings = kiwoom_client.get_holdings()
-        return jsonify({
-            "success": True,
-            "holdings": holdings
-        })
-    except Exception as e:
-        logger.error(f"Error fetching holdings for dashboard: {e}")
-        return jsonify({"success": False, "error": f"계좌 종목 조회 중 오류가 발생했습니다: {e}"}), 500
-
-@app.route('/api/watchlist/import_holdings', methods=['POST'])
-def api_import_holdings():
-    try:
-        holdings = kiwoom_client.get_holdings()
-        if not holdings:
-            return jsonify({"success": False, "error": "가져올 계좌 보유 종목이 없거나 조회를 실패했습니다."}), 400
-            
-        WATCHLIST_PATH = config.WATCHLIST_FILE
-        added_count = 0
-        for h in holdings:
-            code = h["code"]
-            name = h["name"]
-            add_to_excel(WATCHLIST_PATH, code, name)
-            added_count += 1
-            
-        watchlist = load_watchlist(WATCHLIST_PATH)
-        return jsonify({
-            "success": True,
-            "message": f"총 {added_count}개의 보유종목을 관심종목에 연동했습니다.",
-            "watchlist": watchlist
-        })
-    except Exception as e:
-        logger.error(f"Error importing holdings to watchlist: {e}")
-        return jsonify({"success": False, "error": f"보유종목 가져오기 중 오류가 발생했습니다: {e}"}), 500
-
-@app.route('/api/watchlist/import_hts', methods=['POST'])
-def api_import_hts():
-    import glob
-    import configparser
-    
-    WATCHLIST_PATH = config.WATCHLIST_FILE
-    portfolio_files = glob.glob('C:/KiwoomHero4/user/**/Portfolio.dat', recursive=True)
-    if not portfolio_files:
-        return jsonify({"success": False, "error": "키움증권 HTS 폴더(C:/KiwoomHero4/user) 또는 Portfolio.dat 파일을 찾을 수 없습니다."}), 404
-        
-    codes = []
-    for filepath in portfolio_files:
-        try:
-            cfg = configparser.ConfigParser(strict=False, interpolation=None)
-            cfg.read(filepath, encoding='cp949')
-            for sec in cfg.sections():
-                gname = cfg.get(sec, 'GName', fallback='').strip()
-                if '나의픽' in gname:
-                    for key, val in cfg.items(sec):
-                        if key.isdigit() and val:
-                            parts = val.split(';')
-                            if parts:
-                                code = parts[0].strip()
-                                if code and len(code) == 6 and code.isdigit() and code not in codes:
-                                    codes.append(code)
-        except Exception as e:
-            logger.error(f"Error parsing Portfolio.dat at {filepath}: {e}")
-            
-    if not codes:
-        return jsonify({"success": False, "error": "영웅문 관심그룹 '나의픽'을 찾지 못했거나 등록된 종목이 없습니다."}), 400
-        
-    try:
-        name_map = kiwoom_client.get_stock_names(codes)
-        added_count = 0
-        for code in codes:
-            name = name_map.get(code, "알 수 없음")
-            add_to_excel(WATCHLIST_PATH, code, name)
-            added_count += 1
-            
-        watchlist = load_watchlist(WATCHLIST_PATH)
-        return jsonify({
-            "success": True,
-            "message": f"영웅문 관심그룹 '나의픽'에서 {added_count}개의 종목을 가져왔습니다.",
-            "watchlist": watchlist
-        })
-    except Exception as e:
-        logger.error(f"Error importing HTS watchlist: {e}")
-        return jsonify({"success": False, "error": f"가져오기 중 오류가 발생했습니다: {e}"}), 500
+@app.route('/api/live')
+def api_live():
+    """Returns the real-time bot state shared from main.py."""
+    return jsonify(BOT_STATE)
 
 @app.route('/api/backtest')
 def api_backtest():

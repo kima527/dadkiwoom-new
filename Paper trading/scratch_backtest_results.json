@@ -1,0 +1,329 @@
+{
+  "total_trades": 16,
+  "completed_trades_count": 16,
+  "winning_trades": 11,
+  "total_return": 15.87,
+  "win_rate": 68.75,
+  "avg_return": 0.99,
+  "details": {
+    "000660": {
+      "name": "SK하이닉스",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "005380": {
+      "name": "현대차",
+      "trades": [
+        {
+          "buy_time": "2026-05-29 09:15:00",
+          "buy_price": 721000.0,
+          "sell_time": "2026-05-29 14:15:00",
+          "sell_price": 724000.0,
+          "return_pct": 0.22,
+          "holding_bars": 20,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-05-29 14:45:00",
+          "buy_price": 725000.0,
+          "sell_time": "2026-06-01 09:30:00",
+          "sell_price": 756000.0,
+          "return_pct": 4.08,
+          "holding_bars": 6,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-06-01 10:30:00",
+          "buy_price": 739000.0,
+          "sell_time": "2026-06-01 10:45:00",
+          "sell_price": 741000.0,
+          "return_pct": 0.07,
+          "holding_bars": 1,
+          "is_completed": true,
+          "reason": "Gate-line 1% Stop Loss"
+        }
+      ],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "005930": {
+      "name": "삼성전자",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "010120": {
+      "name": "LS ELECTRIC",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "012330": {
+      "name": "현대모비스",
+      "trades": [
+        {
+          "buy_time": "2026-05-29 09:15:00",
+          "buy_price": 734000.0,
+          "sell_time": "2026-05-29 10:00:00",
+          "sell_price": 742000.0,
+          "return_pct": 0.89,
+          "holding_bars": 3,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-05-29 10:45:00",
+          "buy_price": 741000.0,
+          "sell_time": "2026-05-29 14:15:00",
+          "sell_price": 768000.0,
+          "return_pct": 3.44,
+          "holding_bars": 14,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-05-29 14:30:00",
+          "buy_price": 774000.0,
+          "sell_time": "2026-06-01 09:30:00",
+          "sell_price": 778000.0,
+          "return_pct": 0.32,
+          "holding_bars": 7,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        }
+      ],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "018260": {
+      "name": "삼성에스디에스",
+      "trades": [
+        {
+          "buy_time": "2026-05-27 09:15:00",
+          "buy_price": 220000.0,
+          "sell_time": "2026-05-27 10:00:00",
+          "sell_price": 228500.0,
+          "return_pct": 3.66,
+          "holding_bars": 3,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-05-27 10:30:00",
+          "buy_price": 232500.0,
+          "sell_time": "2026-05-27 11:15:00",
+          "sell_price": 236000.0,
+          "return_pct": 1.31,
+          "holding_bars": 3,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-05-27 13:00:00",
+          "buy_price": 252000.0,
+          "sell_time": "2026-05-27 13:45:00",
+          "sell_price": 244000.0,
+          "return_pct": -3.37,
+          "holding_bars": 3,
+          "is_completed": true,
+          "reason": "Gate-line 1% Stop Loss"
+        },
+        {
+          "buy_time": "2026-05-29 09:15:00",
+          "buy_price": 293000.0,
+          "sell_time": "2026-05-29 11:45:00",
+          "sell_price": 313750.0,
+          "return_pct": 6.88,
+          "holding_bars": 10,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-05-29 12:00:00",
+          "buy_price": 308500.0,
+          "sell_time": "2026-06-01 09:30:00",
+          "sell_price": 353000.0,
+          "return_pct": 14.22,
+          "holding_bars": 17,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-06-01 10:15:00",
+          "buy_price": 351500.0,
+          "sell_time": "2026-06-01 11:30:00",
+          "sell_price": 378500.0,
+          "return_pct": 7.48,
+          "holding_bars": 5,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-06-01 12:30:00",
+          "buy_price": 378000.0,
+          "sell_time": "2026-06-02 09:15:00",
+          "sell_price": 306000.0,
+          "return_pct": -19.25,
+          "holding_bars": 14,
+          "is_completed": true,
+          "reason": "Gate-line 1% Stop Loss"
+        }
+      ],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "028050": {
+      "name": "삼성E&A",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "034730": {
+      "name": "SK",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "064350": {
+      "name": "현대로템",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "079550": {
+      "name": "LIG디펜스앤에어로스페이스",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "086960": {
+      "name": "MDS테크",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "267260": {
+      "name": "HD현대일렉트릭",
+      "trades": [],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "329180": {
+      "name": "HD현대중공업",
+      "trades": [
+        {
+          "buy_time": "2026-05-26 12:00:00",
+          "buy_price": 740000.0,
+          "sell_time": "2026-05-27 09:30:00",
+          "sell_price": 739000.0,
+          "return_pct": -0.34,
+          "holding_bars": 17,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        },
+        {
+          "buy_time": "2026-06-01 11:00:00",
+          "buy_price": 703000.0,
+          "sell_time": "2026-06-01 11:15:00",
+          "sell_price": 699000.0,
+          "return_pct": -0.77,
+          "holding_bars": 1,
+          "is_completed": true,
+          "reason": "TEMA 3 Dead Cross"
+        }
+      ],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    },
+    "373220": {
+      "name": "LG에너지솔루션",
+      "trades": [
+        {
+          "buy_time": "2026-06-02 09:15:00",
+          "buy_price": 488000.0,
+          "sell_time": "2026-06-02 09:30:00",
+          "sell_price": 474500.0,
+          "return_pct": -2.97,
+          "holding_bars": 1,
+          "is_completed": true,
+          "reason": "BB5 Upper Reversal"
+        }
+      ],
+      "last_5_dates": [
+        "2026-05-27",
+        "2026-05-28",
+        "2026-05-29",
+        "2026-06-01",
+        "2026-06-02"
+      ]
+    }
+  }
+}

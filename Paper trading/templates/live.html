@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>모의매매 실시간 대시보드 | Antigravity</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg-dark: #0a0d14;
+            --bg-card: #111827;
+            --bg-card2: #161d2e;
+            --border: rgba(255,255,255,0.07);
+            --accent-green: #00f5a0;
+            --accent-blue: #00c8ff;
+            --accent-orange: #ff9f43;
+            --accent-red: #ff4757;
+            --accent-purple: #a55eea;
+            --text-primary: #e8eaf2;
+            --text-secondary: #8899aa;
+            --glow-green: 0 0 16px rgba(0,245,160,0.3);
+            --glow-blue: 0 0 16px rgba(0,200,255,0.3);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        /* ── Header ── */
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 28px;
+            background: rgba(17,24,39,0.95);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(12px);
+        }
+        .topbar-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .logo-icon { color: var(--accent-blue); font-size: 1.3rem; }
+        .logo-text {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 700;
+            font-size: 1.1rem;
+            letter-spacing: 2px;
+            color: var(--text-primary);
+        }
+        .page-title {
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+            margin-left: 4px;
+        }
+        .nav-links { display: flex; gap: 8px; }
+        .nav-link {
+            padding: 6px 16px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            text-decoration: none;
+            color: var(--text-secondary);
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+        .nav-link:hover { background: rgba(255,255,255,0.06); color: var(--text-primary); }
+        .nav-link.active {
+            background: rgba(0,200,255,0.12);
+            border-color: rgba(0,200,255,0.3);
+            color: var(--accent-blue);
+        }
+        .topbar-right { display: flex; align-items: center; gap: 12px; }
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            transition: all 0.3s;
+        }
+        .status-badge.running {
+            background: rgba(0,245,160,0.12);
+            border: 1px solid rgba(0,245,160,0.3);
+            color: var(--accent-green);
+        }
+        .status-badge.sleeping {
+            background: rgba(0,200,255,0.1);
+            border: 1px solid rgba(0,200,255,0.25);
+            color: var(--accent-blue);
+        }
+        .status-badge.idle {
+            background: rgba(136,153,170,0.1);
+            border: 1px solid rgba(136,153,170,0.2);
+            color: var(--text-secondary);
+        }
+        .pulse-dot {
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: currentColor;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.7); }
+        }
+        .refresh-info {
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* ── Main layout ── */
+        .main {
+            max-width: 1440px;
+            margin: 0 auto;
+            padding: 24px 28px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* ── KPI Tiles ── */
+        .kpi-row {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 16px;
+        }
+        .kpi-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 18px 20px;
+            position: relative;
+            overflow: hidden;
+            transition: border-color 0.3s;
+        }
+        .kpi-card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: var(--kpi-color, var(--accent-blue));
+            opacity: 0.7;
+        }
+        .kpi-label { font-size: 0.75rem; color: var(--text-secondary); font-weight: 500; margin-bottom: 8px; }
+        .kpi-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.55rem;
+            font-weight: 700;
+            line-height: 1;
+        }
+        .kpi-sub { font-size: 0.75rem; color: var(--text-secondary); margin-top: 6px; }
+        .color-green { color: var(--accent-green); --kpi-color: var(--accent-green); }
+        .color-blue { color: var(--accent-blue); --kpi-color: var(--accent-blue); }
+        .color-orange { color: var(--accent-orange); --kpi-color: var(--accent-orange); }
+        .color-purple { color: var(--accent-purple); --kpi-color: var(--accent-purple); }
+        .color-red { color: var(--accent-red); --kpi-color: var(--accent-red); }
+
+        /* ── Two column layout ── */
+        .two-col {
+            display: grid;
+            grid-template-columns: 1fr 360px;
+            gap: 20px;
+            align-items: start;
+        }
+
+        /* ── Card ── */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+        }
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+        }
+        .card-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-primary);
+        }
+        .card-title i { color: var(--accent-blue); }
+        .card-badge {
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 3px 10px;
+            border-radius: 20px;
+            background: rgba(0,200,255,0.1);
+            border: 1px solid rgba(0,200,255,0.2);
+            color: var(--accent-blue);
+        }
+        .card-body { padding: 16px 20px; }
+
+        /* ── Rankings Table ── */
+        .rank-table { width: 100%; border-collapse: collapse; }
+        .rank-table th {
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+        }
+        .rank-table td {
+            padding: 10px 12px;
+            font-size: 0.83rem;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            transition: background 0.2s;
+        }
+        .rank-table tr:hover td { background: rgba(255,255,255,0.03); }
+        .rank-table tr:last-child td { border-bottom: none; }
+        .rank-num {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+        .stock-name { font-weight: 600; }
+        .stock-code { font-size: 0.72rem; color: var(--text-secondary); font-family: 'JetBrains Mono', monospace; }
+        .price-mono { font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; }
+        .disparity-pct { font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; font-weight: 600; }
+        .signal-tag {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        .tag-buy { background: rgba(0,245,160,0.15); color: var(--accent-green); border: 1px solid rgba(0,245,160,0.3); }
+        .tag-sell { background: rgba(255,71,87,0.15); color: var(--accent-red); border: 1px solid rgba(255,71,87,0.3); }
+        .tag-up { background: rgba(0,200,255,0.1); color: var(--accent-blue); border: 1px solid rgba(0,200,255,0.2); }
+        .tag-rb { background: rgba(165,94,234,0.1); color: var(--accent-purple); border: 1px solid rgba(165,94,234,0.2); }
+        .tag-none { color: var(--text-secondary); }
+
+        /* ── Holdings ── */
+        .holding-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .holding-item:last-child { border-bottom: none; }
+        .holding-left { display: flex; flex-direction: column; gap: 3px; }
+        .holding-name { font-weight: 600; font-size: 0.88rem; }
+        .holding-qty { font-size: 0.73rem; color: var(--text-secondary); }
+        .holding-right { text-align: right; }
+        .holding-price { font-family: 'JetBrains Mono', monospace; font-size: 0.83rem; }
+        .holding-ret {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.82rem;
+            font-weight: 700;
+            margin-top: 2px;
+        }
+        .ret-pos { color: var(--accent-green); }
+        .ret-neg { color: var(--accent-red); }
+        .empty-msg {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            padding: 20px 0;
+        }
+        .empty-msg i { font-size: 1.5rem; margin-bottom: 8px; display: block; }
+
+        /* ── Alerts Feed ── */
+        .alert-feed { display: flex; flex-direction: column; gap: 8px; }
+        .alert-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 10px 14px;
+            border-radius: 10px;
+            background: var(--bg-card2);
+            border: 1px solid var(--border);
+            transition: all 0.3s;
+            animation: slideIn 0.3s ease;
+        }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(-8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .alert-icon {
+            width: 28px; height: 28px;
+            border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 0.8rem;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+        .icon-buy { background: rgba(0,245,160,0.15); color: var(--accent-green); }
+        .icon-sell { background: rgba(255,71,87,0.15); color: var(--accent-red); }
+        .icon-buy_prep { background: rgba(255,159,67,0.15); color: var(--accent-orange); }
+        .icon-error { background: rgba(255,71,87,0.15); color: var(--accent-red); }
+        .icon-info { background: rgba(0,200,255,0.12); color: var(--accent-blue); }
+        .alert-content { flex: 1; min-width: 0; }
+        .alert-name { font-weight: 600; font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .alert-msg { font-size: 0.77rem; color: var(--text-secondary); margin-top: 2px; }
+        .alert-time {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        /* ── Scrollable panels ── */
+        .scroll-panel { max-height: 520px; overflow-y: auto; }
+        .scroll-panel::-webkit-scrollbar { width: 4px; }
+        .scroll-panel::-webkit-scrollbar-track { background: transparent; }
+        .scroll-panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+
+        /* ── Last update bar ── */
+        .update-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 20px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            background: rgba(17,24,39,0.5);
+            border-top: 1px solid var(--border);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* ── Responsive ── */
+        @media (max-width: 1100px) {
+            .kpi-row { grid-template-columns: repeat(3, 1fr); }
+            .two-col { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 640px) {
+            .kpi-row { grid-template-columns: repeat(2, 1fr); }
+            .main { padding: 14px 14px; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- ── Topbar ── -->
+<header class="topbar">
+    <div class="topbar-left">
+        <i class="fa-solid fa-bolt-lightning logo-icon"></i>
+        <span class="logo-text">ANTIGRAVITY</span>
+        <span class="page-title">/ 모의매매 실시간 대시보드</span>
+    </div>
+    <nav class="nav-links">
+        <a href="/live" class="nav-link active"><i class="fa-solid fa-tower-broadcast"></i> 실시간</a>
+        <a href="/" class="nav-link"><i class="fa-solid fa-chart-area"></i> 백테스트</a>
+    </nav>
+    <div class="topbar-right">
+        <span class="refresh-info">5초마다 자동갱신</span>
+        <div id="status-badge" class="status-badge idle">
+            <div class="pulse-dot"></div>
+            <span id="status-text">대기 중</span>
+        </div>
+    </div>
+</header>
+
+<!-- ── Main ── -->
+<main class="main">
+
+    <!-- KPI Row -->
+    <section class="kpi-row">
+        <div class="kpi-card color-green">
+            <div class="kpi-label"><i class="fa-solid fa-wallet"></i> 예수금 (가용자산)</div>
+            <div class="kpi-value color-green" id="kpi-cash">--</div>
+            <div class="kpi-sub" id="kpi-holdings-count">보유종목 0개</div>
+        </div>
+        <div class="kpi-card color-blue">
+            <div class="kpi-label"><i class="fa-solid fa-list-check"></i> 감시 종목 수</div>
+            <div class="kpi-value color-blue" id="kpi-watchlist">--</div>
+            <div class="kpi-sub">나의픽 (my_pick.xlsx)</div>
+        </div>
+        <div class="kpi-card color-orange">
+            <div class="kpi-label"><i class="fa-solid fa-rotate"></i> 완료 사이클 수</div>
+            <div class="kpi-value color-orange" id="kpi-cycles">--</div>
+            <div class="kpi-sub">2분 인터벌 폴링</div>
+        </div>
+        <div class="kpi-card color-purple">
+            <div class="kpi-label"><i class="fa-solid fa-bell"></i> 총 알림 수 (세션)</div>
+            <div class="kpi-value color-purple" id="kpi-alerts">--</div>
+            <div class="kpi-sub">매수/매도/준비 포함</div>
+        </div>
+        <div class="kpi-card color-green">
+            <div class="kpi-label"><i class="fa-solid fa-clock"></i> 마지막 폴링</div>
+            <div class="kpi-value" style="font-size:1rem; color: var(--text-primary); margin-top:4px;" id="kpi-last-updated">--</div>
+            <div class="kpi-sub" id="kpi-next-poll">다음 폴링: --</div>
+        </div>
+    </section>
+
+    <!-- Main Content: Rankings + Side Panel -->
+    <div class="two-col">
+
+        <!-- LEFT: Rankings Table -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">
+                    <i class="fa-solid fa-ranking-star"></i>
+                    이격도 우선순위 감시 현황
+                </div>
+                <span class="card-badge" id="ranking-count">0 종목</span>
+            </div>
+            <div class="scroll-panel">
+                <table class="rank-table">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>종목</th>
+                            <th>현재가</th>
+                            <th>관문선</th>
+                            <th>이격도</th>
+                            <th>추세</th>
+                            <th>신호</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rank-tbody">
+                        <tr><td colspan="7" class="empty-msg" style="padding:24px; text-align:center; color:#8899aa;">
+                            <i class="fa-solid fa-spinner fa-spin"></i> 데이터 로딩 중...
+                        </td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="update-bar">
+                <span><i class="fa-solid fa-circle-info"></i> 이격도 낮은 순 = 매수 우선순위 높음</span>
+                <span id="rank-update-time">--</span>
+            </div>
+        </div>
+
+        <!-- RIGHT: Holdings + Alerts -->
+        <div style="display:flex; flex-direction:column; gap:16px;">
+
+            <!-- Holdings -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <i class="fa-solid fa-briefcase"></i>
+                        보유 종목
+                    </div>
+                    <span class="card-badge" id="holdings-badge">0 종목</span>
+                </div>
+                <div class="card-body" id="holdings-body">
+                    <div class="empty-msg">
+                        <i class="fa-regular fa-folder-open"></i>
+                        현재 보유 종목이 없습니다
+                    </div>
+                </div>
+            </div>
+
+            <!-- Alert Feed -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <i class="fa-solid fa-bell"></i>
+                        실시간 알림 피드
+                    </div>
+                    <span class="card-badge" id="alerts-badge">0건</span>
+                </div>
+                <div class="card-body scroll-panel" style="max-height:320px;" id="alerts-body">
+                    <div class="empty-msg">
+                        <i class="fa-regular fa-bell-slash"></i>
+                        아직 알림이 없습니다
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+</main>
+
+<script>
+const ALERT_ICONS = {
+    buy:      { cls: 'icon-buy',      icon: 'fa-arrow-trend-up' },
+    sell:     { cls: 'icon-sell',     icon: 'fa-arrow-trend-down' },
+    buy_prep: { cls: 'icon-buy_prep', icon: 'fa-triangle-exclamation' },
+    error:    { cls: 'icon-error',    icon: 'fa-xmark' },
+    info:     { cls: 'icon-info',     icon: 'fa-circle-info' },
+};
+
+function fmtMoney(v) {
+    if (v == null || v === 0) return '--';
+    return Number(v).toLocaleString('ko-KR') + '원';
+}
+function fmtNum(v) {
+    if (v == null) return '--';
+    return Number(v).toLocaleString('ko-KR');
+}
+
+function setStatus(status) {
+    const badge = document.getElementById('status-badge');
+    const text = document.getElementById('status-text');
+    badge.className = 'status-badge ' + status;
+    if (status === 'running') text.textContent = '스캔 중';
+    else if (status === 'sleeping') text.textContent = '대기 중';
+    else text.textContent = '시작 전';
+}
+
+function renderHoldings(holdings) {
+    const body = document.getElementById('holdings-body');
+    const badge = document.getElementById('holdings-badge');
+    badge.textContent = `${holdings.length} 종목`;
+
+    if (!holdings.length) {
+        body.innerHTML = `<div class="empty-msg"><i class="fa-regular fa-folder-open"></i>현재 보유 종목이 없습니다</div>`;
+        return;
+    }
+    body.innerHTML = holdings.map(h => {
+        const ret = h.return_pct;
+        const retClass = ret >= 0 ? 'ret-pos' : 'ret-neg';
+        const retSign = ret >= 0 ? '+' : '';
+        return `
+        <div class="holding-item">
+            <div class="holding-left">
+                <div class="holding-name">${h.name}</div>
+                <div class="holding-qty">${h.code} | ${fmtNum(h.quantity)}주</div>
+            </div>
+            <div class="holding-right">
+                <div class="holding-price">${fmtMoney(h.current_price)}</div>
+                <div class="holding-ret ${retClass}">${retSign}${ret?.toFixed(2)}%</div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function renderRankings(rankings, lastUpdated) {
+    const tbody = document.getElementById('rank-tbody');
+    const badge = document.getElementById('ranking-count');
+    const timeEl = document.getElementById('rank-update-time');
+    badge.textContent = `${rankings.length} 종목`;
+    timeEl.textContent = lastUpdated || '--';
+
+    if (!rankings.length) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:24px;color:#8899aa;">
+            <i class="fa-solid fa-clock fa-spin"></i> 다음 폴링 사이클 대기 중...
+        </td></tr>`;
+        return;
+    }
+
+    tbody.innerHTML = rankings.map(r => {
+        const disp = r.disparity_pct != null ? r.disparity_pct.toFixed(2) + '%' : 'N/A';
+        const gate = r.gate_line != null ? fmtNum(r.gate_line) + '원' : 'N/A';
+        const price = fmtNum(r.price) + '원';
+        const trendTag = r.trend === 'uptrend'
+            ? `<span class="signal-tag tag-up"><i class="fa-solid fa-arrow-trend-up"></i> 상승중</span>`
+            : `<span class="signal-tag tag-rb"><i class="fa-solid fa-rotate-left"></i> 반등중</span>`;
+
+        let signalTag = `<span class="tag-none">-</span>`;
+        if (r.signal_buy) signalTag = `<span class="signal-tag tag-buy">🚀 매수</span>`;
+        else if (r.signal_sell) signalTag = `<span class="signal-tag tag-sell">📉 매도</span>`;
+
+        return `
+        <tr>
+            <td class="rank-num">${r.rank}</td>
+            <td>
+                <div class="stock-name">${r.name}</div>
+                <div class="stock-code">${r.code}</div>
+            </td>
+            <td class="price-mono">${price}</td>
+            <td class="price-mono" style="color:var(--text-secondary)">${gate}</td>
+            <td class="disparity-pct" style="color:${parseFloat(r.disparity_pct) < 1 ? 'var(--accent-green)' : 'var(--text-primary)'}">${disp}</td>
+            <td>${trendTag}</td>
+            <td>${signalTag}</td>
+        </tr>`;
+    }).join('');
+}
+
+function renderAlerts(alerts) {
+    const body = document.getElementById('alerts-body');
+    const badge = document.getElementById('alerts-badge');
+    badge.textContent = `${alerts.length}건`;
+    document.getElementById('kpi-alerts').textContent = alerts.length;
+
+    if (!alerts.length) {
+        body.innerHTML = `<div class="empty-msg"><i class="fa-regular fa-bell-slash"></i>아직 알림이 없습니다</div>`;
+        return;
+    }
+    const feed = document.createElement('div');
+    feed.className = 'alert-feed';
+    feed.innerHTML = alerts.slice(0, 20).map(a => {
+        const ic = ALERT_ICONS[a.type] || ALERT_ICONS.info;
+        const timeShort = a.time ? a.time.split(' ')[1] : '--';
+        return `
+        <div class="alert-item">
+            <div class="alert-icon ${ic.cls}"><i class="fa-solid ${ic.icon}"></i></div>
+            <div class="alert-content">
+                <div class="alert-name">${a.name || '시스템'} ${a.code ? '(' + a.code + ')' : ''}</div>
+                <div class="alert-msg">${a.message}</div>
+            </div>
+            <div class="alert-time">${timeShort}</div>
+        </div>`;
+    }).join('');
+    body.innerHTML = '';
+    body.appendChild(feed);
+}
+
+let autoRefreshTimer = null;
+let countdown = 5;
+
+function startCountdown() {
+    clearInterval(autoRefreshTimer);
+    countdown = 5;
+    autoRefreshTimer = setInterval(() => {
+        countdown--;
+        document.querySelector('.refresh-info').textContent = `${countdown}초 후 갱신`;
+        if (countdown <= 0) {
+            clearInterval(autoRefreshTimer);
+            fetchLive();
+        }
+    }, 1000);
+}
+
+async function fetchLive() {
+    document.querySelector('.refresh-info').textContent = '갱신 중...';
+    try {
+        const res = await fetch('/api/live');
+        const data = await res.json();
+
+        // KPIs
+        setStatus(data.status || 'idle');
+        document.getElementById('kpi-cash').textContent = fmtMoney(data.cash);
+        document.getElementById('kpi-watchlist').textContent = data.watchlist_count ?? '--';
+        document.getElementById('kpi-cycles').textContent = data.cycle_count ?? '--';
+        document.getElementById('kpi-holdings-count').textContent = `보유종목 ${(data.holdings || []).length}개`;
+        document.getElementById('kpi-last-updated').textContent = data.last_updated || '--';
+        document.getElementById('kpi-next-poll').textContent = data.next_poll_at ? `다음 폴링: ${data.next_poll_at.split(' ')[1]}` : '다음 폴링: --';
+
+        // Rankings
+        renderRankings(data.rankings || [], data.last_updated);
+
+        // Holdings
+        renderHoldings(data.holdings || []);
+
+        // Alerts
+        renderAlerts(data.alerts || []);
+
+    } catch (e) {
+        console.error('Live API error:', e);
+        document.querySelector('.refresh-info').textContent = '연결 오류';
+    }
+    startCountdown();
+}
+
+// Start
+fetchLive();
+</script>
+</body>
+</html>

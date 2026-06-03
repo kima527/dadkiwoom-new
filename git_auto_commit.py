@@ -1,3 +1,16 @@
+import sys
+import io
+
+# Windows 콘솔에서 한국어(UTF-8)가 깨지지 않도록 안전하게 설정
+if sys.platform.startswith("win"):
+    try:
+        if sys.stdout and not sys.stdout.closed:
+            sys.stdout.reconfigure(encoding="utf-8")
+        if sys.stderr and not sys.stderr.closed:
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 import os
 import time
 import subprocess
