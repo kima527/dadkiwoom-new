@@ -1,6 +1,9 @@
 # Environments
 .env
 .env.example
+.env*
+*.env*
+.env copy
 
 # Python cache
 __pycache__/
