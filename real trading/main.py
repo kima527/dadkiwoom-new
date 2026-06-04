@@ -982,9 +982,8 @@ def run_trading_bot():
                                 sent_alerts[code]["buy_reason"] = "dynamic"
 
                             if not is_held:
-                                # 단일 종목 예산과 일반 종목 예산 구분
-                                trade_budget = config.SINGLE_STOCK_BUDGET if config.TARGET_SINGLE_STOCK_CODE else config.BUDGET_PER_STOCK
-                                qty = int(trade_budget / close_price)
+                                # 당분간은 1주만 매매하도록 고정 (사용자 요청)
+                                qty = 1
                                 if qty > 0:
                                     order_res = client.place_buy_order(code, qty, price=close_price, order_type="3")
                                     if order_res and order_res.get("return_code") == 0:
