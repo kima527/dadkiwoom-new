@@ -427,7 +427,5 @@ def run_trading_bot():
         time.sleep(120)
 
 if __name__ == "__main__":
-    try:
-        run_trading_bot()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
+    import sys
+    sys.exit("⚠️ 모의매매(Paper trading)는 비활성화되었습니다. 실전매매(real trading) 폴더의 봇을 실행해주세요.")

@@ -1316,12 +1316,6 @@ def start_dashboard():
 
 
 if __name__ == "__main__":
-    import webbrowser, threading
-    # 0.5초 뒤 브라우저 열기 (서버 기동 후)
-    threading.Timer(2.5, lambda: webbrowser.open("http://127.0.0.1:5000/live")).start()
-    start_dashboard()
-    try:
-        run_trading_bot()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
+    import sys
+    sys.exit("⚠️ 모의매매(Paper trading)는 비활성화되었습니다. 실전매매(real trading) 폴더의 봇을 실행해주세요.")
 
