@@ -533,8 +533,9 @@ def run_trading_bot():
         holdings = client.get_holdings()
         
         # Filter holdings to target stock if configured
-        if config.TARGET_SINGLE_STOCK_CODE:
-            holdings = [h for h in holdings if h["code"] == config.TARGET_SINGLE_STOCK_CODE]
+        target_code = get_daily_target_stock_code()
+        if target_code:
+            holdings = [h for h in holdings if h["code"] == target_code]
             
         held_dict = {h["code"]: h for h in holdings}
         cash = client.get_cash_balance()
