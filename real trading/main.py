@@ -218,20 +218,27 @@ def run_trading_bot():
     """Main trading bot loop."""
     logger.info("Starting Kiwoom 15-Min Chart Trading Alert Bot...")
     
-    # Prompt for credentials at startup
-    print("=" * 65)
-    print("      키움증권 API 호출을 위한 APP KEY 및 SECRET KEY 입력이 필요합니다.")
-    print("=" * 65)
-    app_key = input("Enter Kiwoom APP KEY: ").strip()
-    app_secret = input("Enter Kiwoom APP SECRET: ").strip()
-    print("=" * 65)
-    
+    # Use credentials from config if present, otherwise prompt
+    app_key = config.KIWOOM_APP_KEY
+    app_secret = getattr(config, 'KIWOOM_REAL_APP_SECRET', getattr(config, 'KIWOOM_APP_SECRET', ''))
+
     if not app_key or not app_secret:
-        logger.error("App Key and Secret Key are required to start the bot. Exiting.")
-        sys.exit(1)
+        print("=" * 65)
+        print("      키움증권 API 호출을 위한 APP KEY 및 SECRET KEY 입력이 필요합니다.")
+        print("=" * 65)
+        app_key = input("Enter Kiwoom APP KEY: ").strip()
+        app_secret = input("Enter Kiwoom APP SECRET: ").strip()
+        print("=" * 65)
         
-    config.KIWOOM_APP_KEY = app_key
-    config.KIWOOM_APP_SECRET = app_secret
+        if not app_key or not app_secret:
+            logger.error("App Key and Secret Key are required to start the bot. Exiting.")
+            sys.exit(1)
+            
+        config.KIWOOM_APP_KEY = app_key
+        if hasattr(config, 'KIWOOM_REAL_APP_SECRET'):
+            config.KIWOOM_REAL_APP_SECRET = app_secret
+        else:
+            config.KIWOOM_APP_SECRET = app_secret
 
     logger.info(f"TEMA Settings: Period1={config.TEMA_PERIOD_SHORT}, Period2={config.TEMA_PERIOD_LONG}")
     
@@ -321,11 +328,19 @@ def run_trading_bot():
                 # Fetch top trading value & top fluctuation stocks
                 top_value_codes = []
                 top_flu_rates_map = {}
-                try:
-                    top_value_codes = client.get_top_trading_value_stocks(market_type="000", limit=100)
-                    top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
-                except Exception as rank_err:
-                    logger.error(f"Failed to fetch market rankings: {rank_err}")
+                
+                # 08시~09시 사이에는 거래대금/등락률 상위가 검색되지 않으므로 조회를 건너뜁니다.
+                now_kst = datetime.now(KST)
+                is_pre_nine = (now_kst.hour == 8)
+                
+                if is_pre_nine:
+                    logger.info("08시~09시 KST 시간대이므로 거래대금/등락률 상위 조회를 건너뛰고 전체 관심종목을 대상으로 매매종목을 선정합니다.")
+                else:
+                    try:
+                        top_value_codes = client.get_top_trading_value_stocks(market_type="000", limit=100)
+                        top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
+                    except Exception as rank_err:
+                        logger.error(f"Failed to fetch market rankings: {rank_err}")
 
                 top_flu_codes = list(top_flu_rates_map.keys())
 
@@ -333,7 +348,7 @@ def run_trading_bot():
                 filtered_candidates = []
                 filter_reason = "Fallback (전체 관심종목)"
                 
-                if top_value_codes and top_flu_codes:
+                if not is_pre_nine and top_value_codes and top_flu_codes:
                     val_set = set(top_value_codes)
                     flu_set = set(top_flu_codes)
                     leaders = val_set.intersection(flu_set) # 거래대금 상위 & 등락률 상위 교집합
@@ -548,12 +563,16 @@ def run_trading_bot():
         # ────────────────────────────────────────────────────────────
         stock_results = []
         
-        # Fetch real-time fluctuation rates map
+        # Fetch real-time fluctuation rates map (08시~09시 사이에는 조회 생략)
         top_flu_rates_map = {}
-        try:
-            top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
-        except Exception:
-            pass
+        now_kst = datetime.now(timezone(timedelta(hours=9)))
+        if now_kst.hour == 8:
+            logger.debug("Before 09:00 KST, skipping real-time fluctuation rates fetch.")
+        else:
+            try:
+                top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
+            except Exception:
+                pass
 
         for stock in watchlist:
             code = stock["code"]
@@ -747,8 +766,8 @@ def run_trading_bot():
             t_hour = now_kst.hour
             t_min  = now_kst.minute
 
-            # ① 동적 매수 윈도우 (모의투자 시간대: 09:00 ~ 10:00)
-            is_buy_window = (t_hour == 9)
+            # ① 동적 매수 윈도우 (08:00 ~ 10:00)
+            is_buy_window = (t_hour == 8 or t_hour == 9)
             # ② 재매수 윈도우 (10:00 ~ 15:20)
             is_rebuy_window = (t_hour >= 10 and (t_hour < 15 or (t_hour == 15 and t_min < 20)))
             # ③ 10:00 이후 : L선 하향 이탈 추가 매도 활성화
@@ -1202,7 +1221,7 @@ def start_dashboard():
             try:
                 t_part = cur["time"].split(" ")[1]
                 h, m = map(int, t_part.split(":")[:2])
-                is_buy_window = (h == 9)
+                is_buy_window = (h == 8 or h == 9)
                 is_rebuy_window = (h >= 10 and (h < 15 or (h == 15 and m < 20)))
             except Exception:
                 is_buy_window = True

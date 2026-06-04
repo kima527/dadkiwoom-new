@@ -86,6 +86,22 @@ def is_market_open() -> bool:
 def run_trading_bot():
     """Main trading bot loop."""
     logger.info("Starting Kiwoom 15-Min Chart Trading Alert Bot...")
+    
+    # Prompt for credentials at startup
+    print("=" * 65)
+    print("      키움증권 API 호출을 위한 APP KEY 및 SECRET KEY 입력이 필요합니다.")
+    print("=" * 65)
+    app_key = input("Enter Kiwoom APP KEY: ").strip()
+    app_secret = input("Enter Kiwoom APP SECRET: ").strip()
+    print("=" * 65)
+    
+    if not app_key or not app_secret:
+        logger.error("App Key and Secret Key are required to start the bot. Exiting.")
+        sys.exit(1)
+        
+    config.KIWOOM_APP_KEY = app_key
+    config.KIWOOM_APP_SECRET = app_secret
+
     logger.info(f"TEMA Settings: Period1={config.TEMA_PERIOD_SHORT}, Period2={config.TEMA_PERIOD_LONG}")
     
     # 1. Initialize Kiwoom client, notifier, and DataCollector
@@ -391,7 +407,7 @@ def run_trading_bot():
                         f"🔄 <b>[재매수 신호 발생]</b>\n"
                         f"종목: {name} ({code})\n"
                         f"현재가: {close_price:,.0f}원\n"
-                        f"사유: 매도 후 음봉에서 5이평선 상승 반전\n"
+                        f"사유: 매도 후 5이평 60이평 골든크로스\n"
                         f"시간: {candle_time}\n"
                         f"<b>시장가 재매수 주문을 실행합니다!</b>"
                     )

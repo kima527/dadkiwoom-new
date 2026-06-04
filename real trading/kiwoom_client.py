@@ -28,6 +28,7 @@ from kiwoom_rest_api.koreanstock.account import Account
 from kiwoom_rest_api.koreanstock.chart import Chart
 from kiwoom_rest_api.koreanstock.order import Order
 from kiwoom_rest_api.koreanstock.rank_info import RankInfo
+from kiwoom_rest_api.koreanstock.stockinfo import StockInfo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class KiwoomRealClient:
         self.chart_api = Chart(base_url=self.base_url, token_manager=self.token_manager)
         self.order_api = Order(base_url=self.base_url, token_manager=self.token_manager)
         self.rank_api = RankInfo(base_url=self.base_url, token_manager=self.token_manager)
+        self.stock_info_api = StockInfo(base_url=self.base_url, token_manager=self.token_manager)
 
     def test_connection(self) -> bool:
         """
@@ -55,7 +57,7 @@ class KiwoomRealClient:
         """
         logger.info("Verifying Live API authentication token...")
         try:
-            token = self.token_manager.get_access_token()
+            token = self.token_manager.get_token()
             if token:
                 logger.info("✅ Live OAuth 2.0 Access Token successfully issued and validated!")
                 return True
@@ -311,6 +313,196 @@ class KiwoomRealClient:
         except Exception as e:
             logger.error(f"Error placing sell order: {e}")
             return None
+
+    def get_1min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
+        """
+        주식 종목의 1분봉 차트 데이터를 조회합니다.
+        """
+        logger.info(f"Fetching 1-minute candles for stock code {stock_code}...")
+        try:
+            result = self.chart_api.stock_minute_chart_request_ka10080(
+                stk_cd=stock_code,
+                tic_scope="1",
+                upd_stkpc_tp="1"
+            )
+            if not result:
+                return []
+                
+            raw_candles = result.get("stk_min_pole_chart_qry", [])
+            if not raw_candles:
+                return []
+                
+            parsed_candles = []
+            for item in raw_candles:
+                raw_time = item.get("cntr_tm", "").strip()
+                if len(raw_time) < 12:
+                    continue
+                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
+                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
+                
+                try:
+                    close_prc = abs(float(item.get("cur_prc", 0.0)))
+                    open_prc = abs(float(item.get("open_pric", 0.0)))
+                    high_prc = abs(float(item.get("high_pric", 0.0)))
+                    low_prc = abs(float(item.get("low_pric", 0.0)))
+                    volume = int(item.get("trde_qty", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
+                parsed_candles.append({
+                    "time": dt_str,
+                    "date": date_only,
+                    "open": open_prc,
+                    "high": high_prc,
+                    "low": low_prc,
+                    "close": close_prc,
+                    "volume": volume
+                })
+                
+            parsed_candles.sort(key=lambda x: x["time"])
+            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
+            target_dates = unique_dates[-last_n_days:]
+            return [c for c in parsed_candles if c["date"] in target_dates]
+        except Exception as e:
+            logger.error(f"Error fetching 1-min candles: {e}")
+            return []
+
+    def get_daily_candles(self, stock_code: str, last_n_days: int = 80) -> list:
+        """
+        주식 종목의 일봉 차트 데이터를 조회합니다.
+        """
+        logger.info(f"Fetching daily candles for stock code {stock_code}...")
+        try:
+            import datetime
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            result = self.chart_api.stock_daily_chart_request_ka10081(
+                stk_cd=stock_code,
+                base_dt=today_str,
+                upd_stkpc_tp="1"
+            )
+            if not result:
+                return []
+                
+            raw_candles = result.get("stk_dt_pole_chart_qry", [])
+            if not raw_candles:
+                return []
+                
+            parsed_candles = []
+            for item in raw_candles:
+                raw_time = item.get("dt", "").strip()
+                if len(raw_time) < 8:
+                    continue
+                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
+                dt_str = f"{date_only} 09:00:00"
+                
+                try:
+                    close_prc = abs(float(item.get("cur_prc", 0.0)))
+                    open_prc = abs(float(item.get("open_pric", 0.0)))
+                    high_prc = abs(float(item.get("high_pric", 0.0)))
+                    low_prc = abs(float(item.get("low_pric", 0.0)))
+                    volume = int(item.get("trde_qty", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
+                parsed_candles.append({
+                    "time": dt_str,
+                    "date": date_only,
+                    "open": open_prc,
+                    "high": high_prc,
+                    "low": low_prc,
+                    "close": close_prc,
+                    "volume": volume
+                })
+                
+            parsed_candles.sort(key=lambda x: x["time"])
+            return parsed_candles[-last_n_days:]
+        except Exception as e:
+            logger.error(f"Error fetching daily candles: {e}")
+            return []
+
+    def get_stock_name(self, stock_code: str) -> str:
+        """
+        주식 종목의 이름을 조회합니다.
+        """
+        logger.info(f"Fetching stock name for stock code {stock_code}...")
+        try:
+            code = str(stock_code).strip().zfill(6)
+            result = self.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
+            if result and result.get("return_code") == 0:
+                name = result.get("stk_nm", "").strip()
+                if name:
+                    return name
+            err_msg = result.get("return_msg") if result else "Empty API response"
+            logger.error(f"Failed to fetch stock name for {code}: {err_msg}")
+            return None
+        except Exception as e:
+            logger.error(f"Error in get_stock_name for {stock_code}: {e}")
+            return None
+
+    def get_stock_names(self, stock_codes: list) -> dict:
+        """
+        여러 주식 종목의 이름을 일괄 조회합니다.
+        """
+        if not stock_codes:
+            return {}
+            
+        logger.info(f"Fetching stock names for {len(stock_codes)} codes in batch...")
+        codes = [str(c).strip().zfill(6) for c in stock_codes if c]
+        chunk_size = 50
+        result_map = {}
+        
+        for i in range(0, len(codes), chunk_size):
+            chunk = codes[i:i + chunk_size]
+            code_str = "|".join(chunk)
+            try:
+                result = self.stock_info_api.watchlist_stock_information_request_ka10095(stock_code=code_str)
+                if result and result.get("return_code") == 0:
+                    items = result.get("atn_stk_infr", [])
+                    for item in items:
+                        cd = item.get("stk_cd", "").strip()
+                        nm = item.get("stk_nm", "").strip()
+                        if cd and nm:
+                            result_map[cd] = nm
+                else:
+                    err_msg = result.get("return_msg") if result else "No response"
+                    logger.error(f"Batch stock info request failed for chunk {i}: {err_msg}")
+            except Exception as e:
+                logger.error(f"Error in batch stock info query for chunk {i}: {e}")
+                
+        return result_map
+
+    def get_top_fluctuation_stocks(self, market_type: str = "000", limit: int = 100) -> list:
+        """
+        대비 상승률 상위 종목 코드를 조회합니다.
+        """
+        logger.info("Fetching top price change rate stocks...")
+        try:
+            result = self.rank_api.top_day_over_day_change_rate_request_ka10027(
+                mrkt_tp=market_type,
+                sort_tp="1",
+                trde_qty_cnd="0000",
+                stk_cnd="0",
+                crd_cnd="0",
+                updown_incls="1",
+                pric_cnd="0",
+                trde_prica_cnd="0",
+                stex_tp="3"
+            )
+            if not result:
+                return []
+            
+            raw_list = result.get("pred_pre_flu_rt_upper", [])
+            codes = []
+            for item in raw_list[:limit]:
+                code = item.get("stk_cd", "").strip()
+                if code:
+                    codes.append(code)
+            return codes
+        except Exception as e:
+            logger.error(f"Error fetching top price change rate stocks: {e}")
+            return []
+
+KiwoomClient = KiwoomRealClient
 
 if __name__ == "__main__":
     client = KiwoomRealClient()

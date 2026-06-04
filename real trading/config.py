@@ -17,8 +17,12 @@ KIWOOM_ACCOUNT_NUM = os.getenv("KIWOOM_REAL_ACCOUNT_NUM", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# KakaoTalk Settings
+KAKAO_APP_KEY = os.getenv("KAKAO_APP_KEY", "")
+KAKAO_REFRESH_TOKEN = os.getenv("KAKAO_REFRESH_TOKEN", "")
+
 # Watchlist Excel File Name
-WATCHLIST_FILE = "my_pick.xlsx"
+WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_pick.xlsx")
 
 # TEMA Gate Line Settings
 TEMA_PERIOD_SHORT = int(os.getenv("TEMA_PERIOD_SHORT", "5"))

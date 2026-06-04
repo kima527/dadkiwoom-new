@@ -18,7 +18,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from kiwoom_client import KiwoomClient
-from indicator import calculate_indicators_pure
+from indicator import calculate_indicators_pure, calculate_indicators_1min
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -43,13 +43,14 @@ def load_raw_watchlist(filepath: str) -> list:
         print(f"Error loading raw watchlist: {e}")
         return []
 
-def run_backtest_simulation(candles, mode="dynamic", fee_tax_pct=0.20):
+def run_backtest_simulation(candles, candles_1m=None, mode="dynamic", fee_tax_pct=0.20):
     trades = []
     is_holding = False
     buy_price = 0.0
     buy_time = None
     buy_index = -1
-    sold_qty = 0  # To track the quantity for rebuying
+    sold_qty = 0
+    tracking_mode = "15m"
     
     if mode == "tema":
         buy_signal_key = "signal_buy_tema"
@@ -59,85 +60,208 @@ def run_backtest_simulation(candles, mode="dynamic", fee_tax_pct=0.20):
         buy_signal_key = "signal_perfect_breakout"
     else: # mode == "dynamic"
         buy_signal_key = "signal_buy_dynamic"
-    sell_signal_key = "signal_sell"
-    
-    n = len(candles)
-    for i in range(n - 1):
-        current = candles[i]
-        nxt = candles[i + 1]
         
-        # Determine hour and minute for the candle time window
-        try:
-            t_part = current["time"].split(" ")[1]
-            h, m = map(int, t_part.split(":")[:2])
-            is_buy_window = (h == 9)
-            is_rebuy_window = (h >= 10 and (h < 15 or (h == 15 and m < 20)))
-        except Exception:
-            is_buy_window = True
-            is_rebuy_window = True
+    has_1m_data = set()
+    if candles_1m:
+        has_1m_data = set(c["date"] for c in candles_1m)
+        candles_1m.sort(key=lambda x: x["time"])
+        
+    n = len(candles)
+    i = 1
+    while i < n:
+        prev_15m = candles[i-1]
+        curr_15m = candles[i]
+        date_str = curr_15m["date"]
+        
+        if date_str not in has_1m_data:
+            # --- Fallback to 15-minute simulation ---
+            try:
+                t_part = curr_15m["time"].split(" ")[1]
+                h, m = map(int, t_part.split(":")[:2])
+                is_buy_window = (h == 9)
+            except Exception:
+                is_buy_window = True
+                
+            if not is_holding:
+                sugeub_ok = True
+                if mode == "sugeub":
+                    sugeub_ok = curr_15m.get('daily_breakout_ok', False)
+                
+                if is_buy_window and curr_15m.get(buy_signal_key) and sugeub_ok:
+                    is_holding = True
+                    buy_price = curr_15m["close"]
+                    buy_time = curr_15m["time"]
+                    buy_index = i
+                    tracking_mode = "15m"
+                    sold_qty = 0
+            else:
+                if curr_15m.get("signal_sell"):
+                    sell_price = curr_15m["close"]
+                    sell_time = curr_15m["time"]
+                    sell_reason = curr_15m.get("sell_reason", "전략 매도")
+                    
+                    gross_return = ((sell_price - buy_price) / buy_price) * 100.0
+                    net_return = gross_return - fee_tax_pct
+                    holding_bars = i - buy_index
+                    
+                    trades.append({
+                        "buy_time": buy_time,
+                        "buy_price": buy_price,
+                        "sell_time": sell_time,
+                        "sell_price": sell_price,
+                        "return_pct": round(net_return, 2),
+                        "holding_bars": holding_bars,
+                        "is_completed": True,
+                        "reason": sell_reason
+                    })
+                    is_holding = False
+                    tracking_mode = "15m"
+                    sold_qty = 0
+            i += 1
             
-        if not is_holding:
-            sugeub_ok = True
-            if mode == "sugeub":
-                sugeub_ok = current.get('daily_breakout_ok', False)
-            if is_buy_window and current.get(buy_signal_key) and sugeub_ok:
-                is_holding = True
-                buy_price = nxt["open"]
-                buy_time = nxt["time"]
-                buy_index = i + 1
-                buy_reason = "Dynamic Buy"
-            elif mode != "sugeub" and is_rebuy_window and current.get("signal_buy_bb_rebound") and sold_qty > 0:
-                is_holding = True
-                buy_price = nxt["open"]
-                buy_time = nxt["time"]
-                buy_index = i + 1
-                buy_reason = "BB5 Lower Rebound Rebuy"
-                sold_qty = 0  # Reset after rebuy
         else:
-            if current.get(sell_signal_key):
-                sell_price = nxt["open"]
-                sell_time = nxt["time"]
+            # --- 1-minute simulation for the 15-minute interval ---
+            interval_1m = [c for c in candles_1m if prev_15m["time"] < c["time"] <= curr_15m["time"]]
+            if not interval_1m:
+                i += 1
+                continue
                 
-                gross_return = ((sell_price - buy_price) / buy_price) * 100.0
-                net_return = gross_return - fee_tax_pct
-                holding_bars = (i + 1) - buy_index
+            for idx_1m, c1m in enumerate(interval_1m):
+                global_idx = candles_1m.index(c1m)
+                prev_c1m = candles_1m[global_idx - 1] if global_idx > 0 else c1m
                 
-                sell_reason = current.get("sell_reason", "전략 매도")
+                is_15m_end = (c1m["time"] == curr_15m["time"])
                 
-                trades.append({
-                    "buy_time": buy_time,
-                    "buy_price": buy_price,
-                    "sell_time": sell_time,
-                    "sell_price": sell_price,
-                    "return_pct": round(net_return, 2),
-                    "holding_bars": holding_bars,
-                    "is_completed": True,
-                    "reason": sell_reason
-                })
-                is_holding = False
+                if is_15m_end:
+                    if curr_15m.get("signal_sell_sma5_sma60_dead"):
+                        tracking_mode = "15m"
+                        sold_qty = 0
+                        if is_holding:
+                            sell_price = c1m["close"]
+                            sell_time = c1m["time"]
+                            gross_return = ((sell_price - buy_price) / buy_price) * 100.0
+                            net_return = gross_return - fee_tax_pct
+                            trades.append({
+                                "buy_time": buy_time,
+                                "buy_price": buy_price,
+                                "sell_time": sell_time,
+                                "sell_price": sell_price,
+                                "return_pct": round(net_return, 2),
+                                "holding_bars": 0,
+                                "is_completed": True,
+                                "reason": "15m SMA5-60 Dead Cross"
+                            })
+                            is_holding = False
+                        continue
+                    
+                    elif not curr_15m.get("sma5_gt_sma60"):
+                        tracking_mode = "15m"
+                        sold_qty = 0
                 
-                # If sold via BB5 Upper Reversal, we can rebuy
-                if sell_reason == "BB5 Upper Reversal":
-                    sold_qty = 1.0  # Set flag to allow rebuy
-                else:
-                    sold_qty = 0.0  # Reset on normal stop loss
-                
+                if tracking_mode == "1m":
+                    tema20_1m = c1m.get("tema20")
+                    sma40_1m = c1m.get("sma40")
+                    prev_tema20_1m = prev_c1m.get("tema20")
+                    prev_sma40_1m = prev_c1m.get("sma40")
+                    
+                    is_1m_dead_cross = False
+                    is_1m_gold_cross = False
+                    
+                    if (tema20_1m is not None and sma40_1m is not None
+                            and prev_tema20_1m is not None and prev_sma40_1m is not None):
+                        if prev_tema20_1m >= prev_sma40_1m and tema20_1m < sma40_1m:
+                            is_1m_dead_cross = True
+                        elif prev_tema20_1m < prev_sma40_1m and tema20_1m >= sma40_1m:
+                            is_1m_gold_cross = True
+                            
+                    if is_holding:
+                        if is_1m_dead_cross:
+                            sell_price = c1m["close"]
+                            sell_time = c1m["time"]
+                            gross_return = ((sell_price - buy_price) / buy_price) * 100.0
+                            net_return = gross_return - fee_tax_pct
+                            trades.append({
+                                "buy_time": buy_time,
+                                "buy_price": buy_price,
+                                "sell_time": sell_time,
+                                "sell_price": sell_price,
+                                "return_pct": round(net_return, 2),
+                                "holding_bars": 0,
+                                "is_completed": True,
+                                "reason": "1m TEMA20-SMA40 Dead Cross"
+                            })
+                            is_holding = False
+                            sold_qty = 1.0
+                    else:
+                        if is_1m_gold_cross and sold_qty > 0:
+                            is_holding = True
+                            buy_price = c1m["close"]
+                            buy_time = c1m["time"]
+                            sold_qty = 0
+                            
+                elif tracking_mode == "15m":
+                    if is_15m_end:
+                        try:
+                            t_part = curr_15m["time"].split(" ")[1]
+                            h, m = map(int, t_part.split(":")[:2])
+                            is_buy_window = (h == 9)
+                        except Exception:
+                            is_buy_window = True
+                            
+                        if not is_holding:
+                            sugeub_ok = True
+                            if mode == "sugeub":
+                                sugeub_ok = curr_15m.get('daily_breakout_ok', False)
+                                
+                            if is_buy_window and curr_15m.get(buy_signal_key) and sugeub_ok:
+                                is_holding = True
+                                buy_price = c1m["close"]
+                                buy_time = c1m["time"]
+                                buy_index = i
+                                sold_qty = 0
+                        else:
+                            if curr_15m.get("signal_sell"):
+                                sell_price = c1m["close"]
+                                sell_time = c1m["time"]
+                                sell_reason = curr_15m.get("sell_reason", "전략 매도")
+                                
+                                gross_return = ((sell_price - buy_price) / buy_price) * 100.0
+                                net_return = gross_return - fee_tax_pct
+                                holding_bars = i - buy_index
+                                
+                                trades.append({
+                                    "buy_time": buy_time,
+                                    "buy_price": buy_price,
+                                    "sell_time": sell_time,
+                                    "sell_price": sell_price,
+                                    "return_pct": round(net_return, 2),
+                                    "holding_bars": holding_bars,
+                                    "is_completed": True,
+                                    "reason": sell_reason
+                                })
+                                is_holding = False
+                                
+                                if sell_reason == "BB5 Upper Reversal":
+                                    tracking_mode = "1m"
+                                    sold_qty = 1.0
+                                else:
+                                    tracking_mode = "15m"
+                                    sold_qty = 0
+            i += 1
+            
     if is_holding:
         last_candle = candles[-1]
         sell_price = last_candle["close"]
         sell_time = last_candle["time"] + " (미청산 평가)"
-        
         gross_return = ((sell_price - buy_price) / buy_price) * 100.0
         net_return = gross_return - fee_tax_pct
-        holding_bars = (n - 1) - buy_index
-        
         trades.append({
             "buy_time": buy_time,
             "buy_price": buy_price,
             "sell_time": sell_time,
             "sell_price": sell_price,
             "return_pct": round(net_return, 2),
-            "holding_bars": holding_bars,
+            "holding_bars": n - 1 - buy_index,
             "is_completed": False,
             "reason": "미청산 평가"
         })
@@ -204,13 +328,20 @@ def main():
                     if daily_L is not None and daily_whale is not None:
                         c['daily_breakout_ok'] = (prev_d['close'] >= daily_L * 0.97) and (prev_d['close'] >= daily_whale * 0.97)
         
+        # Fetch 1-minute candles
+        candles_1m = client.get_1min_candles(code, last_n_days=days_to_fetch)
+        if candles_1m:
+            calculate_indicators_1min(candles_1m)
+        else:
+            candles_1m = None
+
         # Determine the last 5 trading days in the candle data
         unique_dates = sorted(list(set(c["date"] for c in candles)))
         last_5_dates = unique_dates[-5:]
         print(f"Last 5 trading dates for {name}: {last_5_dates}")
         
         # Run simulation
-        trades = run_backtest_simulation(candles, mode="sugeub")
+        trades = run_backtest_simulation(candles, candles_1m=candles_1m, mode="sugeub")
         
         # Filter trades where the SELL happened in the last 5 dates
         # Or if it is not completed, check if buy_time is within the last 5 dates

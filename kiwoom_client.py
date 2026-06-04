@@ -374,6 +374,74 @@ class KiwoomClient:
             logger.error(f"Error fetching 15-min candles for {stock_code}: {e}")
             return []
 
+    def get_1min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
+        """
+        Fetches 1-minute candlestick chart data for a stock code.
+        Returns a list of parsed candles sorted by date/time ascending (oldest first).
+        Filters data to contain only the most recent N days of data.
+        """
+        logger.info(f"Fetching 1-minute candles for stock code {stock_code}...")
+        try:
+            result = self.chart_api.stock_minute_chart_request_ka10080(
+                stk_cd=stock_code,
+                tic_scope="1",
+                upd_stkpc_tp="1"
+            )
+            
+            if not result:
+                logger.error(f"Empty response received for chart of stock {stock_code}.")
+                return []
+                
+            raw_candles = result.get("stk_min_pole_chart_qry", [])
+            if not raw_candles:
+                logger.warning(f"No candlestick data returned for {stock_code}.")
+                return []
+                
+            parsed_candles = []
+            for item in raw_candles:
+                raw_time = item.get("cntr_tm", "").strip()
+                if len(raw_time) < 12:
+                    continue
+                    
+                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
+                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
+                
+                try:
+                    close_prc = abs(float(item.get("cur_prc", 0.0)))
+                    open_prc = abs(float(item.get("open_pric", 0.0)))
+                    high_prc = abs(float(item.get("high_pric", 0.0)))
+                    low_prc = abs(float(item.get("low_pric", 0.0)))
+                    volume = int(item.get("trde_qty", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
+                parsed_candles.append({
+                    "time": dt_str,
+                    "date": date_only,
+                    "open": open_prc,
+                    "high": high_prc,
+                    "low": low_prc,
+                    "close": close_prc,
+                    "volume": volume
+                })
+                
+            parsed_candles.sort(key=lambda x: x["time"])
+            
+            if not parsed_candles:
+                return []
+                
+            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
+            target_dates = unique_dates[-last_n_days:]
+            logger.info(f"Available dates in data: {unique_dates}. Filtering to target dates: {target_dates}")
+            
+            filtered_candles = [c for c in parsed_candles if c["date"] in target_dates]
+            logger.info(f"Retrieved {len(filtered_candles)} 1-minute candles across {len(target_dates)} days for {stock_code}.")
+            return filtered_candles
+            
+        except Exception as e:
+            logger.error(f"Error fetching 1-min candles for {stock_code}: {e}")
+            return []
+
     def get_daily_candles(self, stock_code: str, last_n_days: int = 80) -> list:
         """
         Fetches daily candlestick chart data for a stock code.

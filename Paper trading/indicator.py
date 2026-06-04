@@ -302,15 +302,28 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             if c_prev['tema3'] >= c_prev['sma60'] and c['tema3'] < c['sma60']:
                 is_sell_dead_signal = True
 
+        # Check 15m SMA 5 & SMA 60 Dead Cross (Macro Exit)
+        is_15m_sma_dead = False
+        if (c['sma5'] is not None and c['sma60'] is not None
+                and c_prev is not None
+                and c_prev.get('sma5') is not None
+                and c_prev.get('sma60') is not None):
+            if c_prev['sma5'] >= c_prev['sma60'] and c['sma5'] < c['sma60']:
+                is_15m_sma_dead = True
+
         # 3. Custom Virtual Trade Tracker / State Machine
         if not virtual_holding:
             if waiting_for_bb_rebuy:
-                # Reset rebuy wait if trend breaks
-                if c['tema3'] is not None and c['sma60'] is not None and c['tema3'] < c['sma60']:
-                    waiting_for_bb_rebuy = False
-                
-                # Check for rebuy rebound
-                if waiting_for_bb_rebuy and c['bb5_lower'] is not None and c['low'] <= c['bb5_lower'] * 1.005:
+                # Check for rebuy cross (SMA5 Golden Cross SMA60)
+                is_rebuy_cross = False
+                if (c['sma5'] is not None and c['sma60'] is not None
+                        and c_prev is not None
+                        and c_prev.get('sma5') is not None
+                        and c_prev.get('sma60') is not None):
+                    if c_prev['sma5'] < c_prev['sma60'] and c['sma5'] >= c['sma60']:
+                        is_rebuy_cross = True
+
+                if is_rebuy_cross:
                     virtual_holding = True
                     has_seen_new_alignment_since_buy = False
                     monitoring_sell = False
@@ -319,7 +332,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                     trade_K = c['K_static'] if (c.get('K_static') is not None and c['K_static'] < c['close']) else None
                     c['signal_buy_bb_rebound'] = True
                     c['signal_buy_sma20_rebound'] = True  # For backward compatibility
-                    c['buy_condition_type'] = "BB5 Lower Rebound"
+                    c['buy_condition_type'] = "SMA5 GoldCross"
             else:
                 if is_buy_signal and is_buy_window:
                     virtual_holding = True
@@ -356,6 +369,8 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                 if c['close'] < c_prev['close']:
                     is_bb_sell = True
 
+
+
             # Check Sell Conditions
             is_sell_cond2 = False
             # Condition 2 (Stop Loss): 관문선 이하 1% 하락 시 손절 매도
@@ -363,7 +378,12 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                 if c['close'] < c['tema_gate_line'] * 0.99:
                     is_sell_cond2 = True
 
-            if is_bb_sell:
+            if is_15m_sma_dead:
+                c['signal_sell'] = True
+                c['sell_reason'] = "15m SMA5-60 Dead Cross"
+                virtual_holding = False
+                waiting_for_bb_rebuy = False
+            elif is_bb_sell:
                 c['signal_sell'] = True
                 c['sell_reason'] = "BB5 Upper Reversal"
                 virtual_holding = False  # Reset virtual trade state
@@ -385,6 +405,10 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         c['K'] = trade_K
         # Map to dynamic buy signal for main.py integration
         c['signal_buy_dynamic'] = c['signal_buy']
+        
+        # Macro indicators and filters
+        c['sma5_gt_sma60'] = (c['sma5'] > c['sma60']) if (c['sma5'] is not None and c['sma60'] is not None) else False
+        c['signal_sell_sma5_sma60_dead'] = is_15m_sma_dead
 
         # Daily Close Reset logic removed to allow overnight holding.
 
@@ -439,8 +463,26 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             
             if above_lines and was_below:
                 is_perfect_breakout = True
-        c['signal_perfect_breakout'] = is_perfect_breakout
+    return candles
 
+def calculate_indicators_1min(candles):
+    """
+    Calculates technical indicators for 1-minute candles.
+    Calculates TEMA 20 and SMA 40.
+    """
+    n = len(candles)
+    if n == 0:
+        return candles
+        
+    closes = [c['close'] for c in candles]
+    
+    tema20 = calculate_tema(closes, 20)
+    sma40 = calculate_sma(closes, 40)
+    
+    for i in range(n):
+        candles[i]['tema20'] = tema20[i]
+        candles[i]['sma40'] = sma40[i]
+        
     return candles
 
 if __name__ == "__main__":
