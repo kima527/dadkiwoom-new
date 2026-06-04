@@ -294,16 +294,28 @@ def run_trading_bot():
         KST = timezone(timedelta(hours=9))
         BOT_STATE["last_updated"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
+        # 계좌 잔고 및 예수금 먼저 조회
+        holdings = client.get_holdings()
+        held_dict = {h["code"]: h for h in holdings}
+        cash = client.get_cash_balance()
+
         # Load watchlist dynamically in case user edited the file
         watchlist = load_watchlist(WATCHLIST_PATH)
-        BOT_STATE["watchlist_count"] = len(watchlist)
-        if not watchlist:
-            logger.warning("Watchlist is empty. Sleeping for 1 minute...")
+        
+        # 관심종목과 계좌 보유 종목을 합산하여 감시 대상 리스트 구성
+        monitor_dict = {s["code"]: s for s in watchlist}
+        for h in holdings:
+            if h["code"] not in monitor_dict:
+                monitor_dict[h["code"]] = {"code": h["code"], "name": h["name"]}
+        monitor_list = list(monitor_dict.values())
+        
+        BOT_STATE["watchlist_count"] = len(monitor_list)
+        if not monitor_list:
+            logger.warning("Monitor list is empty. Sleeping for 1 minute...")
             time.sleep(60)
             continue
 
-        # ── 매일 장 시작 시 보유종목 전량 자동 매도 (Daily Reset) ──
-        # 장이 시작되면 기존 보유 종목을 모두 매도하고 새로 시작
+        # ── 매일 장 시작 시 일일 매매 종목 선정 및 초기화 (오버나잇 보유 허용) ──
         liquidation_file = "last_liquidation.txt"
         last_liquidation_date = ""
         if os.path.exists(liquidation_file):
@@ -315,7 +327,7 @@ def run_trading_bot():
 
         current_date = datetime.now(KST).strftime("%Y-%m-%d")
         if is_market_open() and current_date != last_liquidation_date:
-            logger.info(f"New trading day detected ({current_date}). Skipped position liquidation (overnight enabled).")
+            logger.info(f"New trading day detected ({current_date}). Initializing daily parameters (overnight positions maintained).")
             
             # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
             # 이 로직은 사용자의 핵심 전략(등락률 우선 + 15분봉 5이평/20이평 정배열 상승 및 이격확장 지속)이 반영된 모멘텀 스코어링 시스템입니다.
@@ -529,16 +541,9 @@ def run_trading_bot():
             except Exception as e:
                 logger.error(f"Failed to write liquidation file: {e}")
 
-        # Fetch current holdings and cash balance for automated trading
-        holdings = client.get_holdings()
-        
+        # (계좌 잔고 및 예수금은 루프 시작부에서 일괄 조회하여 사용합니다)
         # Filter holdings to target stock if configured
         target_code = get_daily_target_stock_code()
-        if target_code:
-            holdings = [h for h in holdings if h["code"] == target_code]
-            
-        held_dict = {h["code"]: h for h in holdings}
-        cash = client.get_cash_balance()
 
         # ── 실시간 상태 업데이트 ──
         BOT_STATE["cash"] = cash
@@ -575,7 +580,7 @@ def run_trading_bot():
             except Exception:
                 pass
 
-        for stock in watchlist:
+        for stock in monitor_list:
             code = stock["code"]
             name = stock["name"]
             
