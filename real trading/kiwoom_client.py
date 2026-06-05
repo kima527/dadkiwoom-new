@@ -367,6 +367,60 @@ class KiwoomRealClient:
             logger.error(f"Error fetching 1-min candles: {e}")
             return []
 
+    def get_5min_candles(self, stock_code: str, last_n_days: int = 2) -> list:
+        """
+        주식 종목의 5분봉 차트 데이터를 조회합니다.
+        """
+        logger.info(f"Fetching 5-minute candles for stock code {stock_code}...")
+        try:
+            result = self.chart_api.stock_minute_chart_request_ka10080(
+                stk_cd=stock_code,
+                tic_scope="5",
+                upd_stkpc_tp="1"
+            )
+            if not result:
+                return []
+                
+            raw_candles = result.get("stk_min_pole_chart_qry", [])
+            if not raw_candles:
+                return []
+                
+            parsed_candles = []
+            for item in raw_candles:
+                raw_time = item.get("cntr_tm", "").strip()
+                if len(raw_time) < 12:
+                    continue
+                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
+                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
+                
+                try:
+                    close_prc = abs(float(item.get("cur_prc", 0.0)))
+                    open_prc = abs(float(item.get("open_pric", 0.0)))
+                    high_prc = abs(float(item.get("high_pric", 0.0)))
+                    low_prc = abs(float(item.get("low_pric", 0.0)))
+                    volume = int(item.get("trde_qty", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
+                parsed_candles.append({
+                    "time": dt_str,
+                    "date": date_only,
+                    "open": open_prc,
+                    "high": high_prc,
+                    "low": low_prc,
+                    "close": close_prc,
+                    "volume": volume
+                })
+                
+            parsed_candles.sort(key=lambda x: x["time"])
+            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
+            target_dates = unique_dates[-last_n_days:]
+            return [c for c in parsed_candles if c["date"] in target_dates]
+        except Exception as e:
+            logger.error(f"Error fetching 5-min candles: {e}")
+            return []
+
+
     def get_daily_candles(self, stock_code: str, last_n_days: int = 80) -> list:
         """
         주식 종목의 일봉 차트 데이터를 조회합니다.

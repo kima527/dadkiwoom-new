@@ -359,13 +359,13 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             if c['bb20_upper'] is not None and c['high'] >= c['bb20_upper']:
                 monitoring_sell = True
 
-            # 2) 매도관찰 상태에서 5볼린저 상한선까지 추가 돌파
+            # 2) 매도관찰 상태에서 5볼린저 상한선까지 추가 돌파 (상태 기록용으로 유지)
             if monitoring_sell and c['bb5_upper'] is not None and c['high'] >= c['bb5_upper']:
                 has_crossed_bb5_upper = True
 
-            # 3) 5상한선 돌파 후 상승이 끝나면 (종가가 전일종가보다 낮아질 때)
+            # 3) 20상한선 돌파로 매도관찰 진입 후, 5상한선과 20상한선 사이에 있거나 5상한선 위에 있어도 하락하게 되면 매도
             is_bb_sell = False
-            if has_crossed_bb5_upper and c_prev is not None:
+            if monitoring_sell and c_prev is not None:
                 if c['close'] < c_prev['close']:
                     is_bb_sell = True
 
@@ -537,3 +537,129 @@ if __name__ == "__main__":
             str(c['signal_buy']),
             str(c['signal_sell'])
         ))
+
+
+def check_short_term_sugeub(candles, timeframe_minutes):
+    """
+    Checks if the latest candle in 1-min or 5-min intervals represents a volume (sugeub) spike.
+    timeframe_minutes must be either 1 or 5.
+    
+    Conditions:
+      1. Bullish candle (close > open)
+      2. Sugeub value >= threshold:
+         - 5-Min: >= 7.0 (700 Million KRW)
+         - 1-Min: >= 1.5 (150 Million KRW)
+      3. Current volume >= 3.0x the average volume of the previous 2 candles.
+    """
+    if not candles or len(candles) < 3:
+        return False
+        
+    latest = candles[-1]
+    h = float(latest.get('high', latest['close']))
+    l = float(latest.get('low', latest['close']))
+    o = float(latest.get('open', latest['close']))
+    c = float(latest['close'])
+    v = float(latest.get('volume', 0))
+    
+    # 1. Bullish candle check
+    if c <= o:
+        return False
+        
+    # 2. Sugeub calculation (Unit: 100 Million KRW)
+    sugeub_val = ((h + l + o + c) / 4.0) * v / 100000000.0
+    
+    threshold = 7.0 if timeframe_minutes == 5 else 1.5
+    if sugeub_val < threshold:
+        return False
+        
+    # 3. Volume spike check (>= 3x average of last 2 candles)
+    prev_vol_1 = float(candles[-2].get('volume', 0))
+    prev_vol_2 = float(candles[-3].get('volume', 0))
+    avg_prev_vol = (prev_vol_1 + prev_vol_2) / 2.0
+    
+    if avg_prev_vol <= 0 or v < (avg_prev_vol * 3.0):
+        return False
+        
+    return True
+
+
+def parse_tick_execution_data(res):
+    """
+    Parses REST API daily_stock_price_request_ka10003 response.
+    Returns:
+      (volume_power: float, block_buy_count: int)
+      
+    - volume_power (체결강도): Latest tick's 'cntr_str' value. Default 100.0.
+    - block_buy_count (1억 이상 매수 건수): Counter of items in 'cntr_infr'
+      where abs(price) * abs(qty) >= 100,000,000 and qty > 0 (marked with '+').
+    """
+    if not res:
+        return 100.0, 0
+        
+    items = res.get("cntr_infr", [])
+    if not items:
+        return 100.0, 0
+        
+    # 1. Parse Volume Power (체결강도) from the latest tick
+    latest_item = items[0]
+    volume_power = 100.0
+    try:
+        vp_str = latest_item.get("cntr_str", "100.0").strip()
+        volume_power = float(vp_str)
+    except (ValueError, TypeError, AttributeError):
+        pass
+        
+    # 2. Count block buy trades (>= 100M KRW and buy direction '+')
+    block_buy_count = 0
+    for item in items:
+        try:
+            raw_qty = item.get("cntr_trde_qty", "0").strip()
+            # If the quantity starts with '+', it is a buy trade.
+            if not raw_qty.startswith("+"):
+                continue
+                
+            qty = abs(int(raw_qty))
+            price = abs(int(item.get("cur_prc", "0")))
+            
+            value = price * qty
+            if value >= 100000000: # 100 Million KRW
+                block_buy_count += 1
+        except (ValueError, TypeError):
+            continue
+            
+    return volume_power, block_buy_count
+
+
+def get_tick_size(price: float) -> int:
+    """KRX 주식 가격대별 호가 단위 반환 (2023년 개정 기준)"""
+    if price < 2000:
+        return 1
+    elif price < 5000:
+        return 5
+    elif price < 20000:
+        return 10
+    elif price < 50000:
+        return 50
+    elif price < 200000:
+        return 100
+    elif price < 500000:
+        return 500
+    else:
+        return 1000
+
+def adjust_price_by_ticks(price: float, ticks: int) -> int:
+    """호가 경계선을 안전하게 넘나들며 지정된 호가(ticks)만큼 가격을 가감"""
+    current_price = int(price)
+    for _ in range(abs(ticks)):
+        if ticks > 0:
+            tick_size = get_tick_size(current_price)
+            current_price += tick_size
+        else:
+            temp_price = current_price - 1
+            tick_size = get_tick_size(temp_price)
+            current_price -= tick_size
+    return current_price
+
+
+
+

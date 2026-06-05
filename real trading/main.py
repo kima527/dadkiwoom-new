@@ -96,11 +96,11 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
     logger.info("Updating watchlist Excel file with latest holdings...")
     holdings = client.get_holdings()
     
-    target_code = get_daily_target_stock_code()
-    if target_code:
-        holdings = [h for h in holdings if h["code"] == target_code]
-        
+    # 실시간 다중 종목 대응을 위해 target_code 필터링을 해제합니다.
     holdings_map = {h["code"]: h for h in holdings}
+    
+    # target_code를 조회하여 신규 집중 종목이 편입되는지 판단하는 용도로만 사용합니다.
+    target_code = get_daily_target_stock_code()
     
     # Load or create workbook
     if os.path.exists(filepath):
@@ -128,9 +128,6 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
             code = str(code_cell).strip().zfill(6)
             name = str(name_cell).strip() if name_cell else "알 수 없음"
             
-            if target_code and code != target_code:
-                continue
-                
             seen_codes.add(code)
             
             if code in holdings_map:
@@ -141,8 +138,7 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
                 
     for code, h in holdings_map.items():
         if code not in seen_codes:
-            if target_code and code != target_code:
-                continue
+            seen_codes.add(code)
             rows_to_keep.append([code, h["name"], h["quantity"], h["buy_price"], h["current_price"]])
             
     if target_code and target_code not in seen_codes and target_code not in holdings_map:
@@ -161,29 +157,8 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
         logger.error(f"Failed to save updated watchlist Excel: {e}")
 
 def load_watchlist(filepath: str) -> list:
-    """Loads watchlisted stocks. Returns the daily selected stock if in single-stock mode."""
-    target_code = get_daily_target_stock_code()
-    if target_code:
-        name = "SK하이닉스"
-        if target_code == "017670":
-            name = "SK텔레콤"
-        elif target_code == "005930":
-            name = "삼성전자"
-            
-        if os.path.exists(filepath):
-            try:
-                wb = openpyxl.load_workbook(filepath)
-                ws = wb.active
-                for r in range(2, ws.max_row + 1):
-                    code_cell = ws.cell(row=r, column=1).value
-                    name_cell = ws.cell(row=r, column=2).value
-                    if code_cell and str(code_cell).strip().zfill(6) == target_code:
-                        name = str(name_cell).strip() if name_cell else name
-                        break
-            except Exception:
-                pass
-        return [{"code": target_code, "name": name}]
-        
+    """Loads watchlisted stocks. Returns all watchlist stocks for multi-stock trading."""
+    # 실시간 다중 종목 대응을 위해 항상 전체 관심종목을 반환합니다.
     return load_raw_watchlist(filepath)
 
 def is_market_open() -> bool:
@@ -522,14 +497,14 @@ def run_trading_bot():
                         logger.info(f"🎯 Selected stock for today: {best_name} ({best_code}) | Score: {best_score:.2f} | {best_details} ({filter_reason})")
                         
                         notifier.send_all(
-                            f"🎯 <b>[금일 집중 매매 종목 선정 - 모멘텀 강화!]</b>\n"
-                            f"시장 분석을 통해 오늘 거래할 최적의 1종목을 선정했습니다.\n"
+                            f"🎯 <b>[금일 모멘텀 최우선 관심 종목 브리핑]</b>\n"
+                            f"시장 분석을 통해 오늘 가장 모멘텀이 우수한 최우선 종목을 선정했습니다.\n"
                             f"종목명: <b>{best_name} ({best_code})</b>\n"
                             f"모멘텀 스코어: <b>{best_score:.2f}점</b>\n"
                             f"이격도: {best_disp:.2f}%\n"
                             f"상세상태: {best_details}\n"
                             f"필터조건: {filter_reason}\n"
-                            f"이유: 등락률과 15분봉 5이평/20이평 정배열 상승 동력이 가장 우수합니다."
+                            f"※ 실제 매매는 전체 관심종목을 대상으로 실시간 감시하며 즉각 대응합니다."
                         )
                         _add_alert("info", f"금일 매매종목 선정: {best_name} ({best_code}) | Score: {best_score:.2f} | {best_details}", best_code, best_name)
                     except Exception as e:
@@ -686,6 +661,23 @@ def run_trading_bot():
                 
             disparity = latest.get("disparity_pct")
 
+            # ⑤ 체결강도 및 1억 이상 대량매수 건수 가산점 반영 (온디맨드 실시간 비교용)
+            volume_power = 100.0
+            block_buy_count = 0
+            try:
+                # 틱 체결 데이터 조회
+                tick_res = client.stock_info_api.daily_stock_price_request_ka10003(stock_code=code)
+                from indicator import parse_tick_execution_data
+                volume_power, block_buy_count = parse_tick_execution_data(tick_res)
+                
+                # 체결강도 가산점: (체결강도 - 100) * 2.0
+                score += (volume_power - 100.0) * 2.0
+                
+                # 대량 매수 건수 가산점: 건당 +50.0
+                score += block_buy_count * 50.0
+            except Exception as ex_tick:
+                logger.error(f"Error fetching tick details for scoring {name} ({code}): {ex_tick}")
+
             stock_results.append({
                 "code": code,
                 "name": name,
@@ -697,6 +689,8 @@ def run_trading_bot():
                 "slope_pct": slope_pct,
                 "flu_pct": flu_pct,
                 "sugeub_spike": latest.get("signal_sugeub_spike", False),
+                "volume_power": volume_power,
+                "block_buy_count": block_buy_count,
             })
             
             # Delay to comply with API rate limits
@@ -718,7 +712,7 @@ def run_trading_bot():
                     f"  #{rank} {sr['name']}({sr['code']}) | "
                     f"점수: {sr['momentum_score']:.2f}점 | "
                     f"정배열={sr['trend_ok']}, 이격확장={sr['slope_ok']}(기울기:{sr['slope_pct']:+.2f}%) | "
-                    f"등락률: {sr['flu_pct']:+.2f}% | 이격도: {disp} | 수급돌파: {sr['sugeub_spike']} | 일봉돌파: {sr['latest'].get('daily_breakout_ok', False)}"
+                    f"등락률: {sr['flu_pct']:+.2f}% | 이격도: {disp} | 수급돌파: {sr['sugeub_spike']} | 일봉돌파: {sr['latest'].get('daily_breakout_ok', False)} | 체결강도: {sr['volume_power']:.1f}% | 1억매수: {sr['block_buy_count']}건"
                 )
                 trend = "uptrend" if sr['trend_ok'] else "rebound"
                 rankings_snapshot.append({
@@ -733,6 +727,8 @@ def run_trading_bot():
                     "signal_buy": bool(sr["latest"].get("signal_buy_dynamic")),
                     "signal_sell": bool(sr["latest"].get("signal_sell")),
                     "daily_breakout_ok": bool(sr["latest"].get("daily_breakout_ok", False)),
+                    "volume_power": sr["volume_power"],
+                    "block_buy_count": sr["block_buy_count"],
                 })
             BOT_STATE["rankings"] = rankings_snapshot
 
@@ -802,16 +798,18 @@ def run_trading_bot():
                     
                     if is_held and held_info:
                         qty_to_sell = held_info["quantity"]
-                        order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="3")
+                        from indicator import adjust_price_by_ticks
+                        sell_price = adjust_price_by_ticks(close_price, -2)
+                        order_res = client.place_sell_order(code, qty_to_sell, price=sell_price, order_type="0")
                         if order_res and order_res.get("return_code") == 0:
                             pur_price = held_info["buy_price"]
-                            ret_rate = ((close_price - pur_price) / pur_price) * 100.0
+                            ret_rate = ((sell_price - pur_price) / pur_price) * 100.0
                             trade_info = {
                                 "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                                 "code": code,
                                 "name": name,
                                 "buy_price": pur_price,
-                                "sell_price": close_price,
+                                "sell_price": sell_price,
                                 "return_pct": round(ret_rate, 2),
                                 "reason": "15m SMA5-60 Dead Cross"
                             }
@@ -821,14 +819,14 @@ def run_trading_bot():
                             msg = (
                                 f"📉 <b>[매도 체결 - 15m SMA5-60 Dead Cross!]</b>\n"
                                 f"종목: {name} ({code})\n"
-                                f"매도단가: {close_price:,.0f}원\n"
+                                f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
                                 f"매수단가: {pur_price:,.0f}원\n"
                                 f"매도수량: {qty_to_sell}주\n"
                                 f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
                                 f"시간: {candle_time}\n"
                             )
                             notifier.send_all(msg)
-                            _add_alert("sell", f"15m SMA5-60 Dead Cross 매도 {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
+                            _add_alert("sell", f"15m SMA5-60 Dead Cross 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (지정가 -2호가)", code, name)
                     continue
 
                 # B) 15m SMA5 <= SMA60 일 경우 1m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
@@ -907,17 +905,19 @@ def run_trading_bot():
                                 if qty_to_buy > 0:
                                     if sent_alerts[code]["buy"] != candle_time:
                                         sent_alerts[code]["buy"] = candle_time
-                                        order_res = client.place_buy_order(code, qty_to_buy, price=close_price, order_type="3")
+                                        from indicator import adjust_price_by_ticks
+                                        buy_price = adjust_price_by_ticks(close_price, 2)
+                                        order_res = client.place_buy_order(code, qty_to_buy, price=buy_price, order_type="0")
                                         if order_res and order_res.get("return_code") == 0:
                                             msg = (
                                                 f"🔄 <b>[재매수 - 1분봉 골든크로스!]</b>\n"
                                                 f"종목: {name} ({code})\n"
-                                                f"매수단가: {close_price:,.0f}원\n"
+                                                f"매수단가: {buy_price:,.0f}원 (지정가 +2호가)\n"
                                                 f"매수수량: {qty_to_buy}주\n"
                                                 f"시간: {candle_time}\n"
                                             )
                                             notifier.send_all(msg)
-                                            _add_alert("buy", f"1m 골든크로스 재매수 {qty_to_buy}주 @ {close_price:,.0f}원", code, name)
+                                            _add_alert("buy", f"1m 골든크로스 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +2호가)", code, name)
                                             sent_alerts[code]["sold_qty"] = 0
                                             sent_alerts[code]["buy_reason"] = "dynamic"
                                         else:
@@ -972,49 +972,139 @@ def run_trading_bot():
                             _add_alert("buy_prep", f"매수준비 - {prep_msg_detail} | {close_price:,.0f}원", code, name)
 
                     # 1b. 매수 트리거 (기존 동적 전략 또는 수급 급증 돌파)
+                    # 오늘 이미 다른 종목 신규 매수를 완료했는지 체크 (하루 1종목 1주 매수 제한)
+                    already_bought_today = False
+                    buy_date_file = "last_buy_date.txt"
+                    if os.path.exists(buy_date_file):
+                        try:
+                            with open(buy_date_file, "r") as f:
+                                last_buy_date = f.read().strip()
+                            if last_buy_date == current_date:
+                                already_bought_today = True
+                        except Exception as e:
+                            logger.error(f"Error reading buy date file: {e}")
+
                     sugeub_daily_ok = True
                     if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
                         sugeub_daily_ok = latest.get("daily_breakout_ok", False)
 
-                    if (latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and sugeub_daily_ok:
+                    if (latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and sugeub_daily_ok and not already_bought_today:
                         if sent_alerts[code]["buy"] != candle_time:
-                            sent_alerts[code]["buy"] = candle_time
-                            if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
-                                cond_type = "수급완벽돌파"
-                                sent_alerts[code]["buy_reason"] = "sugeub"
-                            else:
-                                cond_type = latest.get("buy_condition_type", "N/A")
-                                sent_alerts[code]["buy_reason"] = "dynamic"
-
-                            if not is_held:
-                                # 당분간은 1주만 매매하도록 고정 (사용자 요청)
-                                qty = 1
-                                if qty > 0:
-                                    order_res = client.place_buy_order(code, qty, price=close_price, order_type="3")
-                                    if order_res and order_res.get("return_code") == 0:
-                                        msg = (
-                                            f"🚀 <b>[매수 체결 - {cond_type}!]</b>\n"
-                                            f"📊 우선순위: #{rank} (이격도: {disp_str})\n"
-                                            f"종목: {name} ({code})\n"
-                                            f"매수단가: {close_price:,.0f}원\n"
-                                            f"매수수량: {qty}주 (예산: {trade_budget:,}원)\n"
-                                            f"시간: {candle_time}\n"
-                                            f"주문번호: {order_res.get('ord_no')}"
-                                        )
-                                        _add_alert("buy", f"매수체결 [{cond_type}] {qty}주 @ {close_price:,.0f}원", code, name)
+                            # ── 🔒 [멀티타임프레임 수급 크로스 체킹 필터 적용] ──
+                            logger.info(f"🔍 [MTF 수급 검증 시작] {name} ({code}) 15분봉 매수 신호 포착. 1분봉/5분봉 단기 수급 폭발 여부 검증...")
+                            
+                            from indicator import check_short_term_sugeub
+                            # 1) 5분봉 조회 및 검증
+                            candles_5m = client.get_5min_candles(code, last_n_days=2)
+                            sugeub_5m_ok = check_short_term_sugeub(candles_5m, 5)
+                            
+                            # 2) 1분봉 조회 및 검증
+                            candles_1m = client.get_1min_candles(code, last_n_days=1)
+                            sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
+                            
+                            # ── 🔒 [실시간 틱 검증 (체결강도 및 1억 이상 대량 매수)] ──
+                            tick_ok = False
+                            volume_power = 100.0
+                            block_buy_count = 0
+                            tick_err_msg = ""
+                            
+                            if sugeub_5m_ok and sugeub_1m_ok:
+                                logger.info(f"🔍 [실시간 틱 검증 시작] {name} ({code}) 1m/5m 수급 통과. 온디맨드 틱 데이터(ka10003) 조회 중...")
+                                try:
+                                    tick_res = client.stock_info_api.daily_stock_price_request_ka10003(stock_code=code)
+                                    from indicator import parse_tick_execution_data
+                                    volume_power, block_buy_count = parse_tick_execution_data(tick_res)
+                                    
+                                    if volume_power >= 100.0 and block_buy_count >= 1:
+                                        tick_ok = True
+                                        logger.info(f"✅ [실시간 틱 검증 통과] {name} ({code}) 체결강도: {volume_power:.1f}%, 1억 이상 매수: {block_buy_count}건")
                                     else:
-                                        err_msg = order_res.get("return_msg") if order_res else "응답 없음"
-                                        msg = (
-                                            f"❌ <b>[매수 실패 - {cond_type}]</b>\n"
-                                            f"종목: {name} ({code})\n"
-                                            f"에러내용: {err_msg}"
-                                        )
-                                        _add_alert("error", f"매수실패: {err_msg}", code, name)
-                                    notifier.send_all(msg)
+                                        logger.warning(f"❌ [실시간 틱 검증 탈락] {name} ({code}) 체결강도: {volume_power:.1f}% (기준: 100%이상), 1억 이상 매수: {block_buy_count}건 (기준: 1건이상)")
+                                except Exception as e:
+                                    logger.error(f"Error during tick verification for {code}: {e}")
+                                    tick_err_msg = str(e)
+                            
+                            if sugeub_5m_ok and sugeub_1m_ok and tick_ok:
+                                logger.info(f"✅ [최종 검증 통과] {name} ({code}) 1분봉/5분봉 수급 및 실시간 틱 조건 모두 만족!")
+                                sent_alerts[code]["buy"] = candle_time
+                                if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
+                                    cond_type = "수급완벽돌파"
+                                    sent_alerts[code]["buy_reason"] = "sugeub"
                                 else:
-                                    logger.warning(f"Buy qty=0 for {name}({code}), price={close_price}")
-                            else:
-                                logger.info(f"Skipping buy (already held): {name} ({code})")
+                                    cond_type = latest.get("buy_condition_type", "N/A")
+                                    sent_alerts[code]["buy_reason"] = "dynamic"
+        
+                                if not is_held:
+                                    qty = 1
+                                    if qty > 0:
+                                        order_res = client.place_buy_order(code, qty, price=close_price, order_type="3")
+                                        if order_res and order_res.get("return_code") == 0:
+                                            # 오늘 매수 성공했으므로 날짜 기록하여 추가 매매 잠금
+                                            try:
+                                                with open(buy_date_file, "w") as f:
+                                                    f.write(current_date)
+                                            except Exception as e:
+                                                logger.error(f"Failed to write buy date file: {e}")
+        
+                                            ms                        if is_held and held_info:
+                            qty_to_sell = held_info["quantity"]
+                            from indicator import adjust_price_by_ticks
+                            sell_price = adjust_price_by_ticks(close_price, -2)
+                            order_res = client.place_sell_order(code, qty_to_sell, price=sell_price, order_type="0")
+                            if order_res and order_res.get("return_code") == 0:
+                                # 15m BB5 Upper Reversal 매도 시에만 1m 추적모드로 진입
+                                if sell_reason == "BB5 Upper Reversal":
+                                    sent_alerts[code]["tracking_mode"] = "1m"
+                                    sent_alerts[code]["sold_qty"] = qty_to_sell
+                                    logger.info(f"➡️ [모드 전환] BB5 Upper Reversal 매도 후 1분봉 매매 모드로 전환: {name} ({code}), 수량: {qty_to_sell}")
+                                else:
+                                    sent_alerts[code]["tracking_mode"] = "15m"
+                                    sent_alerts[code]["sold_qty"] = 0
+                                    logger.info(f"➡️ [모드 유지] {sell_reason} 매도 발생으로 15m 모드 유지 및 sold_qty 초기화: {name} ({code})")
+ 
+                                pur_price = held_info["buy_price"]
+                                ret_rate = ((sell_price - pur_price) / pur_price) * 100.0
+                                 
+                                # 로그 및 대시보드 연동용 Trade 기록 추가
+                                logger.info(f"📉 [매도 체결] {name}({code}) | 매수가: {pur_price:,.0f}원 | 매도가: {sell_price:,.0f}원 (지정가 -2호가) | 수익률: {ret_rate:+.2f}% | 사유: {reason_kr}")
+                                trade_info = {
+                                    "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+                                    "code": code,
+                                    "name": name,
+                                    "buy_price": pur_price,
+                                    "sell_price": sell_price,
+                                    "return_pct": round(ret_rate, 2),
+                                    "reason": reason_kr
+                                }
+                                BOT_STATE["completed_trades"].insert(0, trade_info)
+                                if len(BOT_STATE["completed_trades"]) > 50:
+                                    BOT_STATE["completed_trades"].pop()
+ 
+                                msg = (
+                                    f"📉 <b>[매도 체결 - {reason_kr}!]</b>\n"
+                                    f"종목: {name} ({code})\n"
+                                    f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
+                                    f"매수단가: {pur_price:,.0f}원\n"
+                                    f"매도수량: {qty_to_sell}주\n"
+                                    f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
+                                    f"시간: {candle_time}\n"
+                                    f"주문번호: {order_res.get('ord_no')}"
+                                )
+                                _add_alert("sell", f"{reason_kr} 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (매수가: {pur_price:,.0f}원, 지정가 -2호가) | 수익률: {ret_rate:+.2f}%", code, name)량매수 미달 ({block_buy_count}건 < 1건)")
+                                
+                                reason_str = " & ".join(filter_reasons)
+                                logger.warning(f"⚠️ [매수 검증 탈락] {name} ({code}) 매수 조건은 충족되었으나 필터 조건 미달로 매수 보류: {reason_str}")
+                                
+                                # 사용자 알림 발송 (매수 보류 통지)
+                                msg = (
+                                    f"⚠️ <b>[매수 보류 - 조건 미달]</b>\n"
+                                    f"종목: {name} ({code})\n"
+                                    f"15분봉 상 매수 신호가 포착되었으나, 필터 조건이 부족하여 진입을 보류했습니다.\n"
+                                    f"미달 사유: <code>{reason_str}</code>\n"
+                                    f"현재가: {close_price:,.0f}원 | 시간: {candle_time}"
+                                )
+                                notifier.send_all(msg)
+                                _add_alert("info", f"매수보류: {reason_str}", code, name)
 
                 # ── ② 10:00~15:20 재매수 비활성화 ──────────────
                 # (15m 모드에서는 더이상 5볼린저 하한선 재매수를 하지 않고, 재매수는 오직 1m 모드에서만 처리됨)
