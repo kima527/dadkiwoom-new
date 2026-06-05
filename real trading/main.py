@@ -371,9 +371,10 @@ def run_trading_bot():
                     code = stock["code"]
                     name = stock["name"]
                     try:
-                        # 1. 일봉 기준선/세력선 필터링 검증
-                        daily_candles = client.get_daily_candles(code, last_n_days=90)
-                        daily_breakout_ok = False
+                        # 1. 일봉 및 주봉 가산점 로직 (기존 필터 제거)
+                        daily_candles = client.get_daily_candles(code, last_n_days=200)
+                        daily_bonus_ok = False
+                        weekly_bonus_ok = False
                         prev_d = None
                         if daily_candles and len(daily_candles) >= 2:
                             calculate_indicators_pure(
@@ -385,20 +386,37 @@ def run_trading_bot():
                             # 전일 완성 일봉 구하기
                             today_str = datetime.now().strftime("%Y-%m-%d")
                             if daily_candles[-1]['date'] == today_str:
-                                if len(daily_candles) >= 2:
-                                    prev_d = daily_candles[-2]
+                                prev_d = daily_candles[-2] if len(daily_candles) >= 2 else None
                             else:
                                 prev_d = daily_candles[-1]
                             
                             if prev_d:
                                 daily_L = prev_d.get('L')
                                 daily_whale = prev_d.get('whale_line')
-                                if daily_L is not None and daily_whale is not None:
-                                    daily_breakout_ok = (prev_d['close'] >= daily_L * 0.97) and (prev_d['close'] >= daily_whale * 0.97)
-                        
-                        if not daily_breakout_ok:
-                            logger.info(f" -> {name} ({code}) | Skip: 일봉 기준선 조건 미달 (기준미달)")
-                            continue
+                                if daily_L is not None:
+                                    is_near_L = (daily_L * 0.97 <= prev_d['close'] <= daily_L * 1.03)
+                                    is_breakout = False
+                                    if daily_whale is not None:
+                                        is_breakout = (prev_d['close'] >= daily_L * 0.97) and (prev_d['close'] >= daily_whale * 0.97)
+                                    daily_bonus_ok = (is_near_L or is_breakout)
+                                    
+                            weekly_candles = client.get_weekly_candles_from_daily(daily_candles)
+                            if weekly_candles and len(weekly_candles) >= 2:
+                                calculate_indicators_pure(
+                                    weekly_candles,
+                                    use_compressed_peak=True,
+                                    tema_period1=config.TEMA_PERIOD_SHORT,
+                                    tema_period2=config.TEMA_PERIOD_LONG
+                                )
+                                w_latest = weekly_candles[-1]
+                                w_L = w_latest.get('L')
+                                w_whale = w_latest.get('whale_line')
+                                if w_L is not None:
+                                    is_near_L_w = (w_L * 0.97 <= w_latest['close'] <= w_L * 1.03)
+                                    is_breakout_w = False
+                                    if w_whale is not None:
+                                        is_breakout_w = (w_latest['close'] >= w_L * 0.97) and (w_latest['close'] >= w_whale * 0.97)
+                                    weekly_bonus_ok = (is_near_L_w or is_breakout_w)
                             
                         candles = client.get_15min_candles(code, last_n_days=7)
                         if candles and len(candles) >= 60:
@@ -462,11 +480,17 @@ def run_trading_bot():
                             if latest.get('signal_sugeub_spike', False):
                                 score += 300.0
                                 
+                            if daily_bonus_ok:
+                                score += 100.0
+                            if weekly_bonus_ok:
+                                score += 50.0
+                                
                             disp = latest.get("disparity_pct", 0.0)
                             
                             detail_msg = (
                                 f"정배열={trend_ok}, 이격확장={slope_ok}(기울기:{slope_pct:+.2f}%), "
-                                f"등락률={flu_pct:+.2f}%, TEMA이격={disp:.2f}%, 수급돌파={latest.get('signal_sugeub_spike', False)}"
+                                f"등락률={flu_pct:+.2f}%, TEMA이격={disp:.2f}%, 수급돌파={latest.get('signal_sugeub_spike', False)}, "
+                                f"일봉보너스={daily_bonus_ok}, 주봉보너스={weekly_bonus_ok}"
                             )
                             logger.info(f" -> {name} ({code}) | Score: {score:.2f} | {detail_msg}")
                             
@@ -576,9 +600,10 @@ def run_trading_bot():
                 tema_period2=config.TEMA_PERIOD_LONG
             )
             
-            # Fetch and calculate daily breakout conditions
-            daily_candles = client.get_daily_candles(code, last_n_days=90)
-            daily_breakout_ok = False
+            # Fetch and calculate daily/weekly conditions
+            daily_candles = client.get_daily_candles(code, last_n_days=200)
+            daily_bonus_ok = False
+            weekly_bonus_ok = False
             prev_d = None
             if daily_candles and len(daily_candles) >= 2:
                 calculate_indicators_pure(
@@ -589,19 +614,41 @@ def run_trading_bot():
                 )
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 if daily_candles[-1]['date'] == today_str:
-                    if len(daily_candles) >= 2:
-                        prev_d = daily_candles[-2]
+                    prev_d = daily_candles[-2] if len(daily_candles) >= 2 else None
                 else:
                     prev_d = daily_candles[-1]
                 
                 if prev_d:
                     daily_L = prev_d.get('L')
                     daily_whale = prev_d.get('whale_line')
-                    if daily_L is not None and daily_whale is not None:
-                        daily_breakout_ok = (prev_d['close'] >= daily_L * 0.97) and (prev_d['close'] >= daily_whale * 0.97)
+                    if daily_L is not None:
+                        is_near_L = (daily_L * 0.97 <= prev_d['close'] <= daily_L * 1.03)
+                        is_breakout = False
+                        if daily_whale is not None:
+                            is_breakout = (prev_d['close'] >= daily_L * 0.97) and (prev_d['close'] >= daily_whale * 0.97)
+                        daily_bonus_ok = (is_near_L or is_breakout)
+                        
+                weekly_candles = client.get_weekly_candles_from_daily(daily_candles)
+                if weekly_candles and len(weekly_candles) >= 2:
+                    calculate_indicators_pure(
+                        weekly_candles,
+                        use_compressed_peak=True,
+                        tema_period1=config.TEMA_PERIOD_SHORT,
+                        tema_period2=config.TEMA_PERIOD_LONG
+                    )
+                    w_latest = weekly_candles[-1]
+                    w_L = w_latest.get('L')
+                    w_whale = w_latest.get('whale_line')
+                    if w_L is not None:
+                        is_near_L_w = (w_L * 0.97 <= w_latest['close'] <= w_L * 1.03)
+                        is_breakout_w = False
+                        if w_whale is not None:
+                            is_breakout_w = (w_latest['close'] >= w_L * 0.97) and (w_latest['close'] >= w_whale * 0.97)
+                        weekly_bonus_ok = (is_near_L_w or is_breakout_w)
             
             latest = candles[-1]
-            latest['daily_breakout_ok'] = daily_breakout_ok
+            latest['daily_bonus_ok'] = daily_bonus_ok
+            latest['weekly_bonus_ok'] = weekly_bonus_ok
             latest['daily_L'] = prev_d.get('L') if prev_d else None
             latest['daily_whale_line'] = prev_d.get('whale_line') if prev_d else None
             
@@ -659,6 +706,11 @@ def run_trading_bot():
             if latest.get('signal_sugeub_spike', False):
                 score += 300.0
                 
+            if daily_bonus_ok:
+                score += 100.0
+            if weekly_bonus_ok:
+                score += 50.0
+                
             disparity = latest.get("disparity_pct")
 
             # ⑤ 체결강도 및 1억 이상 대량매수 건수 가산점 반영 (온디맨드 실시간 비교용)
@@ -712,7 +764,7 @@ def run_trading_bot():
                     f"  #{rank} {sr['name']}({sr['code']}) | "
                     f"점수: {sr['momentum_score']:.2f}점 | "
                     f"정배열={sr['trend_ok']}, 이격확장={sr['slope_ok']}(기울기:{sr['slope_pct']:+.2f}%) | "
-                    f"등락률: {sr['flu_pct']:+.2f}% | 이격도: {disp} | 수급돌파: {sr['sugeub_spike']} | 일봉돌파: {sr['latest'].get('daily_breakout_ok', False)} | 체결강도: {sr['volume_power']:.1f}% | 1억매수: {sr['block_buy_count']}건"
+                    f"등락률: {sr['flu_pct']:+.2f}% | 이격도: {disp} | 수급돌파: {sr['sugeub_spike']} | 일봉보너스: {sr['latest'].get('daily_bonus_ok', False)} | 주봉보너스: {sr['latest'].get('weekly_bonus_ok', False)} | 체결강도: {sr['volume_power']:.1f}% | 1억매수: {sr['block_buy_count']}건"
                 )
                 trend = "uptrend" if sr['trend_ok'] else "rebound"
                 rankings_snapshot.append({
@@ -726,7 +778,8 @@ def run_trading_bot():
                     "trend": trend,
                     "signal_buy": bool(sr["latest"].get("signal_buy_dynamic")),
                     "signal_sell": bool(sr["latest"].get("signal_sell")),
-                    "daily_breakout_ok": bool(sr["latest"].get("daily_breakout_ok", False)),
+                    "daily_breakout_ok": bool(sr["latest"].get("daily_bonus_ok", False)),
+                    "weekly_bonus_ok": bool(sr["latest"].get("weekly_bonus_ok", False)),
                     "volume_power": sr["volume_power"],
                     "block_buy_count": sr["block_buy_count"],
                 })
@@ -768,8 +821,8 @@ def run_trading_bot():
             t_hour = now_kst.hour
             t_min  = now_kst.minute
 
-            # ① 동적 매수 윈도우 (08:00 ~ 10:00)
-            is_buy_window = (t_hour == 8 or t_hour == 9)
+            # ① 동적 매수 윈도우 (08:00 ~ 12:00)
+            is_buy_window = (8 <= t_hour < 12)
             # ② 재매수 윈도우 (10:00 ~ 15:20)
             is_rebuy_window = (t_hour >= 10 and (t_hour < 15 or (t_hour == 15 and t_min < 20)))
             # ③ 10:00 이후 : L선 하향 이탈 추가 매도 활성화
@@ -846,22 +899,22 @@ def run_trading_bot():
                         latest_1m = candles_1m[-1]
                         prev_1m = candles_1m[-2] if len(candles_1m) > 1 else latest_1m
                         
-                        tema20_1m = latest_1m.get("tema20")
+                        sma20_1m = latest_1m.get("sma20")
                         sma40_1m = latest_1m.get("sma40")
-                        prev_tema20_1m = prev_1m.get("tema20")
+                        prev_sma20_1m = prev_1m.get("sma20")
                         prev_sma40_1m = prev_1m.get("sma40")
                         
                         is_1m_dead_cross = False
                         is_1m_gold_cross = False
                         
-                        if (tema20_1m is not None and sma40_1m is not None 
-                            and prev_tema20_1m is not None and prev_sma40_1m is not None):
-                            if prev_tema20_1m >= prev_sma40_1m and tema20_1m < sma40_1m:
+                        if (sma20_1m is not None and sma40_1m is not None 
+                            and prev_sma20_1m is not None and prev_sma40_1m is not None):
+                            if prev_sma20_1m >= prev_sma40_1m and sma20_1m < sma40_1m:
                                 is_1m_dead_cross = True
-                            elif prev_tema20_1m < prev_sma40_1m and tema20_1m >= sma40_1m:
+                            elif prev_sma20_1m < prev_sma40_1m and sma20_1m >= sma40_1m:
                                 is_1m_gold_cross = True
                                 
-                        # 1) 보유 중일 때 -> 1m TEMA20 & SMA40 데드크로스 매도
+                        # 1) 보유 중일 때 -> 1m SMA20 & SMA40 데드크로스 매도
                         if is_held:
                             if is_1m_dead_cross:
                                 if sent_alerts[code]["sell"] != candle_time:
@@ -880,7 +933,7 @@ def run_trading_bot():
                                             "buy_price": pur_price,
                                             "sell_price": close_price,
                                             "return_pct": round(ret_rate, 2),
-                                            "reason": "1m TEMA20-SMA40 Dead Cross"
+                                            "reason": "1m SMA20-SMA40 Dead Cross"
                                         }
                                         BOT_STATE["completed_trades"].insert(0, trade_info)
                                         if len(BOT_STATE["completed_trades"]) > 50:
@@ -898,7 +951,7 @@ def run_trading_bot():
                                         notifier.send_all(msg)
                                         _add_alert("sell", f"1m 데드크로스 매도 {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
                         
-                        # 2) 미보유 중일 때 -> 1m TEMA20 & SMA40 골든크로스 재매수
+                        # 2) 미보유 중일 때 -> 1m SMA20 & SMA40 골든크로스 재매수
                         else:
                             if is_1m_gold_cross:
                                 qty_to_buy = sent_alerts[code].get("sold_qty", 0)
@@ -934,7 +987,7 @@ def run_trading_bot():
                         logger.warning(f"Failed to fetch 1-min candles for {name} ({code}) in 1m tracking mode. Falling back to 15m logic.")
 
             if tracking_mode == "15m":
-                # ── ① 09:15~10:00 기존 동적 매수 (L선 / TEMA) ─────
+                # ── ① 08:00~12:00 매수 시간대 (1순위 우선매수 포함) ─────
                 if is_buy_window:
                     # 1a. 매수준비 알림
                     is_buy_prep = False
@@ -988,46 +1041,55 @@ def run_trading_bot():
                     if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
                         sugeub_daily_ok = latest.get("daily_breakout_ok", False)
 
-                    if (latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and sugeub_daily_ok and not already_bought_today:
+                    is_rank1 = (rank == 1) and not is_held
+                    if (is_rank1 or ((latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and sugeub_daily_ok)) and not already_bought_today:
                         if sent_alerts[code]["buy"] != candle_time:
-                            # ── 🔒 [멀티타임프레임 수급 크로스 체킹 필터 적용] ──
-                            logger.info(f"🔍 [MTF 수급 검증 시작] {name} ({code}) 15분봉 매수 신호 포착. 1분봉/5분봉 단기 수급 폭발 여부 검증...")
-                            
-                            from indicator import check_short_term_sugeub
-                            # 1) 5분봉 조회 및 검증
-                            candles_5m = client.get_5min_candles(code, last_n_days=2)
-                            sugeub_5m_ok = check_short_term_sugeub(candles_5m, 5)
-                            
-                            # 2) 1분봉 조회 및 검증
-                            candles_1m = client.get_1min_candles(code, last_n_days=1)
-                            sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
-                            
-                            # ── 🔒 [실시간 틱 검증 (체결강도 및 1억 이상 대량 매수)] ──
-                            tick_ok = False
-                            volume_power = 100.0
-                            block_buy_count = 0
-                            tick_err_msg = ""
-                            
-                            if sugeub_5m_ok and sugeub_1m_ok:
-                                logger.info(f"🔍 [실시간 틱 검증 시작] {name} ({code}) 1m/5m 수급 통과. 온디맨드 틱 데이터(ka10003) 조회 중...")
-                                try:
-                                    tick_res = client.stock_info_api.daily_stock_price_request_ka10003(stock_code=code)
-                                    from indicator import parse_tick_execution_data
-                                    volume_power, block_buy_count = parse_tick_execution_data(tick_res)
-                                    
-                                    if volume_power >= 100.0 and block_buy_count >= 1:
-                                        tick_ok = True
-                                        logger.info(f"✅ [실시간 틱 검증 통과] {name} ({code}) 체결강도: {volume_power:.1f}%, 1억 이상 매수: {block_buy_count}건")
-                                    else:
-                                        logger.warning(f"❌ [실시간 틱 검증 탈락] {name} ({code}) 체결강도: {volume_power:.1f}% (기준: 100%이상), 1억 이상 매수: {block_buy_count}건 (기준: 1건이상)")
-                                except Exception as e:
-                                    logger.error(f"Error during tick verification for {code}: {e}")
-                                    tick_err_msg = str(e)
+                            if is_rank1:
+                                logger.info(f"✅ [1순위 우선매수] {name} ({code}) 1순위 종목이므로 조건에 관계없이 즉시 매수를 진행합니다.")
+                                sugeub_5m_ok, sugeub_1m_ok, tick_ok = True, True, True
+                                volume_power, block_buy_count = 100.0, 1
+                            else:
+                                # ── 🔒 [멀티타임프레임 수급 크로스 체킹 필터 적용] ──
+                                logger.info(f"🔍 [MTF 수급 검증 시작] {name} ({code}) 15분봉 매수 신호 포착. 1분봉/5분봉 단기 수급 폭발 여부 검증...")
+                                
+                                from indicator import check_short_term_sugeub
+                                # 1) 5분봉 조회 및 검증
+                                candles_5m = client.get_5min_candles(code, last_n_days=2)
+                                sugeub_5m_ok = check_short_term_sugeub(candles_5m, 5)
+                                
+                                # 2) 1분봉 조회 및 검증
+                                candles_1m = client.get_1min_candles(code, last_n_days=1)
+                                sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
+                                
+                                # ── 🔒 [실시간 틱 검증 (체결강도 및 1억 이상 대량 매수)] ──
+                                tick_ok = False
+                                volume_power = 100.0
+                                block_buy_count = 0
+                                tick_err_msg = ""
+                                
+                                if sugeub_5m_ok and sugeub_1m_ok:
+                                    logger.info(f"🔍 [실시간 틱 검증 시작] {name} ({code}) 1m/5m 수급 통과. 온디맨드 틱 데이터(ka10003) 조회 중...")
+                                    try:
+                                        tick_res = client.stock_info_api.daily_stock_price_request_ka10003(stock_code=code)
+                                        from indicator import parse_tick_execution_data
+                                        volume_power, block_buy_count = parse_tick_execution_data(tick_res)
+                                        
+                                        if volume_power >= 100.0 and block_buy_count >= 1:
+                                            tick_ok = True
+                                            logger.info(f"✅ [실시간 틱 검증 통과] {name} ({code}) 체결강도: {volume_power:.1f}%, 1억 이상 매수: {block_buy_count}건")
+                                        else:
+                                            logger.warning(f"❌ [실시간 틱 검증 탈락] {name} ({code}) 체결강도: {volume_power:.1f}% (기준: 100%이상), 1억 이상 매수: {block_buy_count}건 (기준: 1건이상)")
+                                    except Exception as e:
+                                        logger.error(f"Error during tick verification for {code}: {e}")
+                                        tick_err_msg = str(e)
                             
                             if sugeub_5m_ok and sugeub_1m_ok and tick_ok:
-                                logger.info(f"✅ [최종 검증 통과] {name} ({code}) 1분봉/5분봉 수급 및 실시간 틱 조건 모두 만족!")
+                                logger.info(f"✅ [최종 검증 통과] {name} ({code}) 매수 조건 모두 만족!")
                                 sent_alerts[code]["buy"] = candle_time
-                                if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
+                                if is_rank1:
+                                    cond_type = "1순위 우선매수"
+                                    sent_alerts[code]["buy_reason"] = "rank1"
+                                elif latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
                                     cond_type = "수급완벽돌파"
                                     sent_alerts[code]["buy_reason"] = "sugeub"
                                 else:
@@ -1046,51 +1108,23 @@ def run_trading_bot():
                                             except Exception as e:
                                                 logger.error(f"Failed to write buy date file: {e}")
         
-                                            ms                        if is_held and held_info:
-                            qty_to_sell = held_info["quantity"]
-                            from indicator import adjust_price_by_ticks
-                            sell_price = adjust_price_by_ticks(close_price, -2)
-                            order_res = client.place_sell_order(code, qty_to_sell, price=sell_price, order_type="0")
-                            if order_res and order_res.get("return_code") == 0:
-                                # 15m BB5 Upper Reversal 매도 시에만 1m 추적모드로 진입
-                                if sell_reason == "BB5 Upper Reversal":
-                                    sent_alerts[code]["tracking_mode"] = "1m"
-                                    sent_alerts[code]["sold_qty"] = qty_to_sell
-                                    logger.info(f"➡️ [모드 전환] BB5 Upper Reversal 매도 후 1분봉 매매 모드로 전환: {name} ({code}), 수량: {qty_to_sell}")
-                                else:
-                                    sent_alerts[code]["tracking_mode"] = "15m"
-                                    sent_alerts[code]["sold_qty"] = 0
-                                    logger.info(f"➡️ [모드 유지] {sell_reason} 매도 발생으로 15m 모드 유지 및 sold_qty 초기화: {name} ({code})")
- 
-                                pur_price = held_info["buy_price"]
-                                ret_rate = ((sell_price - pur_price) / pur_price) * 100.0
-                                 
-                                # 로그 및 대시보드 연동용 Trade 기록 추가
-                                logger.info(f"📉 [매도 체결] {name}({code}) | 매수가: {pur_price:,.0f}원 | 매도가: {sell_price:,.0f}원 (지정가 -2호가) | 수익률: {ret_rate:+.2f}% | 사유: {reason_kr}")
-                                trade_info = {
-                                    "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                                    "code": code,
-                                    "name": name,
-                                    "buy_price": pur_price,
-                                    "sell_price": sell_price,
-                                    "return_pct": round(ret_rate, 2),
-                                    "reason": reason_kr
-                                }
-                                BOT_STATE["completed_trades"].insert(0, trade_info)
-                                if len(BOT_STATE["completed_trades"]) > 50:
-                                    BOT_STATE["completed_trades"].pop()
- 
-                                msg = (
-                                    f"📉 <b>[매도 체결 - {reason_kr}!]</b>\n"
-                                    f"종목: {name} ({code})\n"
-                                    f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
-                                    f"매수단가: {pur_price:,.0f}원\n"
-                                    f"매도수량: {qty_to_sell}주\n"
-                                    f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
-                                    f"시간: {candle_time}\n"
-                                    f"주문번호: {order_res.get('ord_no')}"
-                                )
-                                _add_alert("sell", f"{reason_kr} 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (매수가: {pur_price:,.0f}원, 지정가 -2호가) | 수익률: {ret_rate:+.2f}%", code, name)량매수 미달 ({block_buy_count}건 < 1건)")
+                                            msg = (
+                                                f"🚀 <b>[매수 체결 - {cond_type}]</b>\n"
+                                                f"종목: {name} ({code})\n"
+                                                f"체결단가: {close_price:,.0f}원\n"
+                                                f"수량: {qty}주\n"
+                                                f"시간: {candle_time}\n"
+                                                f"주문번호: {order_res.get('ord_no')}"
+                                            )
+                                            notifier.send_all(msg)
+                                            _add_alert("buy", f"{cond_type} 매수 {qty}주 @ {close_price:,.0f}원", code, name)
+                            else:
+                                filter_reasons = []
+                                if not sugeub_5m_ok: filter_reasons.append("5분봉 수급 미달")
+                                if not sugeub_1m_ok: filter_reasons.append("1분봉 수급 미달")
+                                if not tick_ok:
+                                    if volume_power < 100.0: filter_reasons.append(f"체결강도 미달 ({volume_power:.1f}% < 100%)")
+                                    if block_buy_count < 1: filter_reasons.append(f"대량매수 미달 ({block_buy_count}건 < 1건)")
                                 
                                 reason_str = " & ".join(filter_reasons)
                                 logger.warning(f"⚠️ [매수 검증 탈락] {name} ({code}) 매수 조건은 충족되었으나 필터 조건 미달로 매수 보류: {reason_str}")
@@ -1316,7 +1350,7 @@ def start_dashboard():
             try:
                 t_part = cur["time"].split(" ")[1]
                 h, m = map(int, t_part.split(":")[:2])
-                is_buy_window = (h == 8 or h == 9)
+                is_buy_window = (8 <= h < 12)
                 is_rebuy_window = (h >= 10 and (h < 15 or (h == 15 and m < 20)))
             except Exception:
                 is_buy_window = True
