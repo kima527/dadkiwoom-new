@@ -421,7 +421,7 @@ class KiwoomRealClient:
             return []
 
 
-    def get_daily_candles(self, stock_code: str, last_n_days: int = 80) -> list:
+    def get_daily_candles(self, stock_code: str, last_n_days: int = 200) -> list:
         """
         주식 종목의 일봉 차트 데이터를 조회합니다.
         """
@@ -473,6 +473,50 @@ class KiwoomRealClient:
         except Exception as e:
             logger.error(f"Error fetching daily candles: {e}")
             return []
+
+    def get_weekly_candles_from_daily(self, daily_candles: list) -> list:
+        """
+        일봉 캔들 데이터를 바탕으로 주봉 캔들을 합성(Synthesize)합니다.
+        ISO 주차(Calendar week)를 기준으로 월요일~일요일 데이터를 묶습니다.
+        """
+        if not daily_candles:
+            return []
+            
+        import datetime
+        
+        weekly_dict = {}
+        for c in daily_candles:
+            date_str = c["date"]  # "YYYY-MM-DD"
+            try:
+                dt_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                # ISO 주차 기준 (year, week, weekday)
+                iso_year, iso_week, _ = dt_obj.isocalendar()
+                week_key = f"{iso_year}-W{iso_week:02d}"
+            except Exception:
+                continue
+                
+            if week_key not in weekly_dict:
+                weekly_dict[week_key] = {
+                    "time": c["time"], # 주차의 첫 거래일 시간
+                    "date": date_str,
+                    "open": c["open"],
+                    "high": c["high"],
+                    "low": c["low"],
+                    "close": c["close"],
+                    "volume": c["volume"]
+                }
+            else:
+                w = weekly_dict[week_key]
+                w["high"] = max(w["high"], c["high"])
+                w["low"] = min(w["low"], c["low"])
+                w["close"] = c["close"] # 마지막 날의 종가
+                w["volume"] += c["volume"]
+                w["date"] = date_str # 주차의 마지막 거래일 기준
+                w["time"] = c["time"]
+                
+        # 딕셔너리 값을 리스트로 변환하고 시간순으로 정렬
+        sorted_weeks = sorted(weekly_dict.values(), key=lambda x: x["time"])
+        return sorted_weeks
 
     def get_stock_name(self, stock_code: str) -> str:
         """

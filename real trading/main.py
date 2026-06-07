@@ -316,18 +316,14 @@ def run_trading_bot():
                 top_value_codes = []
                 top_flu_rates_map = {}
                 
-                # 08시~09시 사이에는 거래대금/등락률 상위가 검색되지 않으므로 조회를 건너뜁니다.
+                # NXT(넥스트레이드) 장 시작인 08:00부터 거래대금/등락률 상위를 실시간으로 조회합니다.
                 now_kst = datetime.now(KST)
-                is_pre_nine = (now_kst.hour == 8)
                 
-                if is_pre_nine:
-                    logger.info("08시~09시 KST 시간대이므로 거래대금/등락률 상위 조회를 건너뛰고 전체 관심종목을 대상으로 매매종목을 선정합니다.")
-                else:
-                    try:
-                        top_value_codes = client.get_top_trading_value_stocks(market_type="000", limit=100)
-                        top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
-                    except Exception as rank_err:
-                        logger.error(f"Failed to fetch market rankings: {rank_err}")
+                try:
+                    top_value_codes = client.get_top_trading_value_stocks(market_type="000", limit=100)
+                    top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
+                except Exception as rank_err:
+                    logger.error(f"Failed to fetch market rankings: {rank_err}")
 
                 top_flu_codes = list(top_flu_rates_map.keys())
 
@@ -335,7 +331,7 @@ def run_trading_bot():
                 filtered_candidates = []
                 filter_reason = "Fallback (전체 관심종목)"
                 
-                if not is_pre_nine and top_value_codes and top_flu_codes:
+                if top_value_codes and top_flu_codes:
                     val_set = set(top_value_codes)
                     flu_set = set(top_flu_codes)
                     leaders = val_set.intersection(flu_set) # 거래대금 상위 & 등락률 상위 교집합
@@ -568,16 +564,13 @@ def run_trading_bot():
         # ────────────────────────────────────────────────────────────
         stock_results = []
         
-        # Fetch real-time fluctuation rates map (08시~09시 사이에는 조회 생략)
+        # Fetch real-time fluctuation rates map (NXT 장 개장 08시부터 실시간 조회)
         top_flu_rates_map = {}
         now_kst = datetime.now(timezone(timedelta(hours=9)))
-        if now_kst.hour == 8:
-            logger.debug("Before 09:00 KST, skipping real-time fluctuation rates fetch.")
-        else:
-            try:
-                top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
-            except Exception:
-                pass
+        try:
+            top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
+        except Exception:
+            pass
 
         for stock in monitor_list:
             code = stock["code"]
@@ -839,6 +832,11 @@ def run_trading_bot():
 
             if "tracking_mode" not in sent_alerts[code]:
                 sent_alerts[code]["tracking_mode"] = "15m"
+                
+            if sent_alerts[code]["tracking_mode"] == "done_today":
+                if sent_alerts[code].get("done_date") != current_date:
+                    sent_alerts[code]["tracking_mode"] = "15m"
+                    
             tracking_mode = sent_alerts[code]["tracking_mode"]
 
             if tracking_mode == "1m":
@@ -914,9 +912,10 @@ def run_trading_bot():
                             elif prev_sma20_1m < prev_sma40_1m and sma20_1m >= sma40_1m:
                                 is_1m_gold_cross = True
                                 
-                        # 1) 보유 중일 때 -> 1m SMA20 & SMA40 데드크로스 매도
+                        # 1) 보유 중일 때 -> 1m SMA20 & SMA40 데드크로스 매도 또는 기준선(L) 이탈 시 매도
                         if is_held:
-                            if is_1m_dead_cross:
+                            is_below_l = (l_line is not None and close_price < l_line)
+                            if is_1m_dead_cross or is_below_l:
                                 if sent_alerts[code]["sell"] != candle_time:
                                     sent_alerts[code]["sell"] = candle_time
                                     qty_to_sell = held_info["quantity"]
@@ -926,6 +925,8 @@ def run_trading_bot():
                                         pur_price = held_info["buy_price"]
                                         ret_rate = ((close_price - pur_price) / pur_price) * 100.0
                                         
+                                        sell_reason_str = "1m 데드크로스" if is_1m_dead_cross else "L선(기준선) 이탈 매도"
+                                        
                                         trade_info = {
                                             "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                                             "code": code,
@@ -933,14 +934,14 @@ def run_trading_bot():
                                             "buy_price": pur_price,
                                             "sell_price": close_price,
                                             "return_pct": round(ret_rate, 2),
-                                            "reason": "1m SMA20-SMA40 Dead Cross"
+                                            "reason": sell_reason_str
                                         }
                                         BOT_STATE["completed_trades"].insert(0, trade_info)
                                         if len(BOT_STATE["completed_trades"]) > 50:
                                             BOT_STATE["completed_trades"].pop()
                                         
                                         msg = (
-                                            f"📉 <b>[매도 체결 - 1분봉 데드크로스!]</b>\n"
+                                            f"📉 <b>[매도 체결 - {sell_reason_str}!]</b>\n"
                                             f"종목: {name} ({code})\n"
                                             f"매도단가: {close_price:,.0f}원\n"
                                             f"매수단가: {pur_price:,.0f}원\n"
@@ -949,7 +950,7 @@ def run_trading_bot():
                                             f"시간: {candle_time}\n"
                                         )
                                         notifier.send_all(msg)
-                                        _add_alert("sell", f"1m 데드크로스 매도 {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
+                                        _add_alert("sell", f"{sell_reason_str} {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
                         
                         # 2) 미보유 중일 때 -> 1m SMA20 & SMA40 골든크로스 재매수
                         else:
@@ -957,6 +958,22 @@ def run_trading_bot():
                                 qty_to_buy = sent_alerts[code].get("sold_qty", 0)
                                 if qty_to_buy > 0:
                                     if sent_alerts[code]["buy"] != candle_time:
+                                        # 관문선과 기준선 간격 1% 이하 시 당일 매매 종료
+                                        if gate_line is not None and l_line is not None and l_line > 0:
+                                            gap_pct = abs(gate_line - l_line) / l_line * 100.0
+                                            if gap_pct <= 1.0:
+                                                msg = (
+                                                    f"🛑 <b>[매매 종료 - 간격 1% 이하]</b>\n"
+                                                    f"종목: {name} ({code})\n"
+                                                    f"관문선({gate_line:,.0f}원)과 기준선({l_line:,.0f}원)의 간격이 1% 이하({gap_pct:.2f}%)이므로 재매수하지 않고 당일 매매를 종료합니다."
+                                                )
+                                                notifier.send_all(msg)
+                                                _add_alert("info", f"1m 재매수 포기 (간격 {gap_pct:.2f}% <= 1%)", code, name)
+                                                sent_alerts[code]["sold_qty"] = 0
+                                                sent_alerts[code]["tracking_mode"] = "done_today"
+                                                sent_alerts[code]["done_date"] = current_date
+                                                continue
+
                                         sent_alerts[code]["buy"] = candle_time
                                         from indicator import adjust_price_by_ticks
                                         buy_price = adjust_price_by_ticks(close_price, 2)
@@ -1041,11 +1058,12 @@ def run_trading_bot():
                     if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
                         sugeub_daily_ok = latest.get("daily_breakout_ok", False)
 
-                    is_rank1 = (rank == 1) and not is_held
+                    # 1순위 강제매수도 TEMA 3 > SMA 60 (signal_buy_dynamic) 조건을 만족해야 하도록 수정
+                    is_rank1 = (rank == 1) and not is_held and latest.get("signal_buy_dynamic")
                     if (is_rank1 or ((latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and sugeub_daily_ok)) and not already_bought_today:
                         if sent_alerts[code]["buy"] != candle_time:
                             if is_rank1:
-                                logger.info(f"✅ [1순위 우선매수] {name} ({code}) 1순위 종목이므로 조건에 관계없이 즉시 매수를 진행합니다.")
+                                logger.info(f"✅ [1순위 우선매수] {name} ({code}) 1순위 & TEMA 3>60 조건을 만족하여 우선 매수를 진행합니다.")
                                 sugeub_5m_ok, sugeub_1m_ok, tick_ok = True, True, True
                                 volume_power, block_buy_count = 100.0, 1
                             else:

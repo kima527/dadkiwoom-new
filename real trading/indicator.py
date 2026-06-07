@@ -261,11 +261,11 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         c = candles[i]
         c_prev = candles[i-1] if i > 0 else None
 
-        # Time window extraction for synchronization (08:00~10:00 only for first buy)
+        # Time window extraction for synchronization (08:00~12:00 only for first buy)
         try:
             t_part = c["time"].split(" ")[1]
             h = int(t_part.split(":")[0])
-            is_buy_window = (h == 8 or h == 9)
+            is_buy_window = (8 <= h < 12)
         except Exception:
             is_buy_window = True
 
@@ -343,63 +343,66 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                     trade_K = c['K_static'] if (c.get('K_static') is not None and c['K_static'] < c['close']) else None
                     c['signal_buy'] = True
                     c['buy_condition_type'] = "TEMA 3 > SMA 60"
-        else:
-            # Holding state
-            # Check for perfect alignment (K line generated/updated for current trade)
-            s5 = c.get('sma5')
-            s20 = c.get('sma20')
-            s60 = c.get('sma60')
-            if s5 is not None and s20 is not None and s60 is not None:
-                if s5 > s20 and s20 > s60:
-                    has_seen_new_alignment_since_buy = True
-                    trade_K = c['close']
+        # [FIX] Always evaluate sell conditions regardless of virtual_holding state
+        # so that real holdings can be sold even if the simulation missed the buy.
+        
+        # Check for perfect alignment (K line generated/updated for current trade)
+        s5 = c.get('sma5')
+        s20 = c.get('sma20')
+        s60 = c.get('sma60')
+        if s5 is not None and s20 is not None and s60 is not None:
+            if s5 > s20 and s20 > s60:
+                has_seen_new_alignment_since_buy = True
+                trade_K = c['close']
 
-            # Bollinger Band sell conditions
-            # 1) 20상한선을 돌파하면 매도관찰 진입
-            if c['bb20_upper'] is not None and c['high'] >= c['bb20_upper']:
-                monitoring_sell = True
+        # Bollinger Band sell conditions
+        # 1) 20상한선을 돌파하면 매도관찰 진입
+        if c['bb20_upper'] is not None and c['high'] >= c['bb20_upper']:
+            monitoring_sell = True
 
-            # 2) 매도관찰 상태에서 5볼린저 상한선까지 추가 돌파 (상태 기록용으로 유지)
-            if monitoring_sell and c['bb5_upper'] is not None and c['high'] >= c['bb5_upper']:
-                has_crossed_bb5_upper = True
+        # 2) 매도관찰 상태에서 5볼린저 상한선까지 추가 돌파 (상태 기록용으로 유지)
+        if monitoring_sell and c['bb5_upper'] is not None and c['high'] >= c['bb5_upper']:
+            has_crossed_bb5_upper = True
 
-            # 3) 20상한선 돌파로 매도관찰 진입 후, 5상한선과 20상한선 사이에 있거나 5상한선 위에 있어도 하락하게 되면 매도
-            is_bb_sell = False
-            if monitoring_sell and c_prev is not None:
-                if c['close'] < c_prev['close']:
-                    is_bb_sell = True
+        # 3) 20상한선 돌파로 매도관찰 진입 후, 5상한선과 20상한선 사이에 있거나 5상한선 위에 있어도 하락하게 되면 매도
+        is_bb_sell = False
+        if monitoring_sell and c_prev is not None:
+            if c['close'] < c_prev['close']:
+                is_bb_sell = True
 
+        # Check Sell Conditions
+        is_sell_cond2 = False
+        # Condition 2 (Stop Loss): 관문선 이하 1% 하락 시 손절 매도
+        if c.get('tema_gate_line') is not None:
+            if c['close'] < c['tema_gate_line'] * 0.99:
+                is_sell_cond2 = True
 
-
-            # Check Sell Conditions
-            is_sell_cond2 = False
-            # Condition 2 (Stop Loss): 관문선 이하 1% 하락 시 손절 매도
-            if c.get('tema_gate_line') is not None:
-                if c['close'] < c['tema_gate_line'] * 0.99:
-                    is_sell_cond2 = True
-
-            if is_15m_sma_dead:
-                c['signal_sell'] = True
-                c['sell_reason'] = "15m SMA5-60 Dead Cross"
-                virtual_holding = False
-                waiting_for_bb_rebuy = False
-            elif is_bb_sell:
-                c['signal_sell'] = True
-                c['sell_reason'] = "BB5 Upper Reversal"
-                virtual_holding = False  # Reset virtual trade state
-                waiting_for_bb_rebuy = True
-            elif is_sell_cond2:
-                c['signal_sell_cond2'] = True
-                c['signal_sell'] = True
-                c['sell_reason'] = "Gate-line 1% Stop Loss"
-                virtual_holding = False  # Reset virtual trade state
-                waiting_for_bb_rebuy = False
-            elif is_sell_dead_signal:
-                c['signal_sell_cond1'] = True
-                c['signal_sell'] = True
-                c['sell_reason'] = "TEMA 3 Dead Cross"
-                virtual_holding = False  # Reset virtual trade state
-                waiting_for_bb_rebuy = False
+        if is_15m_sma_dead:
+            c['signal_sell'] = True
+            c['sell_reason'] = "15m SMA5-60 Dead Cross"
+            virtual_holding = False
+            waiting_for_bb_rebuy = False
+            monitoring_sell = False
+        elif is_bb_sell:
+            c['signal_sell'] = True
+            c['sell_reason'] = "BB5 Upper Reversal"
+            virtual_holding = False  # Reset virtual trade state
+            waiting_for_bb_rebuy = True
+            monitoring_sell = False
+        elif is_sell_cond2:
+            c['signal_sell_cond2'] = True
+            c['signal_sell'] = True
+            c['sell_reason'] = "Gate-line 1% Stop Loss"
+            virtual_holding = False  # Reset virtual trade state
+            waiting_for_bb_rebuy = False
+            monitoring_sell = False
+        elif is_sell_dead_signal:
+            c['signal_sell_cond1'] = True
+            c['signal_sell'] = True
+            c['sell_reason'] = "TEMA 3 Dead Cross"
+            virtual_holding = False  # Reset virtual trade state
+            waiting_for_bb_rebuy = False
+            monitoring_sell = False
 
         # Overwrite candle K-line with trade-specific K-line for orders & display
         c['K'] = trade_K
@@ -468,7 +471,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
 def calculate_indicators_1min(candles):
     """
     Calculates technical indicators for 1-minute candles.
-    Calculates TEMA 20 and SMA 40.
+    Calculates TEMA 20, SMA 40, SMA 3, SMA 60, and Bollinger Bands.
     """
     n = len(candles)
     if n == 0:
@@ -477,11 +480,19 @@ def calculate_indicators_1min(candles):
     closes = [c['close'] for c in candles]
     
     tema20 = calculate_tema(closes, 20)
+    sma20 = calculate_sma(closes, 20)
     sma40 = calculate_sma(closes, 40)
+    sma3 = calculate_sma(closes, 3)
+    sma60 = calculate_sma(closes, 60)
+    bb20_upper, bb20_mid, bb20_lower = calculate_bollinger_bands(closes, 20, 2.0)
     
     for i in range(n):
         candles[i]['tema20'] = tema20[i]
+        candles[i]['sma20'] = sma20[i]
         candles[i]['sma40'] = sma40[i]
+        candles[i]['sma3'] = sma3[i]
+        candles[i]['sma60'] = sma60[i]
+        candles[i]['bb20_upper'] = bb20_upper[i]
         
     return candles
 
@@ -622,7 +633,7 @@ def parse_tick_execution_data(res):
             price = abs(int(item.get("cur_prc", "0")))
             
             value = price * qty
-            if value >= 100000000: # 100 Million KRW
+            if value >= 50000000: # 50 Million KRW
                 block_buy_count += 1
         except (ValueError, TypeError):
             continue
