@@ -255,6 +255,23 @@ def run_trading_bot():
         "대상 파일: <code>my_pick.xlsx</code>"
     )
 
+    # 장 시작 전(Sleeping 상태)에도 대시보드에 보유 종목이 뜰 수 있도록 1회 초기화
+    init_holdings = client.get_holdings()
+    BOT_STATE["cash"] = client.get_cash_balance()
+    BOT_STATE["holdings"] = [
+        {
+            "code": h["code"],
+            "name": h["name"],
+            "quantity": h["quantity"],
+            "buy_price": h["buy_price"],
+            "current_price": h.get("current_price", 0),
+            "return_pct": round(
+                ((h.get("current_price", h["buy_price"]) - h["buy_price"]) / h["buy_price"]) * 100, 2
+            ) if h["buy_price"] > 0 else 0.0,
+        }
+        for h in init_holdings
+    ]
+
     # 3. Main Polling Loop
     while True:
         # For mock testing, ignore market hours so user can test on weekends
