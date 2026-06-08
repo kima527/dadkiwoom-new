@@ -858,7 +858,10 @@ def run_trading_bot():
             held_info = held_dict.get(code)
 
             if "tracking_mode" not in sent_alerts[code]:
-                sent_alerts[code]["tracking_mode"] = "15m"
+                if is_held:
+                    sent_alerts[code]["tracking_mode"] = "1m"
+                else:
+                    sent_alerts[code]["tracking_mode"] = "15m"
                 
             if sent_alerts[code]["tracking_mode"] == "done_today":
                 if sent_alerts[code].get("done_date") != current_date:
@@ -916,8 +919,8 @@ def run_trading_bot():
                 
                 else:
                     # 15m SMA 5 > SMA 60 인 정상 1m 추적 상태
-                    # 1분봉 데이터 및 지표 계산
-                    candles_1m = client.get_1min_candles(code, last_n_days=1)
+                    # 1분봉 데이터 및 지표 계산 (SMA40, TEMA20 등을 위해 최소 2일치 확보)
+                    candles_1m = client.get_1min_candles(code, last_n_days=2)
                     if candles_1m:
                         from indicator import calculate_indicators_1min
                         calculate_indicators_1min(candles_1m)
@@ -987,10 +990,16 @@ def run_trading_bot():
                                         notifier.send_all(msg)
                                         _add_alert("sell", f"{sell_reason_str} {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
                         
-                        # 2) 미보유 중일 때 -> 1m SMA20 & SMA40 골든크로스 재매수
                         else:
                             if is_1m_gold_cross:
                                 qty_to_buy = sent_alerts[code].get("sold_qty", 0)
+                                if qty_to_buy <= 0:
+                                    # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 기본 예산 사용
+                                    if config.TARGET_SINGLE_STOCK_CODE == "AUTO":
+                                        qty_to_buy = int(config.SINGLE_STOCK_BUDGET // close_price)
+                                    else:
+                                        qty_to_buy = int(config.BUDGET_PER_STOCK // close_price)
+                                        
                                 if qty_to_buy > 0:
                                     if sent_alerts[code]["buy"] != candle_time:
                                         # 관문선과 기준선 간격 1% 이하 시 당일 매매 종료
@@ -1277,180 +1286,10 @@ def run_trading_bot():
         BOT_STATE["status"] = "sleeping"
         time.sleep(120)
 
-def start_dashboard():
-    """Flask 대시보드 서버를 백그라운드 스레드로 실행합니다."""
-    import threading
-    import os
-    from flask import Flask, jsonify, render_template, request as flask_request
-    from indicator import calculate_indicators_pure as calc_ind
 
-    # Flask 앱 생성
-    dash_app = Flask(
-        __name__,
-        template_folder="templates",
-        static_folder="static"
-    )
-    dash_app.logger.disabled = True  # Flask 기본 로거 끄기
-
-    # Kiwoom 클라이언트 (백테스트용)
-    dash_client = KiwoomClient()
-
-    # ── 실시간 라우트 ──────────────────────────────────────────────
-    @dash_app.route('/live')
-    def live():
-        return render_template("live.html")
-
-    @dash_app.route('/api/live')
-    def api_live():
-        return jsonify(BOT_STATE)
-
-    # ── 백테스트 라우트 ────────────────────────────────────────────
-    @dash_app.route('/')
-    def index():
-        return render_template("index.html")
-
-    CANDLE_CACHE = {}
-    CACHE_EXPIRY = 300
-
-    def get_cached_candles(code, days):
-        import time as _time
-        now = _time.time()
-        key = (code, days)
-        if key in CANDLE_CACHE:
-            ts, candles = CANDLE_CACHE[key]
-            if now - ts < CACHE_EXPIRY:
-                return [c.copy() for c in candles]
-        candles = dash_client.get_15min_candles(code, last_n_days=days)
-        if candles:
-            CANDLE_CACHE[key] = (now, candles)
-            return [c.copy() for c in candles]
-        return []
-
-    # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
-    # ── Flask 백테스트 시뮬레이션 매매 엔진 ──
-    def run_sim(candles, mode="dynamic", fee=0.20):
-        key = {"tema": "signal_buy_tema", "line": "signal_buy"}.get(mode, "signal_buy_dynamic")
-        trades, is_holding, buy_price, buy_time, buy_idx = [], False, 0.0, None, -1
-        sold_qty = 0.0
-        n = len(candles)
-        for i in range(n - 1):
-            cur, nxt = candles[i], candles[i + 1]
-            try:
-                t_part = cur["time"].split(" ")[1]
-                h, m = map(int, t_part.split(":")[:2])
-                is_buy_window = (8 <= h < 12)
-                is_rebuy_window = (h >= 10 and (h < 15 or (h == 15 and m < 20)))
-            except Exception:
-                is_buy_window = True
-                is_rebuy_window = True
-
-            if not is_holding:
-                if is_buy_window and cur.get(key):
-                    is_holding, buy_price, buy_time, buy_idx = True, nxt["open"], nxt["time"], i + 1
-                    sold_qty = 0.0
-                elif is_rebuy_window and cur.get("signal_buy_bb_rebound") and sold_qty > 0:
-                    is_holding, buy_price, buy_time, buy_idx = True, nxt["open"], nxt["time"], i + 1
-                    sold_qty = 0.0
-            else:
-                if cur.get("signal_sell"):
-                    sp = nxt["open"]
-                    gr = ((sp - buy_price) / buy_price) * 100.0
-                    sell_reason = cur.get("sell_reason", "전략 매도")
-                    
-                    reason_kr = {
-                        "Pre-Power-Line Drop": "세력선 출현 전 종가 하락",
-                        "TEMA 3 Dead Cross": "TEMA 3 데드크로스",
-                        "BB5 Upper Reversal": "볼린저밴드 5상한선 반전 매도",
-                        "K-line Stop Loss": "K선 이탈 손실제한",
-                        "L-line 1% Stop Loss": "L선 1% 이탈 손절",
-                        "Gate-line 1% Stop Loss": "관문선 1% 이탈 손절",
-                        "Daily Close Liquidation": "당일 종가 청산"
-                    }.get(sell_reason, sell_reason)
-
-                    trades.append({"buy_time": buy_time, "buy_price": buy_price,
-                                   "sell_time": nxt["time"], "sell_price": sp,
-                                   "return_pct": round(gr - fee, 2),
-                                   "holding_bars": (i + 1) - buy_idx, "is_completed": True,
-                                   "reason": reason_kr})
-                    is_holding = False
-                    
-                    if sell_reason == "BB5 Upper Reversal":
-                        sold_qty = 1.0
-                    else:
-                        sold_qty = 0.0
-        if is_holding:
-            lc = candles[-1]
-            gr = ((lc["close"] - buy_price) / buy_price) * 100.0
-            trades.append({"buy_time": buy_time, "buy_price": buy_price,
-                           "sell_time": lc["time"] + " (미청산 평가)", "sell_price": lc["close"],
-                           "return_pct": round(gr - fee, 2),
-                           "holding_bars": (n - 1) - buy_idx, "is_completed": False,
-                           "reason": "미청산 평가"})
-        return trades
-
-    @dash_app.route('/api/backtest')
-    def api_backtest():
-        mode = flask_request.args.get("mode", "dynamic")
-        days = int(flask_request.args.get("days", "14"))
-        watchlist = load_watchlist(WATCHLIST_PATH)
-        if not watchlist:
-            return jsonify({"success": False, "error": "my_pick.xlsx 없거나 비어 있음"}), 400
-
-        all_trades, stock_perf = [], []
-        total_ret, total_cnt, win_cnt = 0.0, 0, 0
-        daily_returns = {}
-
-        for stock in watchlist:
-            code, name = stock["code"], stock["name"]
-            candles = get_cached_candles(code, days)
-            if not candles or len(candles) < 60:
-                continue
-            calc_ind(candles, use_compressed_peak=True,
-                     tema_period1=config.TEMA_PERIOD_SHORT,
-                     tema_period2=config.TEMA_PERIOD_LONG)
-            trades = run_sim(candles, mode=mode)
-            sr, sw, sc = 0.0, 0, 0
-            for t in trades:
-                t["code"], t["name"] = code, name
-                all_trades.append(t)
-                sr += t["return_pct"]
-                if t["return_pct"] > 0: sw += 1
-                if t["is_completed"]: sc += 1
-                d = t["sell_time"].split(" ")[0]
-                daily_returns[d] = daily_returns.get(d, 0.0) + t["return_pct"]
-            stock_perf.append({"code": code, "name": name, "total_return": round(sr, 2),
-                               "trades_count": len(trades),
-                               "win_rate": round(sw / len(trades) * 100, 1) if trades else 0.0})
-            total_ret += sr; total_cnt += len(trades); win_cnt += sw
-
-        all_trades.sort(key=lambda x: x["buy_time"], reverse=True)
-        curve, running = [], 0.0
-        for d in sorted(daily_returns):
-            running += daily_returns[d]
-            curve.append({"date": d, "daily_return": round(daily_returns[d], 2),
-                          "cumulative_return": round(running, 2)})
-        wr = round(win_cnt / total_cnt * 100, 1) if total_cnt > 0 else 0.0
-        return jsonify({"success": True, "mode": mode, "days": days,
-                        "summary": {"total_return": round(total_ret, 2), "trades_count": total_cnt,
-                                    "win_rate": wr, "avg_return": round(total_ret / total_cnt, 2) if total_cnt else 0.0},
-                        "stock_performance": stock_perf, "daily_cumulative": curve, "trades": all_trades})
-
-    # ── 스레드 실행 ──────────────────────────────────────────────
-    def _run():
-        import logging as _logging
-        _logging.getLogger('werkzeug').setLevel(_logging.ERROR)
-        dash_app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
-
-    t = threading.Thread(target=_run, daemon=True, name="DashboardThread")
-    t.start()
-    logger.info("✅ 실시간 대시보드 시작: http://127.0.0.1:5000/live  |  백테스트: http://127.0.0.1:5000/")
 
 
 if __name__ == "__main__":
-    import webbrowser, threading
-    # 0.5초 뒤 브라우저 열기 (서버 기동 후)
-    threading.Timer(2.5, lambda: webbrowser.open("http://127.0.0.1:5000/live")).start()
-    start_dashboard()
     try:
         run_trading_bot()
     except KeyboardInterrupt:
