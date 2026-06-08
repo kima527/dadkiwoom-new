@@ -1122,12 +1122,67 @@ function renderActiveHTSTab() {
 }
 
 function populateHTSTradeTab() {
-    const trades = LATEST_DATA.completed_trades || [];
-    const tbody = document.getElementById('hts-trade-rows');
-    if (!tbody) return;
+    // 1. 실현손익 요약 (키움 API 데이터 우선)
+    const real_profit = LATEST_DATA.today_realized_profit || {};
+    let grand_sell = real_profit.sell_amt || 0;
+    let grand_buy = real_profit.buy_amt || 0;
+    let grand_profit = real_profit.realized_profit || 0;
+    let grand_fees = (real_profit.commission || 0) + (real_profit.tax || 0);
     
-    if (trades.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center; padding:20px; color:#666;">당일 매매 내역이 없습니다.</td></tr>`;
+    // 2. 체결 내역 파싱 (키움 API 데이터 우선, 없으면 봇 자체 메모리 사용)
+    const kiwoom_orders = LATEST_DATA.today_filled_orders;
+    const bot_trades = LATEST_DATA.completed_trades || [];
+    
+    const grouped = {};
+    
+    if (kiwoom_orders && kiwoom_orders.length > 0) {
+        // 키움증권 실제 체결 내역 기준
+        kiwoom_orders.forEach(o => {
+            const c = o.code;
+            if (!grouped[c]) {
+                grouped[c] = { code: c, name: o.name, buy_qty: 0, buy_sum: 0, sell_qty: 0, sell_sum: 0, fee_tax: 0 };
+            }
+            const g = grouped[c];
+            const qty = o.filled_qty;
+            const price = o.filled_price;
+            if (o.side.includes("매수")) {
+                g.buy_qty += qty;
+                g.buy_sum += price * qty;
+            } else if (o.side.includes("매도")) {
+                g.sell_qty += qty;
+                g.sell_sum += price * qty;
+            }
+            // 수수료 추산
+            const amt = price * qty;
+            if (o.side.includes("매수")) g.fee_tax += Math.round(amt * 0.00015);
+            if (o.side.includes("매도")) g.fee_tax += Math.round(amt * 0.00215);
+        });
+    } else {
+        // 폴백: 봇 자체 거래 내역
+        bot_trades.forEach(t => {
+            const c = t.code;
+            if (!grouped[c]) {
+                grouped[c] = { code: c, name: t.name || c, buy_qty: 0, buy_sum: 0, sell_qty: 0, sell_sum: 0, fee_tax: 0 };
+            }
+            const g = grouped[c];
+            const qty = t.qty || 10;
+            if (t.buy_price && t.buy_price > 0) {
+                g.buy_qty += qty;
+                g.buy_sum += t.buy_price * qty;
+            }
+            if (t.sell_price && t.sell_price > 0) {
+                g.sell_qty += qty;
+                g.sell_sum += t.sell_price * qty;
+            }
+            const buy_amount = (t.buy_price || 0) * qty;
+            const sell_amount = (t.sell_price || 0) * qty;
+            g.fee_tax += Math.round((buy_amount * 0.00015) + (sell_amount * 0.00215));
+        });
+    }
+
+    const tbody = document.getElementById('hts-trade-rows');
+    if (Object.keys(grouped).length === 0) {
+        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center; padding:20px; color:#666;">당일 체결 내역이 없습니다. (키움 연동)</td></tr>`;
         document.getElementById('hts-sum-sell').textContent = '0';
         document.getElementById('hts-sum-buy').textContent = '0';
         document.getElementById('hts-sum-fees').textContent = '0';
@@ -1137,45 +1192,11 @@ function populateHTSTradeTab() {
         return;
     }
     
-    // Group trades by stock code
-    const grouped = {};
-    trades.forEach(t => {
-        const c = t.code;
-        if (!grouped[c]) {
-            grouped[c] = {
-                code: c,
-                name: t.name || c,
-                buy_qty: 0,
-                buy_sum: 0,
-                sell_qty: 0,
-                sell_sum: 0,
-                fee_tax: 0
-            };
-        }
-        const g = grouped[c];
-        const qty = t.qty || 10;
-        
-        if (t.buy_price && t.buy_price > 0) {
-            g.buy_qty += qty;
-            g.buy_sum += t.buy_price * qty;
-        }
-        
-        if (t.sell_price && t.sell_price > 0) {
-            g.sell_qty += qty;
-            g.sell_sum += t.sell_price * qty;
-        }
-        
-        const buy_amount = (t.buy_price || 0) * qty;
-        const sell_amount = (t.sell_price || 0) * qty;
-        const trade_fee = Math.round((buy_amount * 0.00015) + (sell_amount * 0.00215));
-        g.fee_tax += trade_fee;
-    });
-    
-    let grand_sell = 0;
-    let grand_buy = 0;
-    let grand_fees = 0;
-    let grand_profit = 0;
-    let grand_matched_buy = 0;
+    let calc_grand_sell = 0;
+    let calc_grand_buy = 0;
+    let calc_grand_fees = 0;
+    let calc_grand_profit = 0;
+    let calc_matched_buy = 0;
     
     let rowsHtml = '';
     
@@ -1196,13 +1217,13 @@ function populateHTSTradeTab() {
             profit = matched_sell_val - matched_buy_val - matched_fees;
             return_pct = (profit / matched_buy_val) * 100;
             
-            grand_profit += profit;
-            grand_matched_buy += matched_buy_val;
+            calc_grand_profit += profit;
+            calc_matched_buy += matched_buy_val;
         }
         
-        grand_sell += g.sell_sum;
-        grand_buy += g.buy_sum;
-        grand_fees += g.fee_tax;
+        calc_grand_sell += g.sell_sum;
+        calc_grand_buy += g.buy_sum;
+        calc_grand_fees += g.fee_tax;
         
         const buy_avg_str = avg_buy > 0 ? Number(avg_buy).toLocaleString('ko-KR') : '';
         const buy_qty_str = g.buy_qty > 0 ? Number(g.buy_qty).toLocaleString('ko-KR') : '';
@@ -1242,8 +1263,16 @@ function populateHTSTradeTab() {
     
     tbody.innerHTML = rowsHtml;
     
+    // 키움 실현손익 API 데이터가 있으면 그 값을 우선 사용, 없으면 직접 계산된 합산 사용
+    if (Object.keys(real_profit).length === 0) {
+        grand_sell = calc_grand_sell;
+        grand_buy = calc_grand_buy;
+        grand_fees = calc_grand_fees;
+        grand_profit = calc_grand_profit;
+    }
+    
     const grand_settle = grand_sell - grand_buy - grand_fees;
-    const grand_return_pct = grand_matched_buy > 0 ? (grand_profit / grand_matched_buy) * 100 : 0;
+    const grand_return_pct = calc_matched_buy > 0 ? (grand_profit / calc_matched_buy) * 100 : 0;
     
     const profit_cls = grand_profit > 0 ? 'hts-pos' : (grand_profit < 0 ? 'hts-neg' : 'hts-neu');
     const profit_sign = grand_profit > 0 ? '+' : '';

@@ -271,6 +271,8 @@ def run_trading_bot():
         }
         for h in init_holdings
     ]
+    BOT_STATE["today_realized_profit"] = client.get_today_realized_profit()
+    BOT_STATE["today_filled_orders"] = client.get_today_filled_orders()
 
     # 3. Main Polling Loop
     while True:
@@ -572,6 +574,10 @@ def run_trading_bot():
             }
             for h in holdings
         ]
+        
+        # 키움증권 당일 실현손익 및 체결내역 직접 조회 연동
+        BOT_STATE["today_realized_profit"] = client.get_today_realized_profit()
+        BOT_STATE["today_filled_orders"] = client.get_today_filled_orders()
 
         # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
         # 이 로직은 실시간 모니터링 및 랭킹 정렬 시 사용자의 핵심 모멘텀 스코어 공식(정배열 + 이격확장 + 등락률)을 일관성 있게 유지해줍니다.

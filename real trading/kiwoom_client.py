@@ -130,6 +130,68 @@ class KiwoomRealClient:
             logger.error(f"Error fetching cash balance: {e}")
             return 0.0
 
+    def get_today_realized_profit(self) -> dict:
+        """
+        실전 계좌의 당일 총 실현손익 및 수수료/세금을 조회합니다.
+        """
+        try:
+            import datetime
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            result = self.account_api.daily_realized_profit_request_ka10074(
+                start_date=today_str,
+                end_date=today_str
+            )
+            if not result:
+                return {}
+            
+            dt_rlzt = result.get("dt_rlzt_pl", [])
+            if dt_rlzt and len(dt_rlzt) > 0:
+                item = dt_rlzt[0]
+                return {
+                    "buy_amt": float(item.get("buy_amt", 0)),
+                    "sell_amt": float(item.get("sell_amt", 0)),
+                    "realized_profit": float(item.get("tdy_sel_pl", 0)),
+                    "commission": float(item.get("tdy_trde_cmsn", 0)),
+                    "tax": float(item.get("tdy_trde_tax", 0))
+                }
+            return {}
+        except Exception as e:
+            logger.error(f"Error fetching today realized profit: {e}")
+            return {}
+
+    def get_today_filled_orders(self) -> list:
+        """
+        실전 계좌의 당일 전체 체결 내역을 조회합니다.
+        """
+        try:
+            result = self.account_api.filled_orders_request_ka10076(
+                qry_tp="0",
+                sell_tp="0",
+                stex_tp="0"
+            )
+            if not result:
+                return []
+                
+            raw_orders = result.get("flled_ord_qry", [])
+            orders = []
+            for item in raw_orders:
+                stk_nm = item.get("stk_nm", "").strip()
+                if not stk_nm:
+                    continue
+                orders.append({
+                    "order_no": item.get("ord_no", ""),
+                    "code": item.get("stk_cd", "").replace("A", ""),
+                    "name": stk_nm,
+                    "side": item.get("sell_buy_tp_nm", ""), # 매수/매도
+                    "filled_qty": int(item.get("flled_qty", 0) or 0),
+                    "filled_price": float(item.get("flled_uv", 0) or 0),
+                    "order_time": item.get("ord_tm", "")
+                })
+            return orders
+        except Exception as e:
+            logger.error(f"Error fetching today filled orders: {e}")
+            return []
+
     def get_15min_candles(self, stock_code: str, last_n_days: int = 7) -> list:
         """
         주식 종목의 15분봉 차트 데이터를 조회합니다.
