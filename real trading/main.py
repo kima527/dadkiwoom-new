@@ -936,7 +936,7 @@ def run_trading_bot():
                                 if sent_alerts[code]["sell"] != candle_time:
                                     sent_alerts[code]["sell"] = candle_time
                                     qty_to_sell = held_info["quantity"]
-                                    order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="3")
+                                    order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
                                     if order_res and order_res.get("return_code") == 0:
                                         sent_alerts[code]["sold_qty"] = qty_to_sell
                                         pur_price = held_info["buy_price"]
@@ -1075,8 +1075,8 @@ def run_trading_bot():
                     if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
                         sugeub_daily_ok = latest.get("daily_breakout_ok", False)
 
-                    # 1순위 강제매수도 TEMA 3 > SMA 60 (signal_buy_dynamic) 조건을 만족해야 하도록 수정
-                    is_rank1 = (rank == 1) and not is_held and latest.get("signal_buy_dynamic")
+                    # 1순위 강제매수는 TEMA 3 > SMA 60 (현재 상승 추세) 조건을 만족해야 하도록 수정 (과거 시그널 누락 방지)
+                    is_rank1 = (rank == 1) and not is_held and latest.get("tema3_gt_sma60", latest.get("signal_buy_dynamic"))
                     if (is_rank1 or ((latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and sugeub_daily_ok)) and not already_bought_today:
                         if sent_alerts[code]["buy"] != candle_time:
                             if is_rank1:
@@ -1132,9 +1132,14 @@ def run_trading_bot():
                                     sent_alerts[code]["buy_reason"] = "dynamic"
         
                                 if not is_held:
-                                    qty = 1
+                                    if config.TARGET_SINGLE_STOCK_CODE == "AUTO":
+                                        budget = config.SINGLE_STOCK_BUDGET
+                                    else:
+                                        budget = config.BUDGET_PER_STOCK
+                                    qty = int(budget // close_price)
+                                    
                                     if qty > 0:
-                                        order_res = client.place_buy_order(code, qty, price=close_price, order_type="3")
+                                        order_res = client.place_buy_order(code, qty, price=close_price, order_type="0")
                                         if order_res and order_res.get("return_code") == 0:
                                             # 오늘 매수 성공했으므로 날짜 기록하여 추가 매매 잠금
                                             try:
@@ -1153,6 +1158,15 @@ def run_trading_bot():
                                             )
                                             notifier.send_all(msg)
                                             _add_alert("buy", f"{cond_type} 매수 {qty}주 @ {close_price:,.0f}원", code, name)
+                                        else:
+                                            err_msg = order_res.get("return_msg") if order_res else "응답 없음"
+                                            logger.error(f"❌ [매수 실패] {name} ({code}): {err_msg}")
+                                            msg = (
+                                                f"❌ <b>[매수 실패 - {cond_type}]</b>\n"
+                                                f"종목: {name} ({code})\n"
+                                                f"에러내용: {err_msg}"
+                                            )
+                                            notifier.send_all(msg)
                             else:
                                 filter_reasons = []
                                 if not sugeub_5m_ok: filter_reasons.append("5분봉 수급 미달")
@@ -1203,7 +1217,7 @@ def run_trading_bot():
 
                         if is_held and held_info:
                             qty_to_sell = held_info["quantity"]
-                            order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="3")
+                            order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
                             if order_res and order_res.get("return_code") == 0:
                                 # 15m BB5 Upper Reversal 매도 시에만 1m 추적모드로 진입
                                 if sell_reason == "BB5 Upper Reversal":
@@ -1272,7 +1286,7 @@ def run_trading_bot():
 
                         if is_held and held_info:
                             qty_to_sell = held_info["quantity"]
-                            order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="3")
+                            order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
                             if order_res and order_res.get("return_code") == 0:
                                 # Stay in 15m mode and reset sold_qty to 0
                                 sent_alerts[code]["tracking_mode"] = "15m"

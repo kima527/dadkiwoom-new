@@ -411,6 +411,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         
         # Macro indicators and filters
         c['sma5_gt_sma60'] = (c['sma5'] > c['sma60']) if (c['sma5'] is not None and c['sma60'] is not None) else False
+        c['tema3_gt_sma60'] = is_buy_signal
         c['signal_sell_sma5_sma60_dead'] = is_15m_sma_dead
 
         # Daily Close Reset logic removed to allow overnight holding.
