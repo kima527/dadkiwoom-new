@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>모의매매 실시간 대시보드 | Antigravity</title>
+    <title>실전매매 실시간 대시보드 | Antigravity</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -643,7 +643,7 @@
     <div class="topbar-left">
         <i class="fa-solid fa-bolt-lightning logo-icon"></i>
         <span class="logo-text">ANTIGRAVITY</span>
-        <span class="page-title">/ 모의매매 실시간 대시보드</span>
+        <span class="page-title">/ 실전매매 실시간 대시보드</span>
     </div>
     <nav class="nav-links">
         <a href="/live" class="nav-link active"><i class="fa-solid fa-tower-broadcast"></i> 실시간</a>
@@ -1343,7 +1343,7 @@ function sendMockOrder() {
             type: side === 'buy' ? 'buy' : 'sell',
             name: `수동주문 (${code})`,
             code: code,
-            message: `수동 모의 ${sideKo} 주문 ${qty}주 전송 완료 @ ${priceStr}`,
+            message: `수동 실전 ${sideKo} 주문 ${qty}주 전송 완료 @ ${priceStr}`,
             time: new Date().toLocaleTimeString('ko-KR')
         });
         renderAlerts(LATEST_DATA.alerts);
