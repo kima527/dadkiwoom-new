@@ -252,12 +252,12 @@ def run_trading_bot():
     BOT_STATE["account_num"] = config.KIWOOM_ACCOUNT_NUM
     
     # Initial startup message
-    notifier.send_all(
-        "🤖 <b>[알림 시작]</b>\n"
-        "키움 15분봉 모니터링 시스템이 가동되었습니다.\n"
-        f"TEMA 관문선: 기간1={config.TEMA_PERIOD_SHORT}, 기간2={config.TEMA_PERIOD_LONG}\n"
-        "대상 파일: <code>my_pick.xlsx</code>"
-    )
+    # notifier.send_all(
+    #     "🤖 <b>[알림 시작]</b>\n"
+    #     "키움 15분봉 모니터링 시스템이 가동되었습니다.\n"
+    #     f"TEMA 관문선: 기간1={config.TEMA_PERIOD_SHORT}, 기간2={config.TEMA_PERIOD_LONG}\n"
+    #     "대상 파일: <code>my_pick.xlsx</code>"
+    # )
 
     # 장 시작 전(Sleeping 상태)에도 대시보드에 보유 종목이 뜰 수 있도록 1회 초기화
     init_holdings = client.get_holdings()
@@ -539,16 +539,17 @@ def run_trading_bot():
                             f.write(f"{current_date},{best_code},{best_name}")
                         logger.info(f"🎯 Selected stock for today: {best_name} ({best_code}) | Score: {best_score:.2f} | {best_details} ({filter_reason})")
                         
-                        notifier.send_all(
-                            f"🎯 <b>[금일 모멘텀 최우선 관심 종목 브리핑]</b>\n"
-                            f"시장 분석을 통해 오늘 가장 모멘텀이 우수한 최우선 종목을 선정했습니다.\n"
-                            f"종목명: <b>{best_name} ({best_code})</b>\n"
-                            f"모멘텀 스코어: <b>{best_score:.2f}점</b>\n"
-                            f"이격도: {best_disp:.2f}%\n"
-                            f"상세상태: {best_details}\n"
-                            f"필터조건: {filter_reason}\n"
-                            f"※ 실제 매매는 전체 관심종목을 대상으로 실시간 감시하며 즉각 대응합니다."
-                        )
+                        # 최우선 관심 종목 브리핑 알림 제거
+                        # notifier.send_all(
+                        #     f"🎯 <b>[금일 모멘텀 최우선 관심 종목 브리핑]</b>\n"
+                        #     f"시장 분석을 통해 오늘 가장 모멘텀이 우수한 최우선 종목을 선정했습니다.\n"
+                        #     f"종목명: <b>{best_name} ({best_code})</b>\n"
+                        #     f"모멘텀 스코어: <b>{best_score:.2f}점</b>\n"
+                        #     f"이격도: {best_disp:.2f}%\n"
+                        #     f"상세상태: {best_details}\n"
+                        #     f"필터조건: {filter_reason}\n"
+                        #     f"※ 실제 매매는 전체 관심종목을 대상으로 실시간 감시하며 즉각 대응합니다."
+                        # )
                         _add_alert("info", f"금일 매매종목 선정: {best_name} ({best_code}) | Score: {best_score:.2f} | {best_details}", best_code, best_name)
                     except Exception as e:
                         logger.error(f"Failed to write selected stock file: {e}")
@@ -1011,7 +1012,8 @@ def run_trading_bot():
                                                     f"종목: {name} ({code})\n"
                                                     f"관문선({gate_line:,.0f}원)과 기준선({l_line:,.0f}원)의 간격이 1% 이하({gap_pct:.2f}%)이므로 재매수하지 않고 당일 매매를 종료합니다."
                                                 )
-                                                notifier.send_all(msg)
+                                                # 매매 종료 알림 제거
+                                                # notifier.send_all(msg)
                                                 _add_alert("info", f"1m 재매수 포기 (간격 {gap_pct:.2f}% <= 1%)", code, name)
                                                 sent_alerts[code]["sold_qty"] = 0
                                                 sent_alerts[code]["tracking_mode"] = "done_today"
@@ -1041,7 +1043,8 @@ def run_trading_bot():
                                                 f"종목: {name} ({code})\n"
                                                 f"에러내용: {err_msg}"
                                             )
-                                            notifier.send_all(msg)
+                                            # 실패 알림 제거
+                                            # notifier.send_all(msg)
                                             _add_alert("error", f"1m 골든크로스 재매수 실패: {err_msg}", code, name)
                         continue
                     else:
@@ -1134,7 +1137,8 @@ def run_trading_bot():
                                             f"종목: {name} ({code})\n"
                                             f"에러내용: {err_msg}"
                                         )
-                                        notifier.send_all(msg)
+                                        # 매수 실패 알림 제거
+                                        # notifier.send_all(msg)
                             else:
                                 # 어느 타임프레임이 미달인지 로그
                                 miss = []
@@ -1214,7 +1218,8 @@ def run_trading_bot():
                                     f"에러내용: {err_msg}"
                                 )
                                 _add_alert("error", f"{reason_kr} 매도실패: {err_msg}", code, name)
-                            notifier.send_all(msg)
+                            # 매도 실패 알림 제거
+                            # notifier.send_all(msg)
                         else:
                             msg = (
                                 f"📉 <b>[{reason_kr} 매도알림 - 미보유]</b>\n"
@@ -1223,7 +1228,8 @@ def run_trading_bot():
                                 f"시간: {candle_time}\n"
                                 f"<i>(매도 신호 발생 - 보유 수량 없음)</i>"
                             )
-                            notifier.send_all(msg)
+                            # 미보유 매도 신호 알림 제거
+                            # notifier.send_all(msg)
                             _add_alert("sell", f"{reason_kr} (미보유) | {close_price:,.0f}원", code, name)
 
                 # B) 세력선과 기준선 중 두번째 선 하향돌파 매도 (10:00 이후 추가 매도 조건)
@@ -1262,7 +1268,8 @@ def run_trading_bot():
                                     f"에러내용: {err_msg}"
                                 )
                                 _add_alert("error", f"하향돌파 매도실패: {err_msg}", code, name)
-                            notifier.send_all(msg)
+                            # 하향돌파 매도 실패 알림 제거
+                            # notifier.send_all(msg)
                         else:
                             # 미보유 종목은 알림만
                             msg = (
@@ -1271,7 +1278,8 @@ def run_trading_bot():
                                 f"현재가: {close_price:,.0f}원 | 두번째 선: {second_line_val:,.0f}원\n"
                                 f"시간: {candle_time}"
                             )
-                            notifier.send_all(msg)
+                            # 하향돌파 미보유 알림 제거
+                            # notifier.send_all(msg)
                             _add_alert("sell", f"하향돌파 (미보유) | {close_price:,.0f}원", code, name)
 
                     
