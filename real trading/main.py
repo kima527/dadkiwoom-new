@@ -872,9 +872,9 @@ def run_trading_bot():
 
             if tracking_mode == "1m":
                 # ─── 1분봉 추적매매 모드 ───
-                # A) 15분봉 SMA5/SMA60 데드크로스 발생 시 우선순위로 즉시 전량 매도 및 15m 모드 복귀
-                if latest.get("signal_sell_sma5_sma60_dead"):
-                    logger.info(f"🚨 [15m 데드크로스 감지] 1분봉 매매 해제 및 전량 매도 처리: {name} ({code})")
+                # A) 15분봉 TEMA3/SMA60 데드크로스 발생 시 우선순위로 즉시 전량 매도 및 15m 모드 복귀
+                if latest.get("signal_sell_tema3_sma60_dead"):
+                    logger.info(f"🚨 [15m TEMA3 데드크로스 감지] 1분봉 매매 해제 및 전량 매도 처리: {name} ({code})")
                     sent_alerts[code]["tracking_mode"] = "15m"
                     sent_alerts[code]["sold_qty"] = 0
                     
@@ -893,13 +893,13 @@ def run_trading_bot():
                                 "buy_price": pur_price,
                                 "sell_price": sell_price,
                                 "return_pct": round(ret_rate, 2),
-                                "reason": "15m SMA5-60 Dead Cross"
+                                "reason": "15m TEMA3-SMA60 Dead Cross"
                             }
                             BOT_STATE["completed_trades"].insert(0, trade_info)
                             if len(BOT_STATE["completed_trades"]) > 50:
                                 BOT_STATE["completed_trades"].pop()
                             msg = (
-                                f"📉 <b>[매도 체결 - 15m SMA5-60 Dead Cross!]</b>\n"
+                                f"📉 <b>[매도 체결 - 15m TEMA3-SMA60 Dead Cross!]</b>\n"
                                 f"종목: {name} ({code})\n"
                                 f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
                                 f"매수단가: {pur_price:,.0f}원\n"
@@ -908,18 +908,18 @@ def run_trading_bot():
                                 f"시간: {candle_time}\n"
                             )
                             notifier.send_all(msg)
-                            _add_alert("sell", f"15m SMA5-60 Dead Cross 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (지정가 -2호가)", code, name)
+                            _add_alert("sell", f"15m TEMA3-SMA60 Dead Cross 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (지정가 -2호가)", code, name)
                     continue
 
-                # B) 15m SMA5 <= SMA60 일 경우 1m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
-                elif not latest.get("sma5_gt_sma60"):
-                    logger.info(f"ℹ️ [15m SMA5 <= SMA60 감지] 1분봉 매매 모드 해제: {name} ({code})")
+                # B) 15m TEMA3 <= SMA60 일 경우 1m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
+                elif not latest.get("tema3_gt_sma60"):
+                    logger.info(f"ℹ️ [15m TEMA3 <= SMA60 감지] 1분봉 매매 모드 해제: {name} ({code})")
                     sent_alerts[code]["tracking_mode"] = "15m"
                     sent_alerts[code]["sold_qty"] = 0
                     tracking_mode = "15m"
                 
                 else:
-                    # 15m SMA 5 > SMA 60 인 정상 1m 추적 상태
+                    # 15m TEMA3 > SMA60 인 정상 1m 추적 상태
                     # 1분봉 데이터 및 지표 계산 (SMA40, TEMA20 등을 위해 최소 2일치 확보)
                     candles_1m = client.get_1min_candles(code, last_n_days=2)
                     if candles_1m:
@@ -1164,7 +1164,7 @@ def run_trading_bot():
                             "L-line 1% Stop Loss": "L선 1% 이탈 손절",
                             "Gate-line 1% Stop Loss": "관문선 1% 이탈 손절",
                             "Daily Close Liquidation": "당일 종가 청산",
-                            "15m SMA5-60 Dead Cross": "15m SMA5-60 데드크로스"
+                            "15m TEMA3-SMA60 Dead Cross": "15m TEMA3-SMA60 데드크로스"
                         }.get(sell_reason, "전략 매도")
 
                         if is_held and held_info:
