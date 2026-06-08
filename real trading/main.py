@@ -139,11 +139,10 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
             else:
                 rows_to_keep.append([code, name, "", "", ""])
                 
-    for code, h in holdings_map.items():
-        if code not in seen_codes:
-            seen_codes.add(code)
-            rows_to_keep.append([code, h["name"], h["quantity"], h["buy_price"], h["current_price"]])
-            
+    # 보유 종목이라도 엑셀에 명시적으로 등록되지 않은 종목은 자동 추가하지 않음 (사용자 요청)
+    # for code, h in holdings_map.items():
+    #     if code not in seen_codes: ...
+
     if target_code and target_code not in seen_codes and target_code not in holdings_map:
         name = client.get_stock_name(target_code) or "SK하이닉스"
         rows_to_keep.append([target_code, name, "", "", ""])
