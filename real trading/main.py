@@ -335,48 +335,9 @@ def run_trading_bot():
                 logger.info("Running Dynamic Daily Scanner with Rank intersection filtering...")
                 raw_watchlist = load_raw_watchlist(WATCHLIST_PATH)
                 
-                # Fetch top trading value & top fluctuation stocks
-                top_value_codes = []
-                top_flu_rates_map = {}
-                
-                # NXT(넥스트레이드) 장 시작인 08:00부터 거래대금/등락률 상위를 실시간으로 조회합니다.
-                now_kst = datetime.now(KST)
-                
-                try:
-                    top_value_codes = client.get_top_trading_value_stocks(market_type="000", limit=100)
-                    top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
-                except Exception as rank_err:
-                    logger.error(f"Failed to fetch market rankings: {rank_err}")
-
-                top_flu_codes = list(top_flu_rates_map.keys())
-
-                # Intersection logic
-                filtered_candidates = []
-                filter_reason = "Fallback (전체 관심종목)"
-                
-                if top_value_codes and top_flu_codes:
-                    val_set = set(top_value_codes)
-                    flu_set = set(top_flu_codes)
-                    leaders = val_set.intersection(flu_set) # 거래대금 상위 & 등락률 상위 교집합
-                    
-                    # 1. 1차 교집합: 거래대금 상위 & 등락률 상위 & 내 관심종목
-                    filtered_candidates = [s for s in raw_watchlist if s["code"] in leaders]
-                    
-                    if filtered_candidates:
-                        filter_reason = f"거래대금 & 등락률 상위 교집합 ({len(filtered_candidates)}종목)"
-                    else:
-                        # 2. 2차 교집합: 거래대금 상위 또는 등락률 상위에 속하는 내 관심종목 (합집합 교집합)
-                        filtered_candidates = [s for s in raw_watchlist if s["code"] in val_set or s["code"] in flu_set]
-                        if filtered_candidates:
-                            filter_reason = f"거래대금 또는 등락률 상위 부분 매칭 ({len(filtered_candidates)}종목)"
-                        else:
-                            # 3. 3차 Fallback: 겹치는 게 하나도 없으면 관심종목 전체
-                            filtered_candidates = raw_watchlist
-                            filter_reason = "매칭 종목 없음 -> 전체 관심종목 fallback"
-                else:
-                    # API 조회 불가(야간/휴일 등) 시 전체 관심종목으로 진행
-                    filtered_candidates = raw_watchlist
-                    filter_reason = "랭킹 API 호출 불가/데이터 없음 -> 전체 관심종목 fallback"
+                # 기존 거래대금/등락률 실시간 교집합 필터링 제거 (사용자 요청: 마이픽에 있는 종목만 전체 검토하여 매매)
+                filtered_candidates = raw_watchlist
+                filter_reason = "전체 관심종목 (마이픽 전수 조사)"
                 
                 logger.info(f"Candidates filtered. Target group: {filter_reason} (Total: {len(filtered_candidates)} stocks)")
                 
