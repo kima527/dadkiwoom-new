@@ -50,6 +50,19 @@ class KiwoomRealClient:
         self.rank_api = RankInfo(base_url=self.base_url, token_manager=self.token_manager)
         self.stock_info_api = StockInfo(base_url=self.base_url, token_manager=self.token_manager)
 
+        # 💡 [Patch] kiwoom_rest_api 라이브러리가 acnt_no를 누락하는 문제를 해결하기 위해
+        # 계좌 관련 및 주문 API의 _execute_request에 config.KIWOOM_ACCOUNT_NUM을 강제 주입
+        def _patch_api_instance(api_instance):
+            original_execute = api_instance._execute_request
+            def patched_execute(method: str, resource_url: str = None, **kwargs):
+                if "json" in kwargs and kwargs["json"] is not None:
+                    kwargs["json"]["acnt_no"] = config.KIWOOM_ACCOUNT_NUM
+                return original_execute(method, resource_url, **kwargs)
+            api_instance._execute_request = patched_execute
+
+        _patch_api_instance(self.account_api)
+        _patch_api_instance(self.order_api)
+
     def test_connection(self) -> bool:
         """
         Tests the API authentication and token issues.

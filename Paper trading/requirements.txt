@@ -1,9 +1,0 @@
-kiwoom-rest-api
-pandas
-numpy
-openpyxl
-python-dotenv
-requests
-schedule
-pandas-ta
-flask

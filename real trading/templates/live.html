@@ -905,7 +905,7 @@ function renderActiveHTSTab() {
         container.innerHTML = `
             <div class="hts-control-bar">
                 <div class="hts-field">
-                    <select class="hts-select"><option>5738-1000</option></select>
+                    <select class="hts-select"><option id="hts-acnt-sel">로딩중...</option></select>
                 </div>
                 <div class="hts-field">
                     <span>비밀번호</span>
@@ -982,6 +982,8 @@ function renderActiveHTSTab() {
         }
         
         if (LATEST_DATA) {
+            const acntElem = document.getElementById('hts-acnt-sel');
+            if (acntElem && LATEST_DATA.account_num) acntElem.textContent = LATEST_DATA.account_num;
             populateHTSTradeTab();
         }
     }
@@ -989,7 +991,7 @@ function renderActiveHTSTab() {
         container.innerHTML = `
             <div class="hts-control-bar">
                 <div class="hts-field">
-                    <select class="hts-select"><option>5738-1000</option></select>
+                    <select class="hts-select"><option id="hts-acnt-sel2">로딩중...</option></select>
                 </div>
                 <div class="hts-field">
                     <span>비밀번호</span>
@@ -1018,6 +1020,8 @@ function renderActiveHTSTab() {
             </div>
         `;
         if (LATEST_DATA) {
+            const acntElem = document.getElementById('hts-acnt-sel2');
+            if (acntElem && LATEST_DATA.account_num) acntElem.textContent = LATEST_DATA.account_num;
             populateHTSHoldingsTab();
         }
     }
@@ -1025,7 +1029,7 @@ function renderActiveHTSTab() {
         container.innerHTML = `
             <div class="hts-control-bar">
                 <div class="hts-field">
-                    <select class="hts-select"><option>5738-1000</option></select>
+                    <select class="hts-select"><option id="hts-acnt-sel3">로딩중...</option></select>
                 </div>
                 <button class="hts-query-btn" onclick="fetchLive()">조회</button>
             </div>
@@ -1056,6 +1060,8 @@ function renderActiveHTSTab() {
             </div>
         `;
         if (LATEST_DATA) {
+            const acntElem = document.getElementById('hts-acnt-sel3');
+            if (acntElem && LATEST_DATA.account_num) acntElem.textContent = LATEST_DATA.account_num;
             populateHTSCashTab();
         }
     }
@@ -1097,7 +1103,7 @@ function renderActiveHTSTab() {
         container.innerHTML = `
             <div class="hts-control-bar">
                 <div class="hts-field">
-                    <select class="hts-select"><option>5738-1000</option></select>
+                    <select class="hts-select"><option id="hts-acnt-sel4">로딩중...</option></select>
                 </div>
                 <button class="hts-query-btn" onclick="fetchLive()">조회</button>
             </div>
@@ -1118,6 +1124,10 @@ function renderActiveHTSTab() {
                 </table>
             </div>
         `;
+        if (LATEST_DATA) {
+            const acntElem = document.getElementById('hts-acnt-sel4');
+            if (acntElem && LATEST_DATA.account_num) acntElem.textContent = LATEST_DATA.account_num;
+        }
     }
 }
 

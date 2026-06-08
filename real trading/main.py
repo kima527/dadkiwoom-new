@@ -38,6 +38,9 @@ BOT_STATE = {
     "rankings": [],             # 이격도 순위 목록
     "next_poll_at": None,       # 다음 폴링 예정 시각
     "completed_trades": [],     # 완료된 거래 내역
+    "today_realized_profit": {},# 금일 실현손익 내역 (키움 API)
+    "today_filled_orders": [],  # 금일 전체 체결 내역 (키움 API)
+    "account_num": ""           # 현재 연동된 계좌번호
 }
 
 # Filepath for watchlist Excel
@@ -246,6 +249,7 @@ def run_trading_bot():
     sent_alerts = {}
     BOT_STATE["status"] = "running"
     BOT_STATE["cycle_count"] = 0
+    BOT_STATE["account_num"] = config.KIWOOM_ACCOUNT_NUM
     
     # Initial startup message
     notifier.send_all(
