@@ -1151,9 +1151,11 @@ def run_trading_bot():
 
                 # B) 매도 조건 충족 시 주문 처리 (시간대 무관하게 항상 적용)
                 if latest.get("signal_sell"):
-                    if sent_alerts[code]["sell"] != candle_time:
+                    sell_reason = latest.get("sell_reason")
+                    if tracking_mode == "3m" and sell_reason == "BB5 Upper Reversal":
+                        pass  # 3분봉 모드에서는 볼린저밴드 매도를 무시
+                    elif sent_alerts[code]["sell"] != candle_time:
                         sent_alerts[code]["sell"] = candle_time
-                        sell_reason = latest.get("sell_reason")
                         reason_kr = {
                             "Pre-Power-Line Drop": "세력선 출현 전 종가 하락",
                             "TEMA 3 Dead Cross": "TEMA 3 데드크로스",
