@@ -43,6 +43,11 @@ BOT_STATE = {
     "account_num": ""           # 현재 연동된 계좌번호
 }
 
+# ─────────────────────────────────────────────────────────
+# 이전 스캔 주기의 등락률 저장소 (급등/모멘텀 추적용)
+# ─────────────────────────────────────────────────────────
+PREV_FLU_RATES = {}
+
 # Filepath for watchlist Excel
 WATCHLIST_PATH = config.WATCHLIST_FILE
 
@@ -673,6 +678,14 @@ def run_trading_bot():
             
             score += flu_pct * 10.0
             
+            # 💡 [신규 로직] 직전 스캔 대비 등락률 급등(모멘텀 폭발) 추적
+            flu_delta = 0.0
+            if code in PREV_FLU_RATES:
+                flu_delta = flu_pct - PREV_FLU_RATES[code]
+                if flu_delta >= 1.0:
+                    score += 200.0
+                    logger.info(f"🚀 [모멘텀 폭발] {name}({code}) 3분만에 등락률 +{flu_delta:.2f}% 급등! 가산점 +200점 부여")
+            
             # ④ 수급 돌파 점수 가중치 반영
             has_recent_sugeub_spike = False
             check_len = min(8, len(candles))
@@ -721,10 +734,14 @@ def run_trading_bot():
                 "slope_ok": slope_ok,
                 "slope_pct": slope_pct,
                 "flu_pct": flu_pct,
+                "flu_delta": flu_delta,
                 "sugeub_spike": latest.get("signal_sugeub_spike", False),
                 "volume_power": volume_power,
                 "block_buy_count": block_buy_count,
             })
+            
+            # 다음 스캔 비교를 위해 현재 등락률 저장
+            PREV_FLU_RATES[code] = flu_pct
             
             # Delay to comply with API rate limits
             time.sleep(0.5)
@@ -745,7 +762,7 @@ def run_trading_bot():
                     f"  #{rank} {sr['name']}({sr['code']}) | "
                     f"점수: {sr['momentum_score']:.2f}점 | "
                     f"정배열={sr['trend_ok']}, 이격확장={sr['slope_ok']}(기울기:{sr['slope_pct']:+.2f}%) | "
-                    f"등락률: {sr['flu_pct']:+.2f}% | 이격도: {disp} | 수급돌파: {sr['sugeub_spike']} | 일봉보너스: {sr['latest'].get('daily_bonus_ok', False)} | 주봉보너스: {sr['latest'].get('weekly_bonus_ok', False)} | 체결강도: {sr['volume_power']:.1f}% | 1억매수: {sr['block_buy_count']}건"
+                    f"등락률: {sr['flu_pct']:+.2f}% (급등:{sr['flu_delta']:+.2f}%) | 이격도: {disp} | 수급돌파: {sr['sugeub_spike']} | 일봉보너스: {sr['latest'].get('daily_bonus_ok', False)} | 주봉보너스: {sr['latest'].get('weekly_bonus_ok', False)} | 체결강도: {sr['volume_power']:.1f}% | 1억매수: {sr['block_buy_count']}건"
                 )
                 trend = "uptrend" if sr['trend_ok'] else "rebound"
                 rankings_snapshot.append({
@@ -757,6 +774,8 @@ def run_trading_bot():
                     "disparity_pct": sr["disparity_pct"],
                     "momentum_score": round(sr["momentum_score"], 2),
                     "trend": trend,
+                    "flu_pct": round(sr["flu_pct"], 2),
+                    "flu_delta": round(sr["flu_delta"], 2),
                     "signal_buy": bool(sr["latest"].get("signal_buy_dynamic")),
                     "signal_sell": bool(sr["latest"].get("signal_sell")),
                     "daily_breakout_ok": bool(sr["latest"].get("daily_bonus_ok", False)),
