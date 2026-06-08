@@ -490,6 +490,7 @@ def calculate_indicators_3min(candles):
     sma40 = calculate_sma(closes, 40)
     sma3 = calculate_sma(closes, 3)
     sma60 = calculate_sma(closes, 60)
+    tema3 = calculate_tema(closes, 3)
     bb20_upper, bb20_mid, bb20_lower = calculate_bollinger_bands(closes, 20, 2.0)
     
     for i in range(n):
@@ -498,6 +499,7 @@ def calculate_indicators_3min(candles):
         candles[i]['sma40'] = sma40[i]
         candles[i]['sma3'] = sma3[i]
         candles[i]['sma60'] = sma60[i]
+        candles[i]['tema3'] = tema3[i]
         candles[i]['bb20_upper'] = bb20_upper[i]
         
     return candles

@@ -928,30 +928,28 @@ def run_trading_bot():
                         latest_3m = candles_3m[-1]
                         prev_3m = candles_3m[-2] if len(candles_3m) > 1 else latest_3m
                         
-                        tema20_3m = latest_3m.get("tema20")
-                        sma20_3m = latest_3m.get("sma20")
-                        sma40_3m = latest_3m.get("sma40")
+                        tema3_3m = latest_3m.get("tema3")
+                        sma60_3m = latest_3m.get("sma60")
                         
-                        prev_tema20_3m = prev_3m.get("tema20")
-                        prev_sma20_3m = prev_3m.get("sma20")
-                        prev_sma40_3m = prev_3m.get("sma40")
+                        prev_tema3_3m = prev_3m.get("tema3")
+                        prev_sma60_3m = prev_3m.get("sma60")
                         
                         is_3m_dead_cross = False
                         is_3m_gold_cross = False
                         
-                        # 데드크로스 (매도 조건): SMA20 이 SMA40 을 하향이탈
-                        if (sma20_3m is not None and sma40_3m is not None 
-                            and prev_sma20_3m is not None and prev_sma40_3m is not None):
-                            if prev_sma20_3m >= prev_sma40_3m and sma20_3m < sma40_3m:
+                        # 데드크로스 (매도 조건): TEMA3 이 SMA60 을 하향이탈
+                        if (tema3_3m is not None and sma60_3m is not None 
+                            and prev_tema3_3m is not None and prev_sma60_3m is not None):
+                            if prev_tema3_3m >= prev_sma60_3m and tema3_3m < sma60_3m:
                                 is_3m_dead_cross = True
                         
-                        # 골든크로스 (재매수 조건): TEMA20 이 SMA20 을 상향돌파
-                        if (tema20_3m is not None and sma20_3m is not None 
-                            and prev_tema20_3m is not None and prev_sma20_3m is not None):
-                            if prev_tema20_3m < prev_sma20_3m and tema20_3m >= sma20_3m:
+                        # 골든크로스 (재매수 조건): TEMA3 이 SMA60 을 상향돌파
+                        if (tema3_3m is not None and sma60_3m is not None 
+                            and prev_tema3_3m is not None and prev_sma60_3m is not None):
+                            if prev_tema3_3m < prev_sma60_3m and tema3_3m >= sma60_3m:
                                 is_3m_gold_cross = True
                                 
-                        # 1) 보유 중일 때 -> 1m SMA20 & SMA40 데드크로스 매도 또는 기준선(L) 이탈 시 매도
+                        # 1) 보유 중일 때 -> 3m TEMA3 & SMA60 데드크로스 매도 또는 기준선(L) 이탈 시 매도
                         if is_held:
                             is_below_l = (l_line is not None and close_price < l_line)
                             if is_3m_dead_cross or is_below_l:
