@@ -1021,45 +1021,9 @@ def run_trading_bot():
                         logger.warning(f"Failed to fetch 1-min candles for {name} ({code}) in 1m tracking mode. Falling back to 15m logic.")
 
             if tracking_mode == "15m":
-                # ── ① 08:00~12:00 매수 시간대 (1순위 우선매수 포함) ─────
-                if is_buy_window:
-                    # 1a. 매수준비 알림
-                    is_buy_prep = False
-                    prep_msg_detail = ""
-                    prep_target_price_str = ""
-
-                    s5 = latest.get("sma5")
-                    s20 = latest.get("sma20")
-
-                    if s5 is not None and s20 is not None:
-                        if s5 > s20:  # 상승중
-                            if latest.get("signal_buy_prep") and l_line is not None:
-                                is_buy_prep = True
-                                prep_msg_detail = "기준선 L 접근 (상승 추세)"
-                                prep_target_price_str = f"기준선(L): {l_line:,.0f}원"
-                        else:  # 하락후반등
-                            if latest.get("signal_buy_prep_tema") and gate_line is not None:
-                                is_buy_prep = True
-                                prep_msg_detail = "관문선 TEMA 접근 (하락 후 반등)"
-                                prep_target_price_str = f"관문선(TEMA): {gate_str}"
-
-                    if is_buy_prep:
-                        if sent_alerts[code]["buy_prep"] != candle_time:
-                            msg = (
-                                f"⚠️ <b>[매수준비 - {prep_msg_detail}]</b>\n"
-                                f"📊 우선순위: #{rank} (이격도: {disp_str})\n"
-                                f"종목: {name} ({code})\n"
-                                f"현재가: {close_price:,.0f}원\n"
-                                f"{prep_target_price_str}\n"
-                                f"시간: {candle_time}\n"
-                                f"<i>(현재가가 매수 기준선 1% 이내 밑에 도달)</i>"
-                            )
-                            notifier.send_all(msg)
-                            sent_alerts[code]["buy_prep"] = candle_time
-                            _add_alert("buy_prep", f"매수준비 - {prep_msg_detail} | {close_price:,.0f}원", code, name)
-
-                    # 1b. 매수 트리거 (기존 동적 전략 또는 수급 급증 돌파)
-                    # 오늘 이미 다른 종목 신규 매수를 완료했는지 체크 (하루 1종목 1주 매수 제한)
+                # ── ① 매수 로직 (수급 신호 기반 - 1분/5분/15분 중 하나라도 수급 터지면 +1호가 매수) ─────
+                if is_buy_window and not is_held:
+                    # 오늘 이미 다른 종목 신규 매수를 완료했는지 체크
                     already_bought_today = False
                     buy_date_file = "last_buy_date.txt"
                     if os.path.exists(buy_date_file):
@@ -1071,131 +1035,88 @@ def run_trading_bot():
                         except Exception as e:
                             logger.error(f"Error reading buy date file: {e}")
 
-                    sugeub_daily_ok = True
-                    if latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
-                        sugeub_daily_ok = latest.get("daily_breakout_ok", False)
-
-                    # 1순위 강제매수는 TEMA 3 > SMA 60 (현재 상승 추세) 조건을 만족해야 하도록 수정 (과거 시그널 누락 방지)
-                    is_rank1 = (rank == 1) and not is_held and latest.get("tema3_gt_sma60", latest.get("signal_buy_dynamic"))
-                    if (is_rank1 or ((latest.get("signal_buy_dynamic") or latest.get("signal_perfect_breakout")) and sugeub_daily_ok)) and not already_bought_today:
+                    if not already_bought_today:
                         if sent_alerts[code]["buy"] != candle_time:
-                            if is_rank1:
-                                logger.info(f"✅ [1순위 우선매수] {name} ({code}) 1순위 & TEMA 3>60 조건을 만족하여 우선 매수를 진행합니다.")
-                                sugeub_5m_ok, sugeub_1m_ok, tick_ok = True, True, True
-                                volume_power, block_buy_count = 100.0, 1
-                            else:
-                                # ── 🔒 [멀티타임프레임 수급 크로스 체킹 필터 적용] ──
-                                logger.info(f"🔍 [MTF 수급 검증 시작] {name} ({code}) 15분봉 매수 신호 포착. 1분봉/5분봉 단기 수급 폭발 여부 검증...")
-                                
-                                from indicator import check_short_term_sugeub
-                                # 1) 5분봉 조회 및 검증
-                                candles_5m = client.get_5min_candles(code, last_n_days=2)
-                                sugeub_5m_ok = check_short_term_sugeub(candles_5m, 5)
-                                
-                                # 2) 1분봉 조회 및 검증
-                                candles_1m = client.get_1min_candles(code, last_n_days=1)
-                                sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
-                                
-                                # ── 🔒 [실시간 틱 검증 (체결강도 및 1억 이상 대량 매수)] ──
-                                tick_ok = False
-                                volume_power = 100.0
-                                block_buy_count = 0
-                                tick_err_msg = ""
-                                
-                                if sugeub_5m_ok and sugeub_1m_ok:
-                                    logger.info(f"🔍 [실시간 틱 검증 시작] {name} ({code}) 1m/5m 수급 통과. 온디맨드 틱 데이터(ka10003) 조회 중...")
-                                    try:
-                                        tick_res = client.stock_info_api.daily_stock_price_request_ka10003(stock_code=code)
-                                        from indicator import parse_tick_execution_data
-                                        volume_power, block_buy_count = parse_tick_execution_data(tick_res)
-                                        
-                                        if volume_power >= 100.0 and block_buy_count >= 1:
-                                            tick_ok = True
-                                            logger.info(f"✅ [실시간 틱 검증 통과] {name} ({code}) 체결강도: {volume_power:.1f}%, 1억 이상 매수: {block_buy_count}건")
-                                        else:
-                                            logger.warning(f"❌ [실시간 틱 검증 탈락] {name} ({code}) 체결강도: {volume_power:.1f}% (기준: 100%이상), 1억 이상 매수: {block_buy_count}건 (기준: 1건이상)")
-                                    except Exception as e:
-                                        logger.error(f"Error during tick verification for {code}: {e}")
-                                        tick_err_msg = str(e)
+                            # ── 멀티타임프레임 수급 신호 순차 확인 (AND 조건: 1분/5분/15분 모두 수급 터져야 매수) ──
+                            from indicator import check_short_term_sugeub
                             
-                            if sugeub_5m_ok and sugeub_1m_ok and tick_ok:
-                                logger.info(f"✅ [최종 검증 통과] {name} ({code}) 매수 조건 모두 만족!")
+                            # 15분봉 수급 확인 (이미 계산된 지표 활용)
+                            sugeub_15m_ok = latest.get('signal_sugeub_spike', False)
+                            
+                            # 5분봉 수급 확인
+                            sugeub_5m_ok = False
+                            candles_5m = client.get_5min_candles(code, last_n_days=2)
+                            if candles_5m:
+                                sugeub_5m_ok = check_short_term_sugeub(candles_5m, 5)
+                            
+                            # 1분봉 수급 확인
+                            sugeub_1m_ok = False
+                            candles_1m = client.get_1min_candles(code, last_n_days=1)
+                            if candles_1m:
+                                sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
+                            
+                            # 세 타임프레임 모두 수급 신호가 떠야 매수
+                            if sugeub_15m_ok and sugeub_5m_ok and sugeub_1m_ok:
+                                # 1분/5분/15분 수급 동시 확인! +1호가 매수 진행
+                                from indicator import adjust_price_by_ticks
+                                buy_price = adjust_price_by_ticks(close_price, 1)
+                                cond_type = "수급신호(1분/5분/15분 동시)"
+                                
+                                logger.info(f"🚀 [수급 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
+                                
                                 sent_alerts[code]["buy"] = candle_time
-                                if is_rank1:
-                                    cond_type = "1순위 우선매수"
-                                    sent_alerts[code]["buy_reason"] = "rank1"
-                                elif latest.get("signal_perfect_breakout") and not latest.get("signal_buy_dynamic"):
-                                    cond_type = "수급완벽돌파"
-                                    sent_alerts[code]["buy_reason"] = "sugeub"
+                                sent_alerts[code]["buy_reason"] = "sugeub_mtf"
+                                
+                                if config.TARGET_SINGLE_STOCK_CODE == "AUTO":
+                                    budget = config.SINGLE_STOCK_BUDGET
                                 else:
-                                    cond_type = latest.get("buy_condition_type", "N/A")
-                                    sent_alerts[code]["buy_reason"] = "dynamic"
+                                    budget = config.BUDGET_PER_STOCK
+                                qty = int(budget // buy_price)
+                                
+                                if qty > 0:
+                                    order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")
+                                    if order_res and order_res.get("return_code") == 0:
+                                        # 오늘 매수 성공 → 날짜 기록 및 1분봉 추적모드 전환
+                                        try:
+                                            with open(buy_date_file, "w") as f:
+                                                f.write(current_date)
+                                        except Exception as e:
+                                            logger.error(f"Failed to write buy date file: {e}")
+                                        
+                                        # 매수 후 1분봉 추적 매매 모드로 전환
+                                        sent_alerts[code]["tracking_mode"] = "1m"
+                                        sent_alerts[code]["sold_qty"] = 0
+                                        logger.info(f"➡️ [모드 전환] 매수 체결 후 1분봉 추적매매 모드로 전환: {name} ({code})")
         
-                                if not is_held:
-                                    if config.TARGET_SINGLE_STOCK_CODE == "AUTO":
-                                        budget = config.SINGLE_STOCK_BUDGET
+                                        msg = (
+                                            f"🚀 <b>[매수 체결 - {cond_type}]</b>\n"
+                                            f"종목: {name} ({code})\n"
+                                            f"체결단가: {buy_price:,.0f}원 (+1호가 지정가)\n"
+                                            f"수량: {qty}주\n"
+                                            f"시간: {candle_time}\n"
+                                            f"주문번호: {order_res.get('ord_no')}\n"
+                                            f"<i>매수 후 1분봉 추적매매 모드로 전환됩니다.</i>"
+                                        )
+                                        notifier.send_all(msg)
+                                        _add_alert("buy", f"{cond_type} 매수 {qty}주 @ {buy_price:,.0f}원 (+1호가)", code, name)
                                     else:
-                                        budget = config.BUDGET_PER_STOCK
-                                    qty = int(budget // close_price)
-                                    
-                                    if qty > 0:
-                                        order_res = client.place_buy_order(code, qty, price=close_price, order_type="0")
-                                        if order_res and order_res.get("return_code") == 0:
-                                            # 오늘 매수 성공했으므로 날짜 기록하여 추가 매매 잠금
-                                            try:
-                                                with open(buy_date_file, "w") as f:
-                                                    f.write(current_date)
-                                            except Exception as e:
-                                                logger.error(f"Failed to write buy date file: {e}")
-        
-                                            msg = (
-                                                f"🚀 <b>[매수 체결 - {cond_type}]</b>\n"
-                                                f"종목: {name} ({code})\n"
-                                                f"체결단가: {close_price:,.0f}원\n"
-                                                f"수량: {qty}주\n"
-                                                f"시간: {candle_time}\n"
-                                                f"주문번호: {order_res.get('ord_no')}"
-                                            )
-                                            notifier.send_all(msg)
-                                            _add_alert("buy", f"{cond_type} 매수 {qty}주 @ {close_price:,.0f}원", code, name)
-                                        else:
-                                            err_msg = order_res.get("return_msg") if order_res else "응답 없음"
-                                            logger.error(f"❌ [매수 실패] {name} ({code}): {err_msg}")
-                                            msg = (
-                                                f"❌ <b>[매수 실패 - {cond_type}]</b>\n"
-                                                f"종목: {name} ({code})\n"
-                                                f"에러내용: {err_msg}"
-                                            )
-                                            notifier.send_all(msg)
+                                        err_msg = order_res.get("return_msg") if order_res else "응답 없음"
+                                        logger.error(f"❌ [매수 실패] {name} ({code}): {err_msg}")
+                                        msg = (
+                                            f"❌ <b>[매수 실패 - {cond_type}]</b>\n"
+                                            f"종목: {name} ({code})\n"
+                                            f"에러내용: {err_msg}"
+                                        )
+                                        notifier.send_all(msg)
                             else:
-                                filter_reasons = []
-                                if not sugeub_5m_ok: filter_reasons.append("5분봉 수급 미달")
-                                if not sugeub_1m_ok: filter_reasons.append("1분봉 수급 미달")
-                                if not tick_ok:
-                                    if volume_power < 100.0: filter_reasons.append(f"체결강도 미달 ({volume_power:.1f}% < 100%)")
-                                    if block_buy_count < 1: filter_reasons.append(f"대량매수 미달 ({block_buy_count}건 < 1건)")
-                                
-                                reason_str = " & ".join(filter_reasons)
-                                logger.warning(f"⚠️ [매수 검증 탈락] {name} ({code}) 매수 조건은 충족되었으나 필터 조건 미달로 매수 보류: {reason_str}")
-                                
-                                # 사용자 알림 발송 (매수 보류 통지)
-                                msg = (
-                                    f"⚠️ <b>[매수 보류 - 조건 미달]</b>\n"
-                                    f"종목: {name} ({code})\n"
-                                    f"15분봉 상 매수 신호가 포착되었으나, 필터 조건이 부족하여 진입을 보류했습니다.\n"
-                                    f"미달 사유: <code>{reason_str}</code>\n"
-                                    f"현재가: {close_price:,.0f}원 | 시간: {candle_time}"
-                                )
-                                notifier.send_all(msg)
-                                _add_alert("info", f"매수보류: {reason_str}", code, name)
+                                # 어느 타임프레임이 미달인지 로그
+                                miss = []
+                                if not sugeub_15m_ok: miss.append("15분봉")
+                                if not sugeub_5m_ok: miss.append("5분봉")
+                                if not sugeub_1m_ok: miss.append("1분봉")
+                                logger.debug(f"  {name}({code}) 수급 미달: {', '.join(miss)} (15m={sugeub_15m_ok}, 5m={sugeub_5m_ok}, 1m={sugeub_1m_ok})")
 
-                # ── ② 10:00~15:20 재매수 비활성화 ──────────────
-                # (15m 모드에서는 더이상 5볼린저 하한선 재매수를 하지 않고, 재매수는 오직 1m 모드에서만 처리됨)
-
-                # ── ③ 12:00 이후 : 매수 없음 ─────────────────────
-                # (매도만 진행, 아래 보락)
-
-                # ── ④ 매도 로직 (시간대 무관하게 항상 적용) ──────────
+                # ── ② 매도 로직 (시간대 무관하게 항상 적용) ──────────
                 # A) 당일 종가 청산 강제 신호 부여 제거 (오버나잇 허용)
                 pass
 
