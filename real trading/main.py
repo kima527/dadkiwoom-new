@@ -972,11 +972,9 @@ def run_trading_bot():
                             if is_3m_gold_cross:
                                 qty_to_buy = sent_alerts[code].get("sold_qty", 0)
                                 if qty_to_buy <= 0:
-                                    # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 기본 예산 사용
-                                    if config.TARGET_SINGLE_STOCK_CODE == "AUTO":
-                                        qty_to_buy = int(config.SINGLE_STOCK_BUDGET // close_price)
-                                    else:
-                                        qty_to_buy = int(config.BUDGET_PER_STOCK // close_price)
+                                    # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 주문가능금액(예수금) 95% 풀매수
+                                    budget = cash * 0.95
+                                    qty_to_buy = int(budget // close_price)
                                         
                                 if qty_to_buy > 0:
                                     if sent_alerts[code]["buy"] != candle_time:
@@ -1030,6 +1028,10 @@ def run_trading_bot():
             if tracking_mode == "15m":
                 # ── ① 매수 로직 (수급 신호 기반 - 1분/5분/15분 중 하나라도 수급 터지면 +1호가 매수) ─────
                 if is_buy_window and not is_held:
+                    # 계좌에 이미 보유 중인 종목이 있다면 신규 매수 차단 (1종목 몰빵 규칙)
+                    if len(holdings) >= 1:
+                        continue
+
                     # 오늘 이미 다른 종목 신규 매수를 완료했는지 체크
                     already_bought_today = False
                     buy_date_file = "last_buy_date.txt"
@@ -1074,10 +1076,8 @@ def run_trading_bot():
                                 sent_alerts[code]["buy"] = candle_time
                                 sent_alerts[code]["buy_reason"] = "sugeub_mtf"
                                 
-                                if config.TARGET_SINGLE_STOCK_CODE == "AUTO":
-                                    budget = config.SINGLE_STOCK_BUDGET
-                                else:
-                                    budget = config.BUDGET_PER_STOCK
+                                # 주문가능금액(예수금) 95% 풀매수
+                                budget = cash * 0.95
                                 qty = int(budget // buy_price)
                                 
                                 if qty > 0:
