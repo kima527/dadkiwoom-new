@@ -914,19 +914,27 @@ def run_trading_bot():
                         latest_1m = candles_1m[-1]
                         prev_1m = candles_1m[-2] if len(candles_1m) > 1 else latest_1m
                         
+                        tema20_1m = latest_1m.get("tema20")
                         sma20_1m = latest_1m.get("sma20")
                         sma40_1m = latest_1m.get("sma40")
+                        
+                        prev_tema20_1m = prev_1m.get("tema20")
                         prev_sma20_1m = prev_1m.get("sma20")
                         prev_sma40_1m = prev_1m.get("sma40")
                         
                         is_1m_dead_cross = False
                         is_1m_gold_cross = False
                         
+                        # 데드크로스 (매도 조건): SMA20 이 SMA40 을 하향이탈
                         if (sma20_1m is not None and sma40_1m is not None 
                             and prev_sma20_1m is not None and prev_sma40_1m is not None):
                             if prev_sma20_1m >= prev_sma40_1m and sma20_1m < sma40_1m:
                                 is_1m_dead_cross = True
-                            elif prev_sma20_1m < prev_sma40_1m and sma20_1m >= sma40_1m:
+                        
+                        # 골든크로스 (재매수 조건): TEMA20 이 SMA20 을 상향돌파
+                        if (tema20_1m is not None and sma20_1m is not None 
+                            and prev_tema20_1m is not None and prev_sma20_1m is not None):
+                            if prev_tema20_1m < prev_sma20_1m and tema20_1m >= sma20_1m:
                                 is_1m_gold_cross = True
                                 
                         # 1) 보유 중일 때 -> 1m SMA20 & SMA40 데드크로스 매도 또는 기준선(L) 이탈 시 매도
