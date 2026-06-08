@@ -124,15 +124,19 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
 
     closes = [c['close'] for c in candles]
     
-    # 1. SMAs
+    # 1. SMAs & TEMA
     sma5 = calculate_sma(closes, 5)
     sma20 = calculate_sma(closes, 20)
+    sma40 = calculate_sma(closes, 40)
     sma60 = calculate_sma(closes, 60)
+    tema20 = calculate_tema(closes, 20)
     
     for i in range(n):
         candles[i]['sma5'] = sma5[i]
         candles[i]['sma20'] = sma20[i]
+        candles[i]['sma40'] = sma40[i]
         candles[i]['sma60'] = sma60[i]
+        candles[i]['tema20'] = tema20[i]
 
     # 2. Perfect Alignment & K-line
     last_K = None
