@@ -389,15 +389,15 @@ class KiwoomRealClient:
             logger.error(f"Error placing sell order: {e}")
             return None
 
-    def get_1min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
+    def get_3min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
         """
-        주식 종목의 1분봉 차트 데이터를 조회합니다.
+        주식 종목의 3분봉 차트 데이터를 조회합니다.
         """
-        logger.info(f"Fetching 1-minute candles for stock code {stock_code}...")
+        logger.info(f"Fetching 3-minute candles for stock code {stock_code}...")
         try:
             result = self.chart_api.stock_minute_chart_request_ka10080(
                 stk_cd=stock_code,
-                tic_scope="1",
+                tic_scope="3",
                 upd_stkpc_tp="1"
             )
             if not result:
@@ -439,7 +439,7 @@ class KiwoomRealClient:
             target_dates = unique_dates[-last_n_days:]
             return [c for c in parsed_candles if c["date"] in target_dates]
         except Exception as e:
-            logger.error(f"Error fetching 1-min candles: {e}")
+            logger.error(f"Error fetching 3-min candles: {e}")
             return []
 
     def get_5min_candles(self, stock_code: str, last_n_days: int = 2) -> list:

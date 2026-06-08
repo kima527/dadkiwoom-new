@@ -474,10 +474,10 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                 is_perfect_breakout = True
     return candles
 
-def calculate_indicators_1min(candles):
+def calculate_indicators_3min(candles):
     """
-    Calculates technical indicators for 1-minute candles.
-    Calculates TEMA 20, SMA 40, SMA 3, SMA 60, and Bollinger Bands.
+    Calculates technical indicators for 3-minute candles.
+    Calculates TEMA 20, SMA 40, SMA 20.
     """
     n = len(candles)
     if n == 0:

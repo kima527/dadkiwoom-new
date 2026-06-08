@@ -860,7 +860,7 @@ def run_trading_bot():
 
             if "tracking_mode" not in sent_alerts[code]:
                 if is_held:
-                    sent_alerts[code]["tracking_mode"] = "1m"
+                    sent_alerts[code]["tracking_mode"] = "3m"
                 else:
                     sent_alerts[code]["tracking_mode"] = "15m"
                 
@@ -870,11 +870,11 @@ def run_trading_bot():
                     
             tracking_mode = sent_alerts[code]["tracking_mode"]
 
-            if tracking_mode == "1m":
-                # ─── 1분봉 추적매매 모드 ───
+            if tracking_mode == "3m":
+                # ─── 3분봉 추적매매 모드 ───
                 # A) 15분봉 TEMA3/SMA60 데드크로스 발생 시 우선순위로 즉시 전량 매도 및 15m 모드 복귀
                 if latest.get("signal_sell_tema3_sma60_dead"):
-                    logger.info(f"🚨 [15m TEMA3 데드크로스 감지] 1분봉 매매 해제 및 전량 매도 처리: {name} ({code})")
+                    logger.info(f"🚨 [15m TEMA3 데드크로스 감지] 3분봉 매매 해제 및 전량 매도 처리: {name} ({code})")
                     sent_alerts[code]["tracking_mode"] = "15m"
                     sent_alerts[code]["sold_qty"] = 0
                     
@@ -911,50 +911,50 @@ def run_trading_bot():
                             _add_alert("sell", f"15m TEMA3-SMA60 Dead Cross 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (지정가 -2호가)", code, name)
                     continue
 
-                # B) 15m TEMA3 <= SMA60 일 경우 1m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
+                # B) 15m TEMA3 <= SMA60 일 경우 3m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
                 elif not latest.get("tema3_gt_sma60"):
-                    logger.info(f"ℹ️ [15m TEMA3 <= SMA60 감지] 1분봉 매매 모드 해제: {name} ({code})")
+                    logger.info(f"ℹ️ [15m TEMA3 <= SMA60 감지] 3분봉 매매 모드 해제: {name} ({code})")
                     sent_alerts[code]["tracking_mode"] = "15m"
                     sent_alerts[code]["sold_qty"] = 0
                     tracking_mode = "15m"
                 
                 else:
-                    # 15m TEMA3 > SMA60 인 정상 1m 추적 상태
-                    # 1분봉 데이터 및 지표 계산 (SMA40, TEMA20 등을 위해 최소 2일치 확보)
-                    candles_1m = client.get_1min_candles(code, last_n_days=2)
-                    if candles_1m:
-                        from indicator import calculate_indicators_1min
-                        calculate_indicators_1min(candles_1m)
-                        latest_1m = candles_1m[-1]
-                        prev_1m = candles_1m[-2] if len(candles_1m) > 1 else latest_1m
+                    # 15m TEMA3 > SMA60 인 정상 3m 추적 상태
+                    # 3분봉 데이터 및 지표 계산 (SMA40, TEMA20 등을 위해 최소 2일치 확보)
+                    candles_3m = client.get_3min_candles(code, last_n_days=2)
+                    if candles_3m:
+                        from indicator import calculate_indicators_3min
+                        calculate_indicators_3min(candles_3m)
+                        latest_3m = candles_3m[-1]
+                        prev_3m = candles_3m[-2] if len(candles_3m) > 1 else latest_3m
                         
-                        tema20_1m = latest_1m.get("tema20")
-                        sma20_1m = latest_1m.get("sma20")
-                        sma40_1m = latest_1m.get("sma40")
+                        tema20_3m = latest_3m.get("tema20")
+                        sma20_3m = latest_3m.get("sma20")
+                        sma40_3m = latest_3m.get("sma40")
                         
-                        prev_tema20_1m = prev_1m.get("tema20")
-                        prev_sma20_1m = prev_1m.get("sma20")
-                        prev_sma40_1m = prev_1m.get("sma40")
+                        prev_tema20_3m = prev_3m.get("tema20")
+                        prev_sma20_3m = prev_3m.get("sma20")
+                        prev_sma40_3m = prev_3m.get("sma40")
                         
-                        is_1m_dead_cross = False
-                        is_1m_gold_cross = False
+                        is_3m_dead_cross = False
+                        is_3m_gold_cross = False
                         
                         # 데드크로스 (매도 조건): SMA20 이 SMA40 을 하향이탈
-                        if (sma20_1m is not None and sma40_1m is not None 
-                            and prev_sma20_1m is not None and prev_sma40_1m is not None):
-                            if prev_sma20_1m >= prev_sma40_1m and sma20_1m < sma40_1m:
-                                is_1m_dead_cross = True
+                        if (sma20_3m is not None and sma40_3m is not None 
+                            and prev_sma20_3m is not None and prev_sma40_3m is not None):
+                            if prev_sma20_3m >= prev_sma40_3m and sma20_3m < sma40_3m:
+                                is_3m_dead_cross = True
                         
                         # 골든크로스 (재매수 조건): TEMA20 이 SMA20 을 상향돌파
-                        if (tema20_1m is not None and sma20_1m is not None 
-                            and prev_tema20_1m is not None and prev_sma20_1m is not None):
-                            if prev_tema20_1m < prev_sma20_1m and tema20_1m >= sma20_1m:
-                                is_1m_gold_cross = True
+                        if (tema20_3m is not None and sma20_3m is not None 
+                            and prev_tema20_3m is not None and prev_sma20_3m is not None):
+                            if prev_tema20_3m < prev_sma20_3m and tema20_3m >= sma20_3m:
+                                is_3m_gold_cross = True
                                 
                         # 1) 보유 중일 때 -> 1m SMA20 & SMA40 데드크로스 매도 또는 기준선(L) 이탈 시 매도
                         if is_held:
                             is_below_l = (l_line is not None and close_price < l_line)
-                            if is_1m_dead_cross or is_below_l:
+                            if is_3m_dead_cross or is_below_l:
                                 if sent_alerts[code]["sell"] != candle_time:
                                     sent_alerts[code]["sell"] = candle_time
                                     qty_to_sell = held_info["quantity"]
@@ -964,7 +964,7 @@ def run_trading_bot():
                                         pur_price = held_info["buy_price"]
                                         ret_rate = ((close_price - pur_price) / pur_price) * 100.0
                                         
-                                        sell_reason_str = "1m 데드크로스" if is_1m_dead_cross else "L선(기준선) 이탈 매도"
+                                        sell_reason_str = "3m 데드크로스" if is_3m_dead_cross else "L선(기준선) 이탈 매도"
                                         
                                         trade_info = {
                                             "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -992,7 +992,7 @@ def run_trading_bot():
                                         _add_alert("sell", f"{sell_reason_str} {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
                         
                         else:
-                            if is_1m_gold_cross:
+                            if is_3m_gold_cross:
                                 qty_to_buy = sent_alerts[code].get("sold_qty", 0)
                                 if qty_to_buy <= 0:
                                     # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 기본 예산 사용
@@ -1014,7 +1014,7 @@ def run_trading_bot():
                                                 )
                                                 # 매매 종료 알림 제거
                                                 # notifier.send_all(msg)
-                                                _add_alert("info", f"1m 재매수 포기 (간격 {gap_pct:.2f}% <= 1%)", code, name)
+                                                _add_alert("info", f"3m 재매수 포기 (간격 {gap_pct:.2f}% <= 1%)", code, name)
                                                 sent_alerts[code]["sold_qty"] = 0
                                                 sent_alerts[code]["tracking_mode"] = "done_today"
                                                 sent_alerts[code]["done_date"] = current_date
@@ -1026,26 +1026,26 @@ def run_trading_bot():
                                         order_res = client.place_buy_order(code, qty_to_buy, price=buy_price, order_type="0")
                                         if order_res and order_res.get("return_code") == 0:
                                             msg = (
-                                                f"🔄 <b>[재매수 - 1분봉 골든크로스!]</b>\n"
+                                                f"🔄 <b>[재매수 - 3분봉 골든크로스!]</b>\n"
                                                 f"종목: {name} ({code})\n"
                                                 f"매수단가: {buy_price:,.0f}원 (지정가 +2호가)\n"
                                                 f"매수수량: {qty_to_buy}주\n"
                                                 f"시간: {candle_time}\n"
                                             )
                                             notifier.send_all(msg)
-                                            _add_alert("buy", f"1m 골든크로스 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +2호가)", code, name)
+                                            _add_alert("buy", f"3m 골든크로스 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +2호가)", code, name)
                                             sent_alerts[code]["sold_qty"] = 0
                                             sent_alerts[code]["buy_reason"] = "dynamic"
                                         else:
                                             err_msg = order_res.get("return_msg") if order_res else "응답 없음"
                                             msg = (
-                                                f"❌ <b>[재매수 실패 - 1분봉 골든크로스]</b>\n"
+                                                f"❌ <b>[재매수 실패 - 3분봉 골든크로스]</b>\n"
                                                 f"종목: {name} ({code})\n"
                                                 f"에러내용: {err_msg}"
                                             )
                                             # 실패 알림 제거
                                             # notifier.send_all(msg)
-                                            _add_alert("error", f"1m 골든크로스 재매수 실패: {err_msg}", code, name)
+                                            _add_alert("error", f"3m 골든크로스 재매수 실패: {err_msg}", code, name)
                         continue
                     else:
                         logger.warning(f"Failed to fetch 1-min candles for {name} ({code}) in 1m tracking mode. Falling back to 15m logic.")
@@ -1079,14 +1079,14 @@ def run_trading_bot():
                             if candles_5m:
                                 sugeub_5m_ok = check_short_term_sugeub(candles_5m, 5)
                             
-                            # 1분봉 수급 확인
-                            sugeub_1m_ok = False
-                            candles_1m = client.get_1min_candles(code, last_n_days=1)
-                            if candles_1m:
-                                sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
+                            # 3분봉 수급 확인
+                            sugeub_3m_ok = False
+                            candles_3m = client.get_3min_candles(code, last_n_days=1)
+                            if candles_3m:
+                                sugeub_3m_ok = check_short_term_sugeub(candles_3m, 1)
                             
                             # 세 타임프레임 모두 수급 신호가 떠야 매수
-                            if sugeub_15m_ok and sugeub_5m_ok and sugeub_1m_ok:
+                            if sugeub_15m_ok and sugeub_5m_ok and sugeub_3m_ok:
                                 # 1분/5분/15분 수급 동시 확인! +1호가 매수 진행
                                 from indicator import adjust_price_by_ticks
                                 buy_price = adjust_price_by_ticks(close_price, 1)
@@ -1106,17 +1106,17 @@ def run_trading_bot():
                                 if qty > 0:
                                     order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")
                                     if order_res and order_res.get("return_code") == 0:
-                                        # 오늘 매수 성공 → 날짜 기록 및 1분봉 추적모드 전환
+                                        # 오늘 매수 성공 → 날짜 기록 및 3분봉 추적모드 전환
                                         try:
                                             with open(buy_date_file, "w") as f:
                                                 f.write(current_date)
                                         except Exception as e:
                                             logger.error(f"Failed to write buy date file: {e}")
                                         
-                                        # 매수 후 1분봉 추적 매매 모드로 전환
-                                        sent_alerts[code]["tracking_mode"] = "1m"
+                                        # 매수 후 3분봉 추적 매매 모드로 전환
+                                        sent_alerts[code]["tracking_mode"] = "3m"
                                         sent_alerts[code]["sold_qty"] = 0
-                                        logger.info(f"➡️ [모드 전환] 매수 체결 후 1분봉 추적매매 모드로 전환: {name} ({code})")
+                                        logger.info(f"➡️ [모드 전환] 매수 체결 후 3분봉 추적매매 모드로 전환: {name} ({code})")
         
                                         msg = (
                                             f"🚀 <b>[매수 체결 - {cond_type}]</b>\n"
@@ -1125,7 +1125,7 @@ def run_trading_bot():
                                             f"수량: {qty}주\n"
                                             f"시간: {candle_time}\n"
                                             f"주문번호: {order_res.get('ord_no')}\n"
-                                            f"<i>매수 후 1분봉 추적매매 모드로 전환됩니다.</i>"
+                                            f"<i>매수 후 3분봉 추적매매 모드로 전환됩니다.</i>"
                                         )
                                         notifier.send_all(msg)
                                         _add_alert("buy", f"{cond_type} 매수 {qty}주 @ {buy_price:,.0f}원 (+1호가)", code, name)
@@ -1144,8 +1144,8 @@ def run_trading_bot():
                                 miss = []
                                 if not sugeub_15m_ok: miss.append("15분봉")
                                 if not sugeub_5m_ok: miss.append("5분봉")
-                                if not sugeub_1m_ok: miss.append("1분봉")
-                                logger.debug(f"  {name}({code}) 수급 미달: {', '.join(miss)} (15m={sugeub_15m_ok}, 5m={sugeub_5m_ok}, 1m={sugeub_1m_ok})")
+                                if not sugeub_3m_ok: miss.append("3분봉")
+                                logger.debug(f"  {name}({code}) 수급 미달: {', '.join(miss)} (15m={sugeub_15m_ok}, 5m={sugeub_5m_ok}, 3m={sugeub_3m_ok})")
 
                 # ── ② 매도 로직 (시간대 무관하게 항상 적용) ──────────
                 # A) 당일 종가 청산 강제 신호 부여 제거 (오버나잇 허용)
@@ -1171,11 +1171,11 @@ def run_trading_bot():
                             qty_to_sell = held_info["quantity"]
                             order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
                             if order_res and order_res.get("return_code") == 0:
-                                # 15m BB5 Upper Reversal 매도 시에만 1m 추적모드로 진입
+                                # 15m BB5 Upper Reversal 매도 시에만 3m 추적모드로 진입
                                 if sell_reason == "BB5 Upper Reversal":
-                                    sent_alerts[code]["tracking_mode"] = "1m"
+                                    sent_alerts[code]["tracking_mode"] = "3m"
                                     sent_alerts[code]["sold_qty"] = qty_to_sell
-                                    logger.info(f"➡️ [모드 전환] BB5 Upper Reversal 매도 후 1분봉 매매 모드로 전환: {name} ({code}), 수량: {qty_to_sell}")
+                                    logger.info(f"➡️ [모드 전환] BB5 Upper Reversal 매도 후 3분봉 매매 모드로 전환: {name} ({code}), 수량: {qty_to_sell}")
                                 else:
                                     sent_alerts[code]["tracking_mode"] = "15m"
                                     sent_alerts[code]["sold_qty"] = 0
