@@ -114,8 +114,9 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
             
             seen_codes.add(code)
             
-            if code in holdings_map:
-                h = holdings_map[code]
+            clean_code = code.replace(\'_AL\', \'\').replace(\'_NX\', \'\')
+                    if clean_code in holdings_map:
+                h = holdings_map[clean_code]
                 rows_to_keep.append([code, name, h["quantity"], h["buy_price"], h["current_price"], theme])
             else:
                 rows_to_keep.append([code, name, "", "", "", theme])
@@ -140,6 +141,59 @@ def load_watchlist(filepath: str) -> list:
     """Loads watchlisted stocks. Returns all watchlist stocks for multi-stock trading."""
     # 실시간 다중 종목 대응을 위해 항상 전체 관심종목을 반환합니다.
     return load_raw_watchlist(filepath)
+
+
+def get_ext_adjusted_price(client, code, base_price, side, default_ticks):
+    import datetime
+    from datetime import timezone, timedelta
+    from indicator import adjust_price_by_ticks
+    
+    kst = timezone(timedelta(hours=9))
+    now = datetime.datetime.now(kst).time()
+    t_0800 = datetime.time(8, 0, 0)
+    t_0850 = datetime.time(8, 50, 0)
+    t_1540 = datetime.time(15, 40, 0)
+    t_2000 = datetime.time(20, 0, 0)
+    
+    is_ext = (t_0800 <= now < t_0850) or (t_1540 <= now < t_2000)
+    
+    if is_ext:
+        hoga = client.get_nxt_hoga(code)
+        if hoga:
+            if side == "buy" and hoga["best_ask"] > 0:
+                # 매수 시 최우선 매도호가 +1틱
+                return adjust_price_by_ticks(hoga["best_ask"], 1)
+            elif side == "sell" and hoga["best_bid"] > 0:
+                # 매도 시 최우선 매수호가 -1틱
+                return adjust_price_by_ticks(hoga["best_bid"], -1)
+                
+    # Fallback to standard
+    return adjust_price_by_ticks(base_price, default_ticks)
+
+def check_and_cancel_unfilled(client, notifier):
+    import datetime
+    from datetime import timezone, timedelta
+    kst = timezone(timedelta(hours=9))
+    now = datetime.datetime.now(kst)
+    
+    unfilled = client.get_unfilled_orders()
+    for u in unfilled:
+        try:
+            # ord_tm format usually HHMMSS
+            tm_str = u["order_time"]
+            if len(tm_str) == 6:
+                ord_dt = now.replace(hour=int(tm_str[0:2]), minute=int(tm_str[2:4]), second=int(tm_str[4:6]))
+                # Check if it was yesterday (e.g. crossing midnight, though unlikely in KRX)
+                if ord_dt > now:
+                    ord_dt = ord_dt - timedelta(days=1)
+                
+                diff_minutes = (now - ord_dt).total_seconds() / 60.0
+                if diff_minutes >= 3.0:
+                    client.cancel_order(u["order_no"], u["code"], u["unfilled_qty"])
+                    notifier.send_all(f"⏳ [미체결 타임아웃 취소] {u['name']} 주문번호 {u['order_no']} (3분 경과)")
+        except Exception as e:
+            pass
+
 
 def is_market_open() -> bool:
     """Checks if the Korean stock market is currently open (Mon-Fri 09:00 - 15:30 KST)."""
@@ -674,7 +728,7 @@ def run_trading_bot():
                     if is_held and held_info:
                         qty_to_sell = held_info["quantity"]
                         from indicator import adjust_price_by_ticks
-                        sell_price = adjust_price_by_ticks(close_price, -2)
+                        sell_price = get_ext_adjusted_price(client, code, close_price, "sell", -2)
                         order_res = client.place_sell_order(code, qty_to_sell, price=sell_price, order_type="0")
                         if order_res and order_res.get("return_code") == 0:
                             pur_price = held_info["buy_price"]
@@ -789,29 +843,21 @@ def run_trading_bot():
                                     # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 주문가능금액(예수금) 95% 풀매수
                                     budget = cash * 0.95
                                     qty_to_buy = int(budget // close_price)
+                                if getattr(config, \'TEST_MODE_1_SHARE\', False):
+                                    qty_to_buy = 1
                                         
                                 if qty_to_buy > 0:
                                     if sent_alerts[code]["buy"] != candle_time:
-                                        # 관문선과 기준선 간격 1% 이하 시 당일 매매 종료
+                                        # 관문선과 기준선 이격 2% 미만 시 관망 (당일 종료 아님)
                                         if gate_line is not None and l_line is not None and l_line > 0:
                                             gap_pct = abs(gate_line - l_line) / l_line * 100.0
-                                            if gap_pct <= 1.0:
-                                                msg = (
-                                                    f"🛑 <b>[매매 종료 - 간격 1% 이하]</b>\n"
-                                                    f"종목: {name} ({code})\n"
-                                                    f"관문선({gate_line:,.0f}원)과 기준선({l_line:,.0f}원)의 간격이 1% 이하({gap_pct:.2f}%)이므로 재매수하지 않고 당일 매매를 종료합니다."
-                                                )
-                                                # 매매 종료 알림 제거
-                                                # notifier.send_all(msg)
-                                                _add_alert("info", f"3m 재매수 포기 (간격 {gap_pct:.2f}% <= 1%)", code, name)
-                                                sent_alerts[code]["sold_qty"] = 0
-                                                sent_alerts[code]["tracking_mode"] = "done_today"
-                                                sent_alerts[code]["done_date"] = current_date
+                                            if gap_pct < 2.0:
+                                                _add_alert("info", f"3m 재매수 관망 (이격 {gap_pct:.2f}% < 2%)", code, name)
                                                 continue
 
                                         sent_alerts[code]["buy"] = candle_time
                                         from indicator import adjust_price_by_ticks
-                                        buy_price = adjust_price_by_ticks(close_price, 1)
+                                        buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
                                         order_res = client.place_buy_order(code, qty_to_buy, price=buy_price, order_type="0")
                                         if order_res and order_res.get("return_code") == 0:
                                             msg = (
@@ -892,7 +938,7 @@ def run_trading_bot():
                             if buy_condition_met:
                                 # 수급 동시 확인! +1호가 매수 진행
                                 from indicator import adjust_price_by_ticks
-                                buy_price = adjust_price_by_ticks(close_price, 1)
+                                buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
                                 
                                 logger.info(f"🚀 [수급 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
                                 
@@ -902,6 +948,8 @@ def run_trading_bot():
                                 # 주문가능금액(예수금) 95% 풀매수
                                 budget = cash * 0.95
                                 qty = int(budget // buy_price)
+                        if getattr(config, \'TEST_MODE_1_SHARE\', False):
+                            qty = 1
                                 
                                 if qty > 0:
                                     order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")

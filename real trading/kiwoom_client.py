@@ -330,14 +330,17 @@ class KiwoomRealClient:
         is_pre_market = (t_0800 <= current_time < t_0850)
         is_after_market = (t_1540 <= current_time < t_2000)
         
-        # 프리마켓, 애프터마켓 거래 시 지정가('0') 강제 전환
-        if (is_pre_market or is_after_market) and order_type == "3":
-            if price is not None:
-                logger.info("Extended trading hours session detected. Converting Market order to Limit order.")
-                return "SOR", "0", price
+        # 프리마켓, 애프터마켓 거래 시 지정가('0') 강제 전환 및 거래소 구분 '2' (NXT)
+        if (is_pre_market or is_after_market):
+            if order_type == "3":
+                if price is not None:
+                    logger.info("Extended trading hours session detected. Converting Market order to Limit order and setting exchange to '2' (NXT).")
+                    return "2", "0", price
+                else:
+                    logger.warning("Extended hours detected but no price was provided for conversion. Fallback to market and '2'.")
+                    return "2", order_type, price
             else:
-                logger.warning("Extended hours detected but no price was provided for conversion. Fallback to market.")
-                return "SOR", order_type, price
+                return "2", order_type, price
                 
         return "SOR", order_type, price
 
@@ -345,17 +348,18 @@ class KiwoomRealClient:
         """
         실전 매수 주문을 발송합니다. (실거래이므로 각별히 예산 조절 주의 요망)
         """
+        clean_code = stock_code.replace("_AL", "").replace("_NX", "")
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
         price_int = int(actual_price) if actual_price is not None else None
         
         logger.warning(
-            f"⚠️ SENDING REAL BUY ORDER: {stock_code} | Qty: {quantity} | Price: {price_int} | "
+            f"⚠️ SENDING REAL BUY ORDER: {clean_code} | Qty: {quantity} | Price: {price_int} | "
             f"Type: {actual_order_type} | Exchange: {dmst_stex_tp}"
         )
         try:
             result = self.order_api.stock_buy_order_request_kt10000(
                 dmst_stex_tp=dmst_stex_tp,
-                stk_cd=stock_code,
+                stk_cd=clean_code,
                 ord_qty=str(quantity),
                 trde_tp=actual_order_type,
                 ord_uv=str(price_int) if price_int is not None else ""
@@ -369,17 +373,18 @@ class KiwoomRealClient:
         """
         실전 매도 주문을 발송합니다.
         """
+        clean_code = stock_code.replace("_AL", "").replace("_NX", "")
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
         price_int = int(actual_price) if actual_price is not None else None
         
         logger.warning(
-            f"⚠️ SENDING REAL SELL ORDER: {stock_code} | Qty: {quantity} | Price: {price_int} | "
+            f"⚠️ SENDING REAL SELL ORDER: {clean_code} | Qty: {quantity} | Price: {price_int} | "
             f"Type: {actual_order_type} | Exchange: {dmst_stex_tp}"
         )
         try:
             result = self.order_api.stock_sell_order_request_kt10001(
                 dmst_stex_tp=dmst_stex_tp,
-                stk_cd=stock_code,
+                stk_cd=clean_code,
                 ord_qty=str(quantity),
                 trde_tp=actual_order_type,
                 ord_uv=str(price_int) if price_int is not None else ""
@@ -449,7 +454,7 @@ class KiwoomRealClient:
         logger.info(f"Fetching 3-minute candles for stock code {stock_code}...")
         try:
             result = self.chart_api.stock_minute_chart_request_ka10080(
-                stk_cd=stock_code,
+                stk_cd=stock_code + "_AL",
                 tic_scope="3",
                 upd_stkpc_tp="1"
             )
@@ -502,7 +507,7 @@ class KiwoomRealClient:
         logger.info(f"Fetching 5-minute candles for stock code {stock_code}...")
         try:
             result = self.chart_api.stock_minute_chart_request_ka10080(
-                stk_cd=stock_code,
+                stk_cd=stock_code + "_AL",
                 tic_scope="5",
                 upd_stkpc_tp="1"
             )
@@ -652,7 +657,7 @@ class KiwoomRealClient:
         """
         logger.info(f"Fetching stock name for stock code {stock_code}...")
         try:
-            code = str(stock_code).strip().zfill(6)
+            code = str(stock_code).replace("_AL", "").replace("_NX", "").strip().zfill(6)
             result = self.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
             if result and result.get("return_code") == 0:
                 name = result.get("stk_nm", "").strip()
@@ -673,7 +678,7 @@ class KiwoomRealClient:
             return {}
             
         logger.info(f"Fetching stock names for {len(stock_codes)} codes in batch...")
-        codes = [str(c).strip().zfill(6) for c in stock_codes if c]
+        codes = [str(c).replace("_AL", "").replace("_NX", "").strip().zfill(6) for c in stock_codes if c]
         chunk_size = 50
         result_map = {}
         
@@ -727,6 +732,77 @@ class KiwoomRealClient:
         except Exception as e:
             logger.error(f"Error fetching top price change rate stocks: {e}")
             return []
+
+    def get_nxt_hoga(self, stock_code: str) -> dict:
+        """
+        NXT 시장의 실시간 최우선 매수/매도 호가를 조회합니다.
+        """
+        try:
+            from kiwoom_rest_api.koreanstock.market_condition import MarketCondition
+            mc = MarketCondition(base_url=self.base_url, token_manager=self.token_manager)
+            clean_code = str(stock_code).replace("_AL", "").replace("_NX", "").strip().zfill(6)
+            nxt_code = clean_code + "_NX"
+            
+            result = mc.stock_quote_request_ka10004(stock_code=nxt_code)
+            if not result or result.get("return_code") != 0:
+                return None
+                
+            return {
+                "best_ask": float(result.get("sel_fpr_bid", "0").replace("+", "").replace("-", "")), # 최우선 매도호가
+                "best_bid": float(result.get("buy_fpr_bid", "0").replace("+", "").replace("-", ""))  # 최우선 매수호가
+            }
+        except Exception as e:
+            logger.error(f"Error fetching NXT hoga for {stock_code}: {e}")
+            return None
+
+    def get_unfilled_orders(self) -> list:
+        """
+        실전 계좌의 미체결 주문 목록을 조회합니다.
+        """
+        try:
+            result = self.account_api.unfilled_orders_request_ka10075(
+                all_stk_tp="0", # 0: 전체
+                trde_tp="0",    # 0: 전체
+                stex_tp="0"     # 0: 전체
+            )
+            if not result:
+                return []
+                
+            raw_list = result.get("ccld_nccld_qry", [])
+            unfilled = []
+            for item in raw_list:
+                if item.get("nccld_qty", "0") != "0":
+                    unfilled.append({
+                        "order_no": item.get("ord_no", "").strip(),
+                        "code": item.get("stk_cd", "").replace("A", "").strip(),
+                        "name": item.get("stk_nm", "").strip(),
+                        "side": item.get("sell_buy_tp_nm", "").strip(),
+                        "unfilled_qty": int(item.get("nccld_qty", "0")),
+                        "order_price": float(item.get("ord_uv", "0") or "0"),
+                        "order_time": item.get("ord_tm", "").strip()
+                    })
+            return unfilled
+        except Exception as e:
+            logger.error(f"Error fetching unfilled orders: {e}")
+            return []
+
+    def cancel_order(self, order_no: str, stock_code: str, cancel_qty: int) -> dict:
+        """
+        미체결 주문을 취소합니다.
+        """
+        clean_code = str(stock_code).replace("_AL", "").replace("_NX", "").strip().zfill(6)
+        logger.warning(f"⚠️ SENDING CANCEL ORDER: No={order_no}, Code={clean_code}, Qty={cancel_qty}")
+        try:
+            result = self.order_api.stock_cancel_order_request_kt10003(
+                dmst_stex_tp="2", # NXT 취소일수도 있고 KRX일수도 있지만 보통 SOR/2로 통합 전송
+                orig_ord_no=order_no,
+                stk_cd=clean_code,
+                cncl_qty=str(cancel_qty)
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Error cancelling order {order_no}: {e}")
+            return None
 
 KiwoomClient = KiwoomRealClient
 
