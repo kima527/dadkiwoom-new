@@ -63,10 +63,12 @@ def load_raw_watchlist(filepath: str) -> list:
         for r in range(2, ws.max_row + 1):
             code_cell = ws.cell(row=r, column=1).value
             name_cell = ws.cell(row=r, column=2).value
+            theme_cell = ws.cell(row=r, column=6).value
             if code_cell:
                 code = str(code_cell).strip().zfill(6)
                 name = str(name_cell).strip() if name_cell else "알 수 없음"
-                watchlist.append({"code": code, "name": name})
+                theme = str(theme_cell).strip() if theme_cell else "기타"
+                watchlist.append({"code": code, "name": name, "theme": theme})
         return watchlist
     except Exception as e:
         logger.error(f"Error loading raw watchlist: {e}")
@@ -122,27 +124,29 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "My Pick"
-        ws.append(["종목코드", "종목명", "보유수량", "매입단가", "현재가"])
+        ws.append(["종목코드", "종목명", "보유수량", "매입단가", "현재가", "테마"])
         
     # Parse existing rows
     rows_to_keep = []
     seen_codes = set()
-    header = ["종목코드", "종목명", "보유수량", "매입단가", "현재가"]
+    header = ["종목코드", "종목명", "보유수량", "매입단가", "현재가", "테마"]
     
     for r in range(2, ws.max_row + 1):
         code_cell = ws.cell(row=r, column=1).value
         name_cell = ws.cell(row=r, column=2).value
+        theme_cell = ws.cell(row=r, column=6).value
         if code_cell:
             code = str(code_cell).strip().zfill(6)
             name = str(name_cell).strip() if name_cell else "알 수 없음"
+            theme = str(theme_cell).strip() if theme_cell else "기타"
             
             seen_codes.add(code)
             
             if code in holdings_map:
                 h = holdings_map[code]
-                rows_to_keep.append([code, name, h["quantity"], h["buy_price"], h["current_price"]])
+                rows_to_keep.append([code, name, h["quantity"], h["buy_price"], h["current_price"], theme])
             else:
-                rows_to_keep.append([code, name, "", "", ""])
+                rows_to_keep.append([code, name, "", "", "", theme])
                 
     # 보유 종목이라도 엑셀에 명시적으로 등록되지 않은 종목은 자동 추가하지 않음 (사용자 요청)
     # for code, h in holdings_map.items():
@@ -150,7 +154,7 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
 
     if target_code and target_code not in seen_codes and target_code not in holdings_map:
         name = client.get_stock_name(target_code) or "SK하이닉스"
-        rows_to_keep.append([target_code, name, "", "", ""])
+        rows_to_keep.append([target_code, name, "", "", "", "기타"])
 
     ws.delete_rows(1, ws.max_row + 1)
     ws.append(header)
@@ -308,7 +312,7 @@ def run_trading_bot():
         monitor_dict = {s["code"]: s for s in watchlist}
         for h in holdings:
             if h["code"] not in monitor_dict:
-                monitor_dict[h["code"]] = {"code": h["code"], "name": h["name"]}
+                monitor_dict[h["code"]] = {"code": h["code"], "name": h["name"], "theme": "기타"}
         monitor_list = list(monitor_dict.values())
         
         BOT_STATE["watchlist_count"] = len(monitor_list)
@@ -640,27 +644,27 @@ def run_trading_bot():
             
             prev = candles[-2] if len(candles) > 1 else latest
             
-            # 모멘텀 스코어 계산
-            s5_now = latest.get("sma5")
-            s20_now = latest.get("sma20")
-            s5_prev = prev.get("sma5")
-            s20_prev = prev.get("sma20")
+            # 모멘텀 스코어 계산 (사용자 요청: 정배열 기준 = TEMA3 > SMA60)
+            t3_now = latest.get("tema3")
+            s60_now = latest.get("sma60")
+            t3_prev = prev.get("tema3")
+            s60_prev = prev.get("sma60")
             
             score = 0.0
             trend_ok = False
             slope_ok = False
             slope_pct = 0.0
             
-            if s5_now is not None and s20_now is not None:
-                # ① 5이평 > 20이평 (정배열 상승세) -> +100점
-                if s5_now > s20_now:
+            if t3_now is not None and s60_now is not None:
+                # ① TEMA3 > SMA60 (정배열 상승세) -> +100점
+                if t3_now > s60_now:
                     score += 100.0
                     trend_ok = True
                 
                 # ② 이격도를 좁히지 않고 벌어지거나 유지하며 올라가는가?
-                diff_now = s5_now - s20_now
-                if s5_prev is not None and s20_prev is not None:
-                    diff_prev = s5_prev - s20_prev
+                diff_now = t3_now - s60_now
+                if t3_prev is not None and s60_prev is not None:
+                    diff_prev = t3_prev - s60_prev
                     if diff_now >= diff_prev:
                         score += 100.0
                         slope_ok = True
@@ -727,6 +731,7 @@ def run_trading_bot():
             stock_results.append({
                 "code": code,
                 "name": name,
+                "theme": stock.get("theme", "기타"),
                 "latest": latest,
                 "disparity_pct": disparity,
                 "momentum_score": score,
@@ -747,6 +752,37 @@ def run_trading_bot():
             time.sleep(0.5)
 
         # ────────────────────────────────────────────────────────────
+        # [NEW] Phase 1B: Calculate Theme Momentum and apply Bonus
+        # ────────────────────────────────────────────────────────────
+        theme_flu_rates = {}
+        for sr in stock_results:
+            theme = sr.get("theme", "기타")
+            if theme != "기타":
+                if theme not in theme_flu_rates:
+                    theme_flu_rates[theme] = []
+                theme_flu_rates[theme].append(sr["flu_pct"])
+
+        theme_avg_flu = {}
+        for theme, rates in theme_flu_rates.items():
+            if len(rates) > 0:
+                theme_avg_flu[theme] = sum(rates) / len(rates)
+        
+        # 주도 테마 선정 (평균 등락률 +2.0% 이상인 테마 모두)
+        hot_themes = [t for t, avg in theme_avg_flu.items() if avg >= 2.0]
+        
+        if hot_themes:
+            hot_themes_str = ", ".join([f"{t}({theme_avg_flu[t]:+.2f}%)" for t in hot_themes])
+            logger.info(f"🔥 [핫 테마 포착] {hot_themes_str} -> 소속 종목에 +200점 보너스 적용")
+
+        for sr in stock_results:
+            theme = sr.get("theme", "기타")
+            if theme in hot_themes:
+                sr["momentum_score"] += 200.0
+                sr["theme_bonus"] = True
+            else:
+                sr["theme_bonus"] = False
+
+        # ────────────────────────────────────────────────────────────
         # Phase 2: Sort by momentum score (모멘텀 스코어 내림차순)
         # ────────────────────────────────────────────────────────────
         stock_results.sort(
@@ -758,8 +794,9 @@ def run_trading_bot():
             rankings_snapshot = []
             for rank, sr in enumerate(stock_results, 1):
                 disp = f"{sr['disparity_pct']:.2f}%" if sr['disparity_pct'] is not None else "N/A"
+                theme_str = f" [🔥{sr['theme']}주도]" if sr.get("theme_bonus") else f" [{sr.get('theme', '기타')}]"
                 logger.info(
-                    f"  #{rank} {sr['name']}({sr['code']}) | "
+                    f"  #{rank} {sr['name']}({sr['code']}){theme_str} | "
                     f"점수: {sr['momentum_score']:.2f}점 | "
                     f"정배열={sr['trend_ok']}, 이격확장={sr['slope_ok']}(기울기:{sr['slope_pct']:+.2f}%) | "
                     f"등락률: {sr['flu_pct']:+.2f}% (급등:{sr['flu_delta']:+.2f}%) | 이격도: {disp} | 수급돌파: {sr['sugeub_spike']} | 일봉보너스: {sr['latest'].get('daily_bonus_ok', False)} | 주봉보너스: {sr['latest'].get('weekly_bonus_ok', False)} | 체결강도: {sr['volume_power']:.1f}% | 1억매수: {sr['block_buy_count']}건"
@@ -1070,17 +1107,10 @@ def run_trading_bot():
                             if candles_1m:
                                 sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
                             
-                            # 듀얼 시간대 판별 (08:00~08:06, 09:00~09:06)
-                            now_time = datetime.now(timezone(timedelta(hours=9)))
-                            is_high_volatility_window = (now_time.hour == 8 and now_time.minute <= 6) or \
-                                                        (now_time.hour == 9 and now_time.minute <= 6)
-                            
-                            if is_high_volatility_window:
-                                buy_condition_met = (sugeub_15m_ok and sugeub_5m_ok and sugeub_3m_ok)
-                                cond_type = "엄격한수급(15/5/3분)"
-                            else:
-                                buy_condition_met = sugeub_1m_ok
-                                cond_type = "단기수급(1분)"
+                            # 듀얼 시간대(장초반 엄격 모드) 완전 폐기 -> 개장 직후부터 무조건 1분봉 단독 수급 기준 적용
+                            # 단, 사용자의 핵심 뼈대 로직인 '15분봉 정배열(TEMA3 > SMA60)'을 만족할 때만 매수
+                            buy_condition_met = sugeub_1m_ok and stock_data.get("trend_ok", False)
+                            cond_type = "단기수급(1분) + 정배열"
                             
                             if buy_condition_met:
                                 # 수급 동시 확인! +1호가 매수 진행
