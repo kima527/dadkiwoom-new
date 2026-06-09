@@ -317,6 +317,14 @@ def run_trading_bot():
             time.sleep(60)
             continue
 
+        # Fetch real-time fluctuation rates map (NXT 장 개장 08시부터 실시간 조회)
+        top_flu_rates_map = {}
+        now_kst = datetime.now(timezone(timedelta(hours=9)))
+        try:
+            top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
+        except Exception:
+            pass
+
         # ── 매일 장 시작 시 일일 매매 종목 선정 및 초기화 (오버나잇 보유 허용) ──
         liquidation_file = "last_liquidation.txt"
         last_liquidation_date = ""
@@ -557,14 +565,6 @@ def run_trading_bot():
         # ────────────────────────────────────────────────────────────
         stock_results = []
         
-        # Fetch real-time fluctuation rates map (NXT 장 개장 08시부터 실시간 조회)
-        top_flu_rates_map = {}
-        now_kst = datetime.now(timezone(timedelta(hours=9)))
-        try:
-            top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
-        except Exception:
-            pass
-
         for stock in monitor_list:
             code = stock["code"]
             name = stock["name"]
@@ -997,18 +997,18 @@ def run_trading_bot():
 
                                         sent_alerts[code]["buy"] = candle_time
                                         from indicator import adjust_price_by_ticks
-                                        buy_price = adjust_price_by_ticks(close_price, 2)
+                                        buy_price = adjust_price_by_ticks(close_price, 1)
                                         order_res = client.place_buy_order(code, qty_to_buy, price=buy_price, order_type="0")
                                         if order_res and order_res.get("return_code") == 0:
                                             msg = (
                                                 f"🔄 <b>[재매수 - 3분봉 골든크로스!]</b>\n"
                                                 f"종목: {name} ({code})\n"
-                                                f"매수단가: {buy_price:,.0f}원 (지정가 +2호가)\n"
+                                                f"매수단가: {buy_price:,.0f}원 (지정가 +1호가)\n"
                                                 f"매수수량: {qty_to_buy}주\n"
                                                 f"시간: {candle_time}\n"
                                             )
                                             notifier.send_all(msg)
-                                            _add_alert("buy", f"3m 골든크로스 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +2호가)", code, name)
+                                            _add_alert("buy", f"3m 골든크로스 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +1호가)", code, name)
                                             sent_alerts[code]["sold_qty"] = 0
                                             sent_alerts[code]["buy_reason"] = "dynamic"
                                         else:
@@ -1063,13 +1063,29 @@ def run_trading_bot():
                             candles_3m = client.get_3min_candles(code, last_n_days=1)
                             if candles_3m:
                                 sugeub_3m_ok = check_short_term_sugeub(candles_3m, 1)
+
+                            # 1분봉 수급 확인 추가
+                            sugeub_1m_ok = False
+                            candles_1m = client.get_1min_candles(code, last_n_days=1)
+                            if candles_1m:
+                                sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
                             
-                            # 세 타임프레임 모두 수급 신호가 떠야 매수
-                            if sugeub_15m_ok and sugeub_5m_ok and sugeub_3m_ok:
-                                # 1분/5분/15분 수급 동시 확인! +1호가 매수 진행
+                            # 듀얼 시간대 판별 (08:00~08:06, 09:00~09:06)
+                            now_time = datetime.now(timezone(timedelta(hours=9)))
+                            is_high_volatility_window = (now_time.hour == 8 and now_time.minute <= 6) or \
+                                                        (now_time.hour == 9 and now_time.minute <= 6)
+                            
+                            if is_high_volatility_window:
+                                buy_condition_met = (sugeub_15m_ok and sugeub_5m_ok and sugeub_3m_ok)
+                                cond_type = "엄격한수급(15/5/3분)"
+                            else:
+                                buy_condition_met = sugeub_1m_ok
+                                cond_type = "단기수급(1분)"
+                            
+                            if buy_condition_met:
+                                # 수급 동시 확인! +1호가 매수 진행
                                 from indicator import adjust_price_by_ticks
                                 buy_price = adjust_price_by_ticks(close_price, 1)
-                                cond_type = "수급신호(1분/5분/15분 동시)"
                                 
                                 logger.info(f"🚀 [수급 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
                                 
@@ -1117,12 +1133,16 @@ def run_trading_bot():
                                         # 매수 실패 알림 제거
                                         # notifier.send_all(msg)
                             else:
-                                # 어느 타임프레임이 미달인지 로그
+                                # 수급 미달 로그
                                 miss = []
-                                if not sugeub_15m_ok: miss.append("15분봉")
-                                if not sugeub_5m_ok: miss.append("5분봉")
-                                if not sugeub_3m_ok: miss.append("3분봉")
-                                logger.debug(f"  {name}({code}) 수급 미달: {', '.join(miss)} (15m={sugeub_15m_ok}, 5m={sugeub_5m_ok}, 3m={sugeub_3m_ok})")
+                                if is_high_volatility_window:
+                                    if not sugeub_15m_ok: miss.append("15분봉")
+                                    if not sugeub_5m_ok: miss.append("5분봉")
+                                    if not sugeub_3m_ok: miss.append("3분봉")
+                                    logger.debug(f"  {name}({code}) 수급 미달(엄격모드): {', '.join(miss)} (15m={sugeub_15m_ok}, 5m={sugeub_5m_ok}, 3m={sugeub_3m_ok})")
+                                else:
+                                    if not sugeub_1m_ok: miss.append("1분봉")
+                                    logger.debug(f"  {name}({code}) 수급 미달(단기모드): {', '.join(miss)} (1m={sugeub_1m_ok})")
 
                 # ── ② 매도 로직 (시간대 무관하게 항상 적용) ──────────
                 # A) 당일 종가 청산 강제 신호 부여 제거 (오버나잇 허용)
@@ -1266,12 +1286,20 @@ def run_trading_bot():
         update_watchlist_excel(client, WATCHLIST_PATH)
 
         # Poll interval: check every 2 minutes (120 seconds)
-        logger.info("Completed polling cycle. Sleeping for 2 minutes...")
         KST = timezone(timedelta(hours=9))
-        next_poll = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+        now_kst = datetime.now(KST)
+        
+        sleep_time = 120
+        if (now_kst.hour == 8 and now_kst.minute >= 59) or (now_kst.hour == 9 and now_kst.minute <= 15):
+            sleep_time = 30
+            logger.info("장 초반 변동성 구간 (08:59~09:15). 30초 대기 후 스캔합니다...")
+        else:
+            logger.info("Completed polling cycle. Sleeping for 2 minutes...")
+
+        next_poll = (now_kst + timedelta(seconds=sleep_time)).strftime("%Y-%m-%d %H:%M:%S")
         BOT_STATE["next_poll_at"] = next_poll
         BOT_STATE["status"] = "sleeping"
-        time.sleep(120)
+        time.sleep(sleep_time)
 
 
 

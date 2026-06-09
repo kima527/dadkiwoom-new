@@ -443,7 +443,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         sugeub_val = ((h + l + o + close_val) / 4.0) * v / 100000000.0
         c['sugeub'] = sugeub_val
         
-        # 조건 검증: 수급 >= 20, 양봉, 몸통 > 윗꼬리 * 1.2, 수급 >= 직전 2봉 평균 수급 * 3
+        # 조건 검증: 수급 >= 20, 양봉, 몸통 > 윗꼬리 * 1.2, 수급 >= 직전 2봉 평균 수급 * 2
         is_sugeub_spike = False
         if sugeub_val >= 20.0 and o < close_val:
             body = close_val - o
@@ -454,7 +454,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                     prev_sugeub_2 = candles[i-2].get('sugeub', 0.0)
                     avg_prev_sugeub = (prev_sugeub_1 + prev_sugeub_2) / 2.0
                     
-                    if avg_prev_sugeub > 0 and sugeub_val >= (avg_prev_sugeub * 3.0):
+                    if avg_prev_sugeub > 0 and sugeub_val >= (avg_prev_sugeub * 2.0):
                         is_sugeub_spike = True
                 else:
                     is_sugeub_spike = False
@@ -568,7 +568,7 @@ def check_short_term_sugeub(candles, timeframe_minutes):
       2. Sugeub value >= threshold:
          - 5-Min: >= 7.0 (700 Million KRW)
          - 1-Min: >= 1.5 (150 Million KRW)
-      3. Current volume >= 3.0x the average volume of the previous 2 candles.
+      3. Current volume >= 2.0x the average volume of the previous 2 candles.
     """
     if not candles or len(candles) < 3:
         return False
@@ -591,12 +591,12 @@ def check_short_term_sugeub(candles, timeframe_minutes):
     if sugeub_val < threshold:
         return False
         
-    # 3. Volume spike check (>= 3x average of last 2 candles)
+    # 3. Volume spike check (>= 2x average of last 2 candles)
     prev_vol_1 = float(candles[-2].get('volume', 0))
     prev_vol_2 = float(candles[-3].get('volume', 0))
     avg_prev_vol = (prev_vol_1 + prev_vol_2) / 2.0
     
-    if avg_prev_vol <= 0 or v < (avg_prev_vol * 3.0):
+    if avg_prev_vol <= 0 or v < (avg_prev_vol * 2.0):
         return False
         
     return True
