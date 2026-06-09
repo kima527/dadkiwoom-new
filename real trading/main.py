@@ -74,25 +74,6 @@ def load_raw_watchlist(filepath: str) -> list:
         logger.error(f"Error loading raw watchlist: {e}")
         return []
 
-    if config.TARGET_SINGLE_STOCK_CODE != "AUTO":
-        return config.TARGET_SINGLE_STOCK_CODE
-        
-    selected_file = "selected_stock.txt"
-    if os.path.exists(selected_file):
-        try:
-            with open(selected_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-            if content:
-                parts = content.split(",")
-                if len(parts) == 3:
-                    file_date, code, name = parts
-                    KST = timezone(timedelta(hours=9))
-                    current_date = datetime.now(KST).strftime("%Y-%m-%d")
-                    if file_date == current_date:
-                        return code
-        except Exception as e:
-            logger.error(f"Error reading daily target stock: {e}")
-    return ""
 
 def update_watchlist_excel(client: KiwoomClient, filepath: str):
     """
@@ -102,8 +83,7 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
     logger.info("Updating watchlist Excel file with latest holdings...")
     holdings = client.get_holdings()
     
-    # 실시간 다중 종목 대응을 위해 target_code 필터링을 해제합니다.
-    holdings_map = {h["code"]: h for h in holdings}    
+    holdings_map = {h["code"]: h for h in holdings}
     # Load or create workbook
     if os.path.exists(filepath):
         try:
@@ -144,9 +124,6 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
     # for code, h in holdings_map.items():
     #     if code not in seen_codes: ...
 
-    if target_code and target_code not in seen_codes and target_code not in holdings_map:
-        name = client.get_stock_name(target_code) or "SK하이닉스"
-        rows_to_keep.append([target_code, name, "", "", "", "기타"])
 
     ws.delete_rows(1, ws.max_row + 1)
     ws.append(header)
