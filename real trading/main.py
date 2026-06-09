@@ -74,10 +74,6 @@ def load_raw_watchlist(filepath: str) -> list:
         logger.error(f"Error loading raw watchlist: {e}")
         return []
 
-def get_daily_target_stock_code() -> str:
-    """Returns the target stock code for today (either statically configured or dynamically selected)."""
-    if not config.TARGET_SINGLE_STOCK_CODE:
-        return ""
     if config.TARGET_SINGLE_STOCK_CODE != "AUTO":
         return config.TARGET_SINGLE_STOCK_CODE
         
@@ -107,11 +103,7 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
     holdings = client.get_holdings()
     
     # 실시간 다중 종목 대응을 위해 target_code 필터링을 해제합니다.
-    holdings_map = {h["code"]: h for h in holdings}
-    
-    # target_code를 조회하여 신규 집중 종목이 편입되는지 판단하는 용도로만 사용합니다.
-    target_code = get_daily_target_stock_code()
-    
+    holdings_map = {h["code"]: h for h in holdings}    
     # Load or create workbook
     if os.path.exists(filepath):
         try:
@@ -342,195 +334,6 @@ def run_trading_bot():
         current_date = datetime.now(KST).strftime("%Y-%m-%d")
         if is_market_open() and current_date != last_liquidation_date:
             logger.info(f"New trading day detected ({current_date}). Initializing daily parameters (overnight positions maintained).")
-            
-            # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
-            # 이 로직은 사용자의 핵심 전략(등락률 우선 + 15분봉 5이평/20이평 정배열 상승 및 이격확장 지속)이 반영된 모멘텀 스코어링 시스템입니다.
-            # 사용자의 승인 없이 이 정렬 알고리즘과 가중치(Score) 공식을 변경하는 것은 금지되어 있습니다.
-            # ── Dynamic Daily Stock Selection ──
-            if config.TARGET_SINGLE_STOCK_CODE == "AUTO":
-                logger.info("Running Dynamic Daily Scanner with Rank intersection filtering...")
-                raw_watchlist = load_raw_watchlist(WATCHLIST_PATH)
-                
-                # 기존 거래대금/등락률 실시간 교집합 필터링 제거 (사용자 요청: 마이픽에 있는 종목만 전체 검토하여 매매)
-                filtered_candidates = raw_watchlist
-                filter_reason = "전체 관심종목 (마이픽 전수 조사)"
-                
-                logger.info(f"Candidates filtered. Target group: {filter_reason} (Total: {len(filtered_candidates)} stocks)")
-                
-                best_code = None
-                best_name = None
-                best_score = -float('inf')
-                best_disp = 0.0
-                best_details = ""
-                
-                for stock in filtered_candidates:
-                    code = stock["code"]
-                    name = stock["name"]
-                    try:
-                        # 1. 일봉 및 주봉 가산점 로직 (기존 필터 제거)
-                        daily_candles = client.get_daily_candles(code, last_n_days=200)
-                        daily_bonus_ok = False
-                        weekly_bonus_ok = False
-                        prev_d = None
-                        if daily_candles and len(daily_candles) >= 2:
-                            calculate_indicators_pure(
-                                daily_candles,
-                                use_compressed_peak=True,
-                                tema_period1=config.TEMA_PERIOD_SHORT,
-                                tema_period2=config.TEMA_PERIOD_LONG
-                            )
-                            # 전일 완성 일봉 구하기
-                            today_str = datetime.now().strftime("%Y-%m-%d")
-                            if daily_candles[-1]['date'] == today_str:
-                                prev_d = daily_candles[-2] if len(daily_candles) >= 2 else None
-                            else:
-                                prev_d = daily_candles[-1]
-                            
-                            if prev_d:
-                                daily_L = prev_d.get('L')
-                                daily_whale = prev_d.get('whale_line')
-                                if daily_L is not None:
-                                    is_near_L = (daily_L * 0.97 <= prev_d['close'] <= daily_L * 1.03)
-                                    is_breakout = False
-                                    if daily_whale is not None:
-                                        is_breakout = (prev_d['close'] >= daily_L * 0.97) and (prev_d['close'] >= daily_whale * 0.97)
-                                    daily_bonus_ok = (is_near_L or is_breakout)
-                                    
-                            weekly_candles = client.get_weekly_candles_from_daily(daily_candles)
-                            if weekly_candles and len(weekly_candles) >= 2:
-                                calculate_indicators_pure(
-                                    weekly_candles,
-                                    use_compressed_peak=True,
-                                    tema_period1=config.TEMA_PERIOD_SHORT,
-                                    tema_period2=config.TEMA_PERIOD_LONG
-                                )
-                                w_latest = weekly_candles[-1]
-                                w_L = w_latest.get('L')
-                                w_whale = w_latest.get('whale_line')
-                                if w_L is not None:
-                                    is_near_L_w = (w_L * 0.97 <= w_latest['close'] <= w_L * 1.03)
-                                    is_breakout_w = False
-                                    if w_whale is not None:
-                                        is_breakout_w = (w_latest['close'] >= w_L * 0.97) and (w_latest['close'] >= w_whale * 0.97)
-                                    weekly_bonus_ok = (is_near_L_w or is_breakout_w)
-                            
-                        candles = client.get_15min_candles(code, last_n_days=7)
-                        if candles and len(candles) >= 60:
-                            calculate_indicators_pure(
-                                candles,
-                                use_compressed_peak=True,
-                                tema_period1=config.TEMA_PERIOD_SHORT,
-                                tema_period2=config.TEMA_PERIOD_LONG
-                            )
-                            latest = candles[-1]
-                            prev = candles[-2] if len(candles) > 1 else latest
-                            
-                            s5_now = latest.get("sma5")
-                            s20_now = latest.get("sma20")
-                            s5_prev = prev.get("sma5")
-                            s20_prev = prev.get("sma20")
-                            
-                            score = 0.0
-                            trend_ok = False
-                            slope_ok = False
-                            slope_pct = 0.0
-                            
-                            if s5_now is not None and s20_now is not None:
-                                # ① 5이평 > 20이평 (정배열 상승세) -> +100점
-                                if s5_now > s20_now:
-                                    score += 100.0
-                                    trend_ok = True
-                                
-                                # ② 이격도를 좁히지 않고 벌어지거나 유지하며 올라가는가?
-                                diff_now = s5_now - s20_now
-                                if s5_prev is not None and s20_prev is not None:
-                                    diff_prev = s5_prev - s20_prev
-                                    if diff_now >= diff_prev:
-                                        score += 100.0
-                                        slope_ok = True
-                                        
-                                    if diff_prev > 0:
-                                        slope_pct = (diff_now - diff_prev) / diff_prev * 100.0
-                                        score += slope_pct * 10.0
-                            
-                            # ③ 등락률 점수 가중치 (+10 * 등락률%)
-                            flu_pct = top_flu_rates_map.get(code, 0.0)
-                            if flu_pct == 0.0:
-                                if len(candles) >= 5:
-                                    c_start = candles[-5]
-                                    flu_pct = ((latest["close"] - c_start["close"]) / c_start["close"]) * 100.0
-                            
-                            score += flu_pct * 10.0
-                            
-                            # ④ 수급 돌파 점수 가중치 반영
-                            has_recent_sugeub_spike = False
-                            check_len = min(8, len(candles))
-                            for idx_check in range(len(candles) - check_len, len(candles)):
-                                if candles[idx_check].get('signal_sugeub_spike', False):
-                                    has_recent_sugeub_spike = True
-                                    break
-                            
-                            if has_recent_sugeub_spike:
-                                score += 150.0
-                                
-                            if latest.get('signal_sugeub_spike', False):
-                                score += 300.0
-                                
-                            if daily_bonus_ok:
-                                score += 100.0
-                            if weekly_bonus_ok:
-                                score += 50.0
-                                
-                            disp = latest.get("disparity_pct", 0.0)
-                            
-                            detail_msg = (
-                                f"정배열={trend_ok}, 이격확장={slope_ok}(기울기:{slope_pct:+.2f}%), "
-                                f"등락률={flu_pct:+.2f}%, TEMA이격={disp:.2f}%, 수급돌파={latest.get('signal_sugeub_spike', False)}, "
-                                f"일봉보너스={daily_bonus_ok}, 주봉보너스={weekly_bonus_ok}"
-                            )
-                            logger.info(f" -> {name} ({code}) | Score: {score:.2f} | {detail_msg}")
-                            
-                            if score > best_score:
-                                best_score = score
-                                best_code = code
-                                best_name = name
-                                best_disp = disp
-                                best_details = detail_msg
-                                
-                        time.sleep(0.5)  # API rate limit
-                    except Exception as ex:
-                        logger.error(f"Error scanning {name} ({code}): {ex}")
-                
-                # If scanner failed to find any valid stock, fallback to first watchlist stock
-                if not best_code and raw_watchlist:
-                    best_code = raw_watchlist[0]["code"]
-                    best_name = raw_watchlist[0]["name"]
-                    best_disp = 0.0
-                    best_details = "N/A"
-                    logger.warning(f"Scanner could not calculate disparity. Falling back to first watchlist stock: {best_name} ({best_code})")
-                
-                if best_code:
-                    selected_file = "selected_stock.txt"
-                    try:
-                        with open(selected_file, "w", encoding="utf-8") as f:
-                            f.write(f"{current_date},{best_code},{best_name}")
-                        logger.info(f"🎯 Selected stock for today: {best_name} ({best_code}) | Score: {best_score:.2f} | {best_details} ({filter_reason})")
-                        
-                        # 최우선 관심 종목 브리핑 알림 제거
-                        # notifier.send_all(
-                        #     f"🎯 <b>[금일 모멘텀 최우선 관심 종목 브리핑]</b>\n"
-                        #     f"시장 분석을 통해 오늘 가장 모멘텀이 우수한 최우선 종목을 선정했습니다.\n"
-                        #     f"종목명: <b>{best_name} ({best_code})</b>\n"
-                        #     f"모멘텀 스코어: <b>{best_score:.2f}점</b>\n"
-                        #     f"이격도: {best_disp:.2f}%\n"
-                        #     f"상세상태: {best_details}\n"
-                        #     f"필터조건: {filter_reason}\n"
-                        #     f"※ 실제 매매는 전체 관심종목을 대상으로 실시간 감시하며 즉각 대응합니다."
-                        # )
-                        _add_alert("info", f"금일 매매종목 선정: {best_name} ({best_code}) | Score: {best_score:.2f} | {best_details}", best_code, best_name)
-                    except Exception as e:
-                        logger.error(f"Failed to write selected stock file: {e}")
-            
             try:
                 with open(liquidation_file, "w") as f:
                     f.write(current_date)
@@ -538,9 +341,6 @@ def run_trading_bot():
                 logger.error(f"Failed to write liquidation file: {e}")
 
         # (계좌 잔고 및 예수금은 루프 시작부에서 일괄 조회하여 사용합니다)
-        # Filter holdings to target stock if configured
-        target_code = get_daily_target_stock_code()
-
         # ── 실시간 상태 업데이트 ──
         BOT_STATE["cash"] = cash
         BOT_STATE["holdings"] = [
