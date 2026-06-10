@@ -439,9 +439,9 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         sugeub_val = ((h + l + o + close_val) / 4.0) * v / 100000000.0
         c['sugeub'] = sugeub_val
         
-        # 조건 검증: 수급 >= 20, 양봉, 몸통 > 윗꼬리 * 1.2, 수급 >= 직전 2봉 평균 수급 * 2
+        # 조건 검증: 양봉, 몸통 > 윗꼬리 * 1.2, 수급 >= 직전 2봉 평균 수급 * 2
         is_sugeub_spike = False
-        if sugeub_val >= 20.0 and o < close_val:
+        if o < close_val:
             body = close_val - o
             upper_shadow = h - close_val
             if body > (upper_shadow * 1.2):
@@ -612,10 +612,7 @@ def check_short_term_sugeub(candles, timeframe_minutes):
     
     Conditions:
       1. Bullish candle (close > open)
-      2. Sugeub value >= threshold:
-         - 5-Min: >= 7.0 (700 Million KRW)
-         - 1-Min: >= 1.5 (150 Million KRW)
-      3. Current volume >= 2.0x the average volume of the previous 2 candles.
+      2. Current volume >= 2.0x the average volume of the previous 2 candles.
     """
     if not candles or len(candles) < 3:
         return False
@@ -631,14 +628,7 @@ def check_short_term_sugeub(candles, timeframe_minutes):
     if c <= o:
         return False
         
-    # 2. Sugeub calculation (Unit: 100 Million KRW)
-    sugeub_val = ((h + l + o + c) / 4.0) * v / 100000000.0
-    
-    threshold = 7.0 if timeframe_minutes == 5 else 1.5
-    if sugeub_val < threshold:
-        return False
-        
-    # 3. Volume spike check (>= 2x average of last 2 candles)
+    # 2. Volume spike check (>= 2.0x average of last 2 candles)
     prev_vol_1 = float(candles[-2].get('volume', 0))
     prev_vol_2 = float(candles[-3].get('volume', 0))
     avg_prev_vol = (prev_vol_1 + prev_vol_2) / 2.0
