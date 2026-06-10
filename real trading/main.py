@@ -114,8 +114,8 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
             
             seen_codes.add(code)
             
-            clean_code = code.replace(\'_AL\', \'\').replace(\'_NX\', \'\')
-                    if clean_code in holdings_map:
+            clean_code = code.replace('_AL', '').replace('_NX', '')
+            if clean_code in holdings_map:
                 h = holdings_map[clean_code]
                 rows_to_keep.append([code, name, h["quantity"], h["buy_price"], h["current_price"], theme])
             else:
@@ -232,16 +232,8 @@ def run_trading_bot():
     app_secret = getattr(config, 'KIWOOM_REAL_APP_SECRET', getattr(config, 'KIWOOM_APP_SECRET', ''))
 
     if not app_key or not app_secret:
-        print("=" * 65)
-        print("      키움증권 API 호출을 위한 APP KEY 및 SECRET KEY 입력이 필요합니다.")
-        print("=" * 65)
-        app_key = input("Enter Kiwoom APP KEY: ").strip()
-        app_secret = input("Enter Kiwoom APP SECRET: ").strip()
-        print("=" * 65)
-        
-        if not app_key or not app_secret:
-            logger.error("App Key and Secret Key are required to start the bot. Exiting.")
-            sys.exit(1)
+        logger.error("APP KEY 또는 SECRET KEY가 .env 파일에 설정되어 있지 않습니다. 봇을 종료합니다.")
+        sys.exit(1)
             
         config.KIWOOM_APP_KEY = app_key
         if hasattr(config, 'KIWOOM_REAL_APP_SECRET'):
@@ -400,18 +392,97 @@ def run_trading_bot():
         # ────────────────────────────────────────────────────────────
         stock_results = []
         
+        import concurrent.futures
+        
         for stock in monitor_list:
             code = stock["code"]
             name = stock["name"]
             
-            # Fetch 15-min candles for last 7 days (확장: TEMA 안정적 계산 위해)
-            candles = client.get_15min_candles(code, last_n_days=7)
-            if not candles or len(candles) < 60:
-                logger.warning(
-                    f"Insufficient candles for {name} ({code}). "
-                    f"Minimum 60 required. Got: {len(candles) if candles else 0}"
-                )
+            # ────────────────────────────────────────────────────────────
+            # Phase 1: 병렬 데이터 수집 (Task Fan-out)
+            # ────────────────────────────────────────────────────────────
+            candles_15m = []
+            candles_3m = []
+            candles_1m = []
+            daily_candles = []
+            tick_res = {}
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                f_15m = executor.submit(client.get_15min_candles, code, 7)
+                f_3m = executor.submit(client.get_3min_candles, code, 2)
+                f_1m = executor.submit(client.get_1min_candles, code, 1)
+                f_daily = executor.submit(client.get_daily_candles, code, 200)
+                f_tick = executor.submit(client.stock_info_api.daily_stock_price_request_ka10003, stock_code=code)
+                
+                candles_15m = f_15m.result()
+                candles_3m = f_3m.result()
+                candles_1m = f_1m.result()
+                daily_candles = f_daily.result()
+                
+                try:
+                    tick_res = f_tick.result()
+                except Exception:
+                    tick_res = {}
+                    
+            # ────────────────────────────────────────────────────────────
+            # Phase 2: 데이터 무결성 독립 검증 (Sanity Check)
+            # ────────────────────────────────────────────────────────────
+            if not candles_15m or len(candles_15m) < 60:
+                logger.warning(f"Insufficient 15m candles for {name} ({code}). Minimum 60 required. Got: {len(candles_15m) if candles_15m else 0}")
+                time.sleep(0.5)
                 continue
+                
+            if not candles_3m or not candles_1m or not daily_candles:
+                logger.warning(f"Missing auxiliary candle data for {name} ({code}). Skipping to prevent wrong analysis.")
+                time.sleep(0.5)
+                continue
+
+            def validate_candles(c_list, name_str):
+                for c in c_list[-5:]:  # Check only the most recent 5 candles for efficiency
+                    if c['close'] <= 0 or c['open'] <= 0 or c['high'] <= 0 or c['low'] <= 0:
+                        logger.warning(f"[{name_str}] Zero or negative price detected for {name} ({code}).")
+                        return False
+                    if c['high'] < c['low']:
+                        logger.warning(f"[{name_str}] High < Low detected for {name} ({code}).")
+                        return False
+                return True
+                
+            if not (validate_candles(candles_15m, "15m") and 
+                    validate_candles(candles_3m, "3m") and 
+                    validate_candles(candles_1m, "1m") and 
+                    validate_candles(daily_candles, "Daily")):
+                time.sleep(0.5)
+                continue
+                
+            # ────────────────────────────────────────────────────────────
+            # Phase 3: 분봉 간 교차 검증 (Cross-Validation)
+            # ────────────────────────────────────────────────────────────
+            latest_15m_close = float(candles_15m[-1]['close'])
+            latest_3m_close = float(candles_3m[-1]['close'])
+            latest_1m_close = float(candles_1m[-1]['close'])
+            
+            tick_current_price = latest_1m_close
+            try:
+                if tick_res and "cntr_infr" in tick_res and len(tick_res["cntr_infr"]) > 0:
+                    tick_current_price = float(abs(int(tick_res["cntr_infr"][0].get("cur_prc", latest_1m_close))))
+            except Exception:
+                pass
+                
+            prices_to_check = [latest_15m_close, latest_3m_close, latest_1m_close, tick_current_price]
+            max_p = max(prices_to_check)
+            min_p = min(prices_to_check)
+            
+            if min_p > 0:
+                diff_pct = (max_p - min_p) / min_p * 100.0
+                if diff_pct > 1.5:  # 1.5% 이상 차이나면 데이터 오염/꼬임으로 간주
+                    logger.warning(f"⚠️ [Data Cross-Validation Failed] {name}({code}) Prices mismatch > 1.5%: 15m={latest_15m_close}, 3m={latest_3m_close}, 1m={latest_1m_close}, Tick={tick_current_price}. Skipping.")
+                    time.sleep(0.5)
+                    continue
+
+            # ==========================================
+            # 모든 검증 통과 (Data is Valid) - 기존 계산 로직 수행
+            # ==========================================
+            candles = candles_15m
                 
             # Calculate all technical indicators (K/L + TEMA gate line)
             calculate_indicators_pure(
@@ -422,7 +493,6 @@ def run_trading_bot():
             )
             
             # Fetch and calculate daily/weekly conditions
-            daily_candles = client.get_daily_candles(code, last_n_days=200)
             daily_bonus_ok = False
             weekly_bonus_ok = False
             prev_d = None
@@ -475,27 +545,27 @@ def run_trading_bot():
             
             prev = candles[-2] if len(candles) > 1 else latest
             
-            # 모멘텀 스코어 계산 (사용자 요청: 정배열 기준 = TEMA3 > SMA60)
+            # 모멘텀 스코어 계산 (사용자 요청: 정배열 기준 = TEMA3 > TEMA60)
             t3_now = latest.get("tema3")
-            s60_now = latest.get("sma60")
+            t60_now = latest.get("tema60")
             t3_prev = prev.get("tema3")
-            s60_prev = prev.get("sma60")
+            t60_prev = prev.get("tema60")
             
             score = 0.0
             trend_ok = False
             slope_ok = False
             slope_pct = 0.0
             
-            if t3_now is not None and s60_now is not None:
-                # ① TEMA3 > SMA60 (정배열 상승세) -> +100점
-                if t3_now > s60_now:
+            if t3_now is not None and t60_now is not None:
+                # ① TEMA3 > TEMA60 (정배열 상승세) -> +100점
+                if t3_now > t60_now:
                     score += 100.0
                     trend_ok = True
                 
                 # ② 이격도를 좁히지 않고 벌어지거나 유지하며 올라가는가?
-                diff_now = t3_now - s60_now
-                if t3_prev is not None and s60_prev is not None:
-                    diff_prev = t3_prev - s60_prev
+                diff_now = t3_now - t60_now
+                if t3_prev is not None and t60_prev is not None:
+                    diff_prev = t3_prev - t60_prev
                     if diff_now >= diff_prev:
                         score += 100.0
                         slope_ok = True
@@ -546,8 +616,7 @@ def run_trading_bot():
             volume_power = 100.0
             block_buy_count = 0
             try:
-                # 틱 체결 데이터 조회
-                tick_res = client.stock_info_api.daily_stock_price_request_ka10003(stock_code=code)
+                # 틱 체결 데이터 파싱 (미리 병렬 수집된 tick_res 사용)
                 from indicator import parse_tick_execution_data
                 volume_power, block_buy_count = parse_tick_execution_data(tick_res)
                 
@@ -574,6 +643,9 @@ def run_trading_bot():
                 "sugeub_spike": latest.get("signal_sugeub_spike", False),
                 "volume_power": volume_power,
                 "block_buy_count": block_buy_count,
+                "candles_1m": candles_1m,
+                "candles_3m": candles_3m,
+                "daily_candles": daily_candles,
             })
             
             # 다음 스캔 비교를 위해 현재 등락률 저장
@@ -706,7 +778,7 @@ def run_trading_bot():
             held_info = held_dict.get(code)
 
             if "tracking_mode" not in sent_alerts[code]:
-                if is_held:
+                if is_held or code == "005930":
                     sent_alerts[code]["tracking_mode"] = "3m"
                 else:
                     sent_alerts[code]["tracking_mode"] = "15m"
@@ -719,8 +791,8 @@ def run_trading_bot():
 
             if tracking_mode == "3m":
                 # ─── 3분봉 추적매매 모드 ───
-                # A) 15분봉 TEMA3/SMA60 데드크로스 발생 시 우선순위로 즉시 전량 매도 및 15m 모드 복귀
-                if latest.get("signal_sell_tema3_sma60_dead"):
+                # A) 15분봉 TEMA3/TEMA60 데드크로스 발생 시 우선순위로 즉시 전량 매도 및 15m 모드 복귀
+                if latest.get("signal_sell_tema3_tema60_dead") and code != "005930":
                     logger.info(f"🚨 [15m TEMA3 데드크로스 감지] 3분봉 매매 해제 및 전량 매도 처리: {name} ({code})")
                     sent_alerts[code]["tracking_mode"] = "15m"
                     sent_alerts[code]["sold_qty"] = 0
@@ -740,13 +812,13 @@ def run_trading_bot():
                                 "buy_price": pur_price,
                                 "sell_price": sell_price,
                                 "return_pct": round(ret_rate, 2),
-                                "reason": "15m TEMA3-SMA60 Dead Cross"
+                                "reason": "15m TEMA3-TEMA60 Dead Cross"
                             }
                             BOT_STATE["completed_trades"].insert(0, trade_info)
                             if len(BOT_STATE["completed_trades"]) > 50:
                                 BOT_STATE["completed_trades"].pop()
                             msg = (
-                                f"📉 <b>[매도 체결 - 15m TEMA3-SMA60 Dead Cross!]</b>\n"
+                                f"📉 <b>[매도 체결 - 15m TEMA3-TEMA60 Dead Cross!]</b>\n"
                                 f"종목: {name} ({code})\n"
                                 f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
                                 f"매수단가: {pur_price:,.0f}원\n"
@@ -755,20 +827,21 @@ def run_trading_bot():
                                 f"시간: {candle_time}\n"
                             )
                             notifier.send_all(msg)
-                            _add_alert("sell", f"15m TEMA3-SMA60 Dead Cross 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (지정가 -2호가)", code, name)
+                            _add_alert("sell", f"15m TEMA3-TEMA60 Dead Cross 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (지정가 -2호가)", code, name)
                     continue
 
-                # B) 15m TEMA3 <= SMA60 일 경우 3m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
-                elif not latest.get("tema3_gt_sma60"):
-                    logger.info(f"ℹ️ [15m TEMA3 <= SMA60 감지] 3분봉 매매 모드 해제: {name} ({code})")
+                # B) 15m TEMA3 <= TEMA60 일 경우 3m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
+                elif not latest.get("tema3_gt_tema60") and code != "005930":
+                    logger.info(f"ℹ️ [15m TEMA3 <= TEMA60 감지] 3분봉 매매 모드 해제: {name} ({code})")
                     sent_alerts[code]["tracking_mode"] = "15m"
                     sent_alerts[code]["sold_qty"] = 0
                     tracking_mode = "15m"
                 
                 else:
-                    # 15m TEMA3 > SMA60 인 정상 3m 추적 상태
-                    # 3분봉 데이터 및 지표 계산 (SMA40, TEMA20 등을 위해 최소 2일치 확보)
-                    candles_3m = client.get_3min_candles(code, last_n_days=2)
+                    # 15m TEMA3 > TEMA60 인 정상 3m 추적 상태
+                    # 3분봉 데이터 및 지표 계산
+                    logger.info(f"🔍 [3분봉 매매 모드 동작 중] {name}({code}) 3분봉 데이터를 기반으로 TEMA3 데드크로스 및 기준선 이탈 여부 실시간 감시 중...")
+                    candles_3m = stock_data.get("candles_3m")
                     if candles_3m:
                         from indicator import calculate_indicators_3min
                         calculate_indicators_3min(candles_3m)
@@ -776,30 +849,36 @@ def run_trading_bot():
                         prev_3m = candles_3m[-2] if len(candles_3m) > 1 else latest_3m
                         
                         tema3_3m = latest_3m.get("tema3")
-                        sma60_3m = latest_3m.get("sma60")
+                        tema60_3m = latest_3m.get("tema60")
                         
                         prev_tema3_3m = prev_3m.get("tema3")
-                        prev_sma60_3m = prev_3m.get("sma60")
+                        prev_tema60_3m = prev_3m.get("tema60")
                         
                         is_3m_dead_cross = False
                         is_3m_gold_cross = False
                         
-                        # 데드크로스 (매도 조건): TEMA3 이 SMA60 을 하향이탈
-                        if (tema3_3m is not None and sma60_3m is not None 
-                            and prev_tema3_3m is not None and prev_sma60_3m is not None):
-                            if prev_tema3_3m >= prev_sma60_3m and tema3_3m < sma60_3m:
-                                is_3m_dead_cross = True
+                        # 3분봉 TEMA3/TEMA60 값 로깅
+                        logger.info(f"📊 [3분봉 지표] {name}({code}) | 현재: TEMA3={tema3_3m:,.0f}, TEMA60={tema60_3m:,.0f} | 이전: TEMA3={prev_tema3_3m:,.0f}, TEMA60={prev_tema60_3m:,.0f}" if all(v is not None for v in [tema3_3m, tema60_3m, prev_tema3_3m, prev_tema60_3m]) else "")
                         
-                        # 골든크로스 (재매수 조건): TEMA3 이 SMA60 을 상향돌파
-                        if (tema3_3m is not None and sma60_3m is not None 
-                            and prev_tema3_3m is not None and prev_sma60_3m is not None):
-                            if prev_tema3_3m < prev_sma60_3m and tema3_3m >= sma60_3m:
+                        # 데드크로스 (매도 조건): 이전 캔들에서 TEMA3 >= TEMA60 → 현재 캔들에서 TEMA3 < TEMA60 교차
+                        # 또는 현재 TEMA3 < TEMA60 상태 (이미 크로스 지나갔어도 캐치)
+                        if tema3_3m is not None and tema60_3m is not None:
+                            if tema3_3m < tema60_3m:
+                                is_3m_dead_cross = True
+                                logger.info(f"🔴 [3분봉 데드크로스 감지] {name}({code}) TEMA3({tema3_3m:,.0f}) < TEMA60({tema60_3m:,.0f})")
+                        
+                        # 골든크로스 (재매수 조건): 이전 캔들에서 TEMA3 < TEMA60 → 현재 캔들에서 TEMA3 >= TEMA60 교차
+                        # 또는 현재 TEMA3 >= TEMA60 상태 (이미 크로스 지나갔어도 캐치)
+                        # 추가 조건: TEMA60 지표 선의 기울기가 +0.05% 이상일 때만 (상승 턴)
+                        if tema3_3m is not None and tema60_3m is not None and prev_tema60_3m is not None and prev_tema60_3m != 0:
+                            slope_3m = ((tema60_3m - prev_tema60_3m) / prev_tema60_3m) * 100
+                            if tema3_3m >= tema60_3m and slope_3m >= 0.05:
                                 is_3m_gold_cross = True
+                                logger.info(f"🟢 [3분봉 재매수 감지] {name}({code}) TEMA3 >= TEMA60 & 60이평 상승 턴 (기울기: {slope_3m:+.3f}%)")
                                 
-                        # 1) 보유 중일 때 -> 3m TEMA3 & SMA60 데드크로스 매도 또는 기준선(L) 이탈 시 매도
+                        # 1) 보유 중일 때 -> 3m TEMA3 & TEMA60 데드크로스 매도 또는 기준선(L) 이탈 시 매도
                         if is_held:
-                            is_below_l = (l_line is not None and close_price < l_line)
-                            if is_3m_dead_cross or is_below_l:
+                            if is_3m_dead_cross:
                                 if sent_alerts[code]["sell"] != candle_time:
                                     sent_alerts[code]["sell"] = candle_time
                                     qty_to_sell = held_info["quantity"]
@@ -809,7 +888,7 @@ def run_trading_bot():
                                         pur_price = held_info["buy_price"]
                                         ret_rate = ((close_price - pur_price) / pur_price) * 100.0
                                         
-                                        sell_reason_str = "3m 데드크로스" if is_3m_dead_cross else "L선(기준선) 이탈 매도"
+                                        sell_reason_str = "3m 데드크로스"
                                         
                                         trade_info = {
                                             "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -843,7 +922,7 @@ def run_trading_bot():
                                     # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 주문가능금액(예수금) 95% 풀매수
                                     budget = cash * 0.95
                                     qty_to_buy = int(budget // close_price)
-                                if getattr(config, \'TEST_MODE_1_SHARE\', False):
+                                if getattr(config, 'TEST_MODE_1_SHARE', False):
                                     qty_to_buy = 1
                                         
                                 if qty_to_buy > 0:
@@ -886,7 +965,7 @@ def run_trading_bot():
                         logger.warning(f"Failed to fetch 1-min candles for {name} ({code}) in 1m tracking mode. Falling back to 15m logic.")
 
             if tracking_mode == "15m":
-                # ── ① 매수 로직 (수급 신호 기반 - 1분/5분/15분 중 하나라도 수급 터지면 +1호가 매수) ─────
+                # ── ① 매수 로직 (15분봉 정배열 + 1분봉 수급폭발 진입) ─────
                 if is_buy_window and not is_held:
                     # 계좌에 이미 보유 중인 종목이 있다면 신규 매수 차단 (1종목 몰빵 규칙)
                     if len(holdings) >= 1:
@@ -906,34 +985,40 @@ def run_trading_bot():
 
                     if not already_bought_today:
                         if sent_alerts[code]["buy"] != candle_time:
-                            # ── 멀티타임프레임 수급 신호 순차 확인 (AND 조건: 1분/5분/15분 모두 수급 터져야 매수) ──
+                            # ── 1분봉 수급폭발 확인 (유일한 수급 조건) ──
                             from indicator import check_short_term_sugeub
                             
-                            # 15분봉 수급 확인 (이미 계산된 지표 활용)
-                            sugeub_15m_ok = latest.get('signal_sugeub_spike', False)
-                            
-                            # 5분봉 수급 확인
-                            sugeub_5m_ok = False
-                            candles_5m = client.get_5min_candles(code, last_n_days=2)
-                            if candles_5m:
-                                sugeub_5m_ok = check_short_term_sugeub(candles_5m, 5)
-                            
-                            # 3분봉 수급 확인
-                            sugeub_3m_ok = False
-                            candles_3m = client.get_3min_candles(code, last_n_days=1)
-                            if candles_3m:
-                                sugeub_3m_ok = check_short_term_sugeub(candles_3m, 1)
-
-                            # 1분봉 수급 확인 추가
+                            # 1분봉 수급 확인
                             sugeub_1m_ok = False
-                            candles_1m = client.get_1min_candles(code, last_n_days=1)
+                            candles_1m = stock_data.get("candles_1m")
                             if candles_1m:
                                 sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
                             
-                            # 듀얼 시간대(장초반 엄격 모드) 완전 폐기 -> 개장 직후부터 무조건 1분봉 단독 수급 기준 적용
-                            # 단, 사용자의 핵심 뼈대 로직인 '15분봉 정배열(TEMA3 > SMA60)'을 만족할 때만 매수
-                            buy_condition_met = sugeub_1m_ok and stock_data.get("trend_ok", False)
-                            cond_type = "단기수급(1분) + 정배열"
+                            # 3분봉 정배열 확인 (TEMA3 > TEMA60) 및 TEMA60 기울기 확인
+                            trend_3m_ok = False
+                            candles_3m = stock_data.get("candles_3m")
+                            if candles_3m and len(candles_3m) >= 60:
+                                calculate_indicators_pure(
+                                    candles_3m,
+                                    use_compressed_peak=True,
+                                    tema_period1=config.TEMA_PERIOD_SHORT,
+                                    tema_period2=config.TEMA_PERIOD_LONG
+                                )
+                                latest_3m = candles_3m[-1]
+                                prev_3m = candles_3m[-2] if len(candles_3m) > 1 else latest_3m
+                                t3_3m = latest_3m.get("tema3")
+                                t60_3m = latest_3m.get("tema60")
+                                prev_t60_3m = prev_3m.get("tema60")
+                                
+                                if t3_3m is not None and t60_3m is not None and prev_t60_3m is not None and prev_t60_3m != 0:
+                                    slope = ((t60_3m - prev_t60_3m) / prev_t60_3m) * 100
+                                    if t3_3m > t60_3m and slope >= 0.05:
+                                        trend_3m_ok = True
+                                        logger.info(f"✅ [TEMA60 기울기 만족] {name}({code}) 기울기: {slope:+.3f}% (기준: +0.05%)")
+                            
+                            # 매수 조건: 1분봉 수급폭발 + 3분봉 정배열(TEMA3 > TEMA60) 및 기울기 상승
+                            buy_condition_met = sugeub_1m_ok and trend_3m_ok
+                            cond_type = "1분봉 수급폭발 + 3분봉 정배열(TEMA60 상승)"
                             
                             if buy_condition_met:
                                 # 수급 동시 확인! +1호가 매수 진행
@@ -948,8 +1033,8 @@ def run_trading_bot():
                                 # 주문가능금액(예수금) 95% 풀매수
                                 budget = cash * 0.95
                                 qty = int(budget // buy_price)
-                        if getattr(config, \'TEST_MODE_1_SHARE\', False):
-                            qty = 1
+                                if getattr(config, 'TEST_MODE_1_SHARE', False):
+                                    qty = 1
                                 
                                 if qty > 0:
                                     order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")
@@ -990,14 +1075,8 @@ def run_trading_bot():
                             else:
                                 # 수급 미달 로그
                                 miss = []
-                                if is_high_volatility_window:
-                                    if not sugeub_15m_ok: miss.append("15분봉")
-                                    if not sugeub_5m_ok: miss.append("5분봉")
-                                    if not sugeub_3m_ok: miss.append("3분봉")
-                                    logger.debug(f"  {name}({code}) 수급 미달(엄격모드): {', '.join(miss)} (15m={sugeub_15m_ok}, 5m={sugeub_5m_ok}, 3m={sugeub_3m_ok})")
-                                else:
-                                    if not sugeub_1m_ok: miss.append("1분봉")
-                                    logger.debug(f"  {name}({code}) 수급 미달(단기모드): {', '.join(miss)} (1m={sugeub_1m_ok})")
+                                if not sugeub_1m_ok: miss.append("1분봉")
+                                logger.debug(f"  {name}({code}) 수급 미달(단기모드): {', '.join(miss)} (1m={sugeub_1m_ok})")
 
                 # ── ② 매도 로직 (시간대 무관하게 항상 적용) ──────────
                 # A) 당일 종가 청산 강제 신호 부여 제거 (오버나잇 허용)
@@ -1018,7 +1097,7 @@ def run_trading_bot():
                             "L-line 1% Stop Loss": "L선 1% 이탈 손절",
                             "Gate-line 1% Stop Loss": "관문선 1% 이탈 손절",
                             "Daily Close Liquidation": "당일 종가 청산",
-                            "15m TEMA3-SMA60 Dead Cross": "15m TEMA3-SMA60 데드크로스"
+                            "15m TEMA3-TEMA60 Dead Cross": "15m TEMA3-TEMA60 데드크로스"
                         }.get(sell_reason, "전략 매도")
 
                         if is_held and held_info:

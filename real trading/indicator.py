@@ -128,14 +128,14 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
     sma5 = calculate_sma(closes, 5)
     sma20 = calculate_sma(closes, 20)
     sma40 = calculate_sma(closes, 40)
-    sma60 = calculate_sma(closes, 60)
+    tema60 = calculate_tema(closes, 60)
     tema20 = calculate_tema(closes, 20)
     
     for i in range(n):
         candles[i]['sma5'] = sma5[i]
         candles[i]['sma20'] = sma20[i]
         candles[i]['sma40'] = sma40[i]
-        candles[i]['sma60'] = sma60[i]
+        candles[i]['tema60'] = tema60[i]
         candles[i]['tema20'] = tema20[i]
 
     # 2. Perfect Alignment & K-line
@@ -144,10 +144,10 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         c = candles[i]
         s5 = c['sma5']
         s20 = c['sma20']
-        s60 = c['sma60']
+        t60 = c['tema60']
         
-        if s5 is not None and s20 is not None and s60 is not None:
-            if s5 > s20 and s20 > s60:
+        if s5 is not None and s20 is not None and t60 is not None:
+            if s5 > s20 and s20 > t60:
                 last_K = c['close']
         c['K'] = last_K
         c['K_static'] = last_K
@@ -291,40 +291,36 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         c['signal_sell_second_line'] = False
         c['second_line_val'] = None
 
-        # 1. Buy Signal (TEMA 3 > SMA 60)
+        # 1. Buy Signal (TEMA 3 > TEMA 60 and TEMA 60 Slope >= +0.05%)
         is_buy_signal = False
-        if c['tema3'] is not None and c['sma60'] is not None:
-            if c['tema3'] > c['sma60']:
+        if (c['tema3'] is not None and c['tema60'] is not None 
+            and c_prev is not None and c_prev.get('tema60') is not None and c_prev['tema60'] != 0):
+            slope = ((c['tema60'] - c_prev['tema60']) / c_prev['tema60']) * 100
+            if c['tema3'] > c['tema60'] and slope >= 0.05:
                 is_buy_signal = True
 
-        # 2. Sell Signal Condition 1 (TEMA 3 & SMA 60 Dead Cross)
+        # 2. Sell Signal Condition 1 (TEMA 3 & TEMA 60 Dead Cross State)
         is_sell_dead_signal = False
-        if (c['tema3'] is not None and c['sma60'] is not None
-                and c_prev is not None
-                and c_prev.get('tema3') is not None
-                and c_prev.get('sma60') is not None):
-            if c_prev['tema3'] >= c_prev['sma60'] and c['tema3'] < c['sma60']:
+        if c['tema3'] is not None and c['tema60'] is not None:
+            if c['tema3'] < c['tema60']:
                 is_sell_dead_signal = True
 
-        # Check 15m SMA 5 & SMA 60 Dead Cross (Macro Exit)
+        # Check 15m SMA 5 & TEMA 60 Dead Cross State (Macro Exit)
         is_15m_sma_dead = False
-        if (c['sma5'] is not None and c['sma60'] is not None
-                and c_prev is not None
-                and c_prev.get('sma5') is not None
-                and c_prev.get('sma60') is not None):
-            if c_prev['sma5'] >= c_prev['sma60'] and c['sma5'] < c['sma60']:
+        if c['sma5'] is not None and c['tema60'] is not None:
+            if c['sma5'] < c['tema60']:
                 is_15m_sma_dead = True
 
         # 3. Custom Virtual Trade Tracker / State Machine
         if not virtual_holding:
             if waiting_for_bb_rebuy:
-                # Check for rebuy cross (SMA5 Golden Cross SMA60)
+                # Check for rebuy cross (SMA5 Golden Cross TEMA60)
                 is_rebuy_cross = False
-                if (c['sma5'] is not None and c['sma60'] is not None
+                if (c['sma5'] is not None and c['tema60'] is not None
                         and c_prev is not None
                         and c_prev.get('sma5') is not None
-                        and c_prev.get('sma60') is not None):
-                    if c_prev['sma5'] < c_prev['sma60'] and c['sma5'] >= c['sma60']:
+                        and c_prev.get('tema60') is not None):
+                    if c_prev['sma5'] < c_prev['tema60'] and c['sma5'] >= c['tema60']:
                         is_rebuy_cross = True
 
                 if is_rebuy_cross:
@@ -353,9 +349,9 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         # Check for perfect alignment (K line generated/updated for current trade)
         s5 = c.get('sma5')
         s20 = c.get('sma20')
-        s60 = c.get('sma60')
-        if s5 is not None and s20 is not None and s60 is not None:
-            if s5 > s20 and s20 > s60:
+        t60 = c.get('tema60')
+        if s5 is not None and s20 is not None and t60 is not None:
+            if s5 > s20 and s20 > t60:
                 has_seen_new_alignment_since_buy = True
                 trade_K = c['close']
 
@@ -414,10 +410,10 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         c['signal_buy_dynamic'] = c['signal_buy']
         
         # Macro indicators and filters
-        c['sma5_gt_sma60'] = (c['sma5'] > c['sma60']) if (c['sma5'] is not None and c['sma60'] is not None) else False
-        c['tema3_gt_sma60'] = is_buy_signal
-        c['signal_sell_sma5_sma60_dead'] = is_15m_sma_dead
-        c['signal_sell_tema3_sma60_dead'] = is_sell_dead_signal
+        c['sma5_gt_tema60'] = (c['sma5'] > c['tema60']) if (c['sma5'] is not None and c['tema60'] is not None) else False
+        c['tema3_gt_tema60'] = is_buy_signal
+        c['signal_sell_sma5_tema60_dead'] = is_15m_sma_dead
+        c['signal_sell_tema3_tema60_dead'] = is_sell_dead_signal
 
         # Daily Close Reset logic removed to allow overnight holding.
 

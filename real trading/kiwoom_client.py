@@ -63,6 +63,109 @@ class KiwoomRealClient:
         _patch_api_instance(self.account_api)
         _patch_api_instance(self.order_api)
 
+    # ═══════════════════════════════════════════════════════════
+    # 🔒 종목코드 정규화 (모든 API 호출 전 반드시 이 메서드를 거침)
+    #    → _AL, _NX, A접두사 등 오염을 원천 차단
+    # ═══════════════════════════════════════════════════════════
+    @staticmethod
+    def _sanitize_code(raw_code: str) -> str:
+        """종목코드에서 접미사(_AL, _NX) 및 접두사(A)를 제거하고 6자리로 정규화합니다."""
+        code = str(raw_code).strip()
+        # 접미사 제거
+        for suffix in ("_AL", "_NX"):
+            code = code.replace(suffix, "")
+        # 접두사 'A' 제거 (키움 API가 반환하는 코드에 붙는 경우)
+        if code.startswith("A") and len(code) == 7:
+            code = code[1:]
+        # 6자리 zero-fill
+        return code.zfill(6)
+
+    # ═══════════════════════════════════════════════════════════
+    # 📊 분봉 차트 공통 메서드 (1분/3분/5분/15분 공용)
+    #    → 파싱 로직 중복 제거, 종목코드 자동 정규화
+    # ═══════════════════════════════════════════════════════════
+    def _get_data_code(self, stock_code: str) -> str:
+        """
+        데이터 조회용 코드를 반환합니다. 
+        야간장(NXT) 시간대에는 순수 6자리에 '_NX'를 붙여 실시간 야간 데이터를 가져옵니다.
+        """
+        clean_code = self._sanitize_code(stock_code)
+        import datetime
+        from datetime import timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        current_time = datetime.datetime.now(kst).time()
+        
+        t_0800 = datetime.time(8, 0, 0)
+        t_0850 = datetime.time(8, 50, 0)
+        t_1540 = datetime.time(15, 40, 0)
+        t_2000 = datetime.time(20, 0, 0)
+        
+        is_pre_market = (t_0800 <= current_time < t_0850)
+        is_after_market = (t_1540 <= current_time < t_2000)
+        
+        if is_pre_market or is_after_market:
+            return clean_code + "_NX"
+        return clean_code
+
+    def _fetch_minute_candles(self, stock_code: str, tic_scope: str, last_n_days: int) -> list:
+        """분봉 차트 데이터의 공통 조회/파싱 메서드.
+        
+        Args:
+            stock_code: 종목코드 (자동 정규화됨)
+            tic_scope: 분봉 간격 ("1", "3", "5", "15")
+            last_n_days: 최근 N일치 데이터만 반환
+        """
+        # 야간장 시간에는 자동으로 _NX가 붙은 코드로 전환하여 실시간 데이터를 수신합니다.
+        data_code = self._get_data_code(stock_code)
+        logger.info(f"Fetching {tic_scope}-minute candles for stock code {data_code}...")
+        try:
+            result = self.chart_api.stock_minute_chart_request_ka10080(
+                stk_cd=data_code,
+                tic_scope=tic_scope,
+                upd_stkpc_tp="1"
+            )
+            if not result:
+                return []
+
+            raw_candles = result.get("stk_min_pole_chart_qry", [])
+            if not raw_candles:
+                return []
+
+            parsed_candles = []
+            for item in raw_candles:
+                raw_time = item.get("cntr_tm", "").strip()
+                if len(raw_time) < 12:
+                    continue
+                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
+                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
+
+                try:
+                    close_prc = abs(float(item.get("cur_prc", 0.0)))
+                    open_prc = abs(float(item.get("open_pric", 0.0)))
+                    high_prc = abs(float(item.get("high_pric", 0.0)))
+                    low_prc = abs(float(item.get("low_pric", 0.0)))
+                    volume = int(item.get("trde_qty", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                parsed_candles.append({
+                    "time": dt_str,
+                    "date": date_only,
+                    "open": open_prc,
+                    "high": high_prc,
+                    "low": low_prc,
+                    "close": close_prc,
+                    "volume": volume
+                })
+
+            parsed_candles.sort(key=lambda x: x["time"])
+            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
+            target_dates = unique_dates[-last_n_days:]
+            return [c for c in parsed_candles if c["date"] in target_dates]
+        except Exception as e:
+            logger.error(f"Error fetching {tic_scope}-min candles for {stock_code}: {e}")
+            return []
+
     def test_connection(self) -> bool:
         """
         Tests the API authentication and token issues.
@@ -206,57 +309,8 @@ class KiwoomRealClient:
             return []
 
     def get_15min_candles(self, stock_code: str, last_n_days: int = 7) -> list:
-        """
-        주식 종목의 15분봉 차트 데이터를 조회합니다.
-        """
-        logger.info(f"Fetching 15-minute candles for stock code {stock_code}...")
-        try:
-            result = self.chart_api.stock_minute_chart_request_ka10080(
-                stk_cd=stock_code,
-                tic_scope="15",
-                upd_stkpc_tp="1"
-            )
-            if not result:
-                return []
-                
-            raw_candles = result.get("stk_min_pole_chart_qry", [])
-            if not raw_candles:
-                return []
-                
-            parsed_candles = []
-            for item in raw_candles:
-                raw_time = item.get("cntr_tm", "").strip()
-                if len(raw_time) < 12:
-                    continue
-                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
-                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
-                
-                try:
-                    close_prc = abs(float(item.get("cur_prc", 0.0)))
-                    open_prc = abs(float(item.get("open_pric", 0.0)))
-                    high_prc = abs(float(item.get("high_pric", 0.0)))
-                    low_prc = abs(float(item.get("low_pric", 0.0)))
-                    volume = int(item.get("trde_qty", 0))
-                except (ValueError, TypeError):
-                    continue
-                    
-                parsed_candles.append({
-                    "time": dt_str,
-                    "date": date_only,
-                    "open": open_prc,
-                    "high": high_prc,
-                    "low": low_prc,
-                    "close": close_prc,
-                    "volume": volume
-                })
-                
-            parsed_candles.sort(key=lambda x: x["time"])
-            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
-            target_dates = unique_dates[-last_n_days:]
-            return [c for c in parsed_candles if c["date"] in target_dates]
-        except Exception as e:
-            logger.error(f"Error fetching 15-min candles: {e}")
-            return []
+        """주식 종목의 15분봉 차트 데이터를 조회합니다."""
+        return self._fetch_minute_candles(stock_code, tic_scope="15", last_n_days=last_n_days)
 
     def get_top_trading_value_stocks(self, market_type: str = "000", limit: int = 100) -> list:
         """
@@ -314,6 +368,7 @@ class KiwoomRealClient:
     def _determine_exchange_and_order_type(self, order_type: str, price: float = None) -> tuple:
         """
         실전 NXT 대체거래소 세션 시간대에 맞춰 적합한 거래소 구분 및 주문타입을 매핑합니다.
+        주문 API의 dmst_stex_tp는 문자열 "KRX" 또는 "NXT"를 사용해야 합니다.
         """
         import datetime
         from datetime import timezone, timedelta
@@ -330,25 +385,25 @@ class KiwoomRealClient:
         is_pre_market = (t_0800 <= current_time < t_0850)
         is_after_market = (t_1540 <= current_time < t_2000)
         
-        # 프리마켓, 애프터마켓 거래 시 지정가('0') 강제 전환 및 거래소 구분 '2' (NXT)
+        # 프리마켓, 애프터마켓 거래 시 지정가('0') 강제 전환 및 거래소 구분 'NXT'
         if (is_pre_market or is_after_market):
             if order_type == "3":
                 if price is not None:
-                    logger.info("Extended trading hours session detected. Converting Market order to Limit order and setting exchange to '2' (NXT).")
-                    return "2", "0", price
+                    logger.info("Extended trading hours session detected. Converting Market order to Limit order and setting exchange to 'NXT'.")
+                    return "NXT", "0", price
                 else:
-                    logger.warning("Extended hours detected but no price was provided for conversion. Fallback to market and '2'.")
-                    return "2", order_type, price
+                    logger.warning("Extended hours detected but no price was provided for conversion. Fallback to limit and 'NXT'.")
+                    return "NXT", order_type, price
             else:
-                return "2", order_type, price
+                return "NXT", order_type, price
                 
-        return "SOR", order_type, price
+        return "KRX", order_type, price
 
     def place_buy_order(self, stock_code: str, quantity: int, price: float = None, order_type: str = "3") -> dict:
         """
         실전 매수 주문을 발송합니다. (실거래이므로 각별히 예산 조절 주의 요망)
         """
-        clean_code = stock_code.replace("_AL", "").replace("_NX", "")
+        clean_code = self._sanitize_code(stock_code)
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
         price_int = int(actual_price) if actual_price is not None else None
         
@@ -373,7 +428,7 @@ class KiwoomRealClient:
         """
         실전 매도 주문을 발송합니다.
         """
-        clean_code = stock_code.replace("_AL", "").replace("_NX", "")
+        clean_code = self._sanitize_code(stock_code)
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
         price_int = int(actual_price) if actual_price is not None else None
         
@@ -395,163 +450,16 @@ class KiwoomRealClient:
             return None
 
     def get_1min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
-        """
-        주식 종목의 1분봉 차트 데이터를 조회합니다.
-        """
-        logger.info(f"Fetching 1-minute candles for stock code {stock_code}...")
-        try:
-            result = self.chart_api.stock_minute_chart_request_ka10080(
-                stk_cd=stock_code,
-                tic_scope="1",
-                upd_stkpc_tp="1"
-            )
-            if not result:
-                return []
-                
-            raw_candles = result.get("stk_min_pole_chart_qry", [])
-            if not raw_candles:
-                return []
-                
-            parsed_candles = []
-            for item in raw_candles:
-                raw_time = item.get("cntr_tm", "").strip()
-                if len(raw_time) < 12:
-                    continue
-                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
-                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
-                
-                try:
-                    close_prc = abs(float(item.get("cur_prc", 0.0)))
-                    open_prc = abs(float(item.get("open_pric", 0.0)))
-                    high_prc = abs(float(item.get("high_pric", 0.0)))
-                    low_prc = abs(float(item.get("low_pric", 0.0)))
-                    volume = int(item.get("trde_qty", 0))
-                except (ValueError, TypeError):
-                    continue
-                    
-                parsed_candles.append({
-                    "time": dt_str,
-                    "date": date_only,
-                    "open": open_prc,
-                    "high": high_prc,
-                    "low": low_prc,
-                    "close": close_prc,
-                    "volume": volume
-                })
-                
-            parsed_candles.sort(key=lambda x: x["time"])
-            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
-            target_dates = unique_dates[-last_n_days:]
-            return [c for c in parsed_candles if c["date"] in target_dates]
-        except Exception as e:
-            logger.error(f"Error fetching 1-min candles: {e}")
-            return []
+        """주식 종목의 1분봉 차트 데이터를 조회합니다."""
+        return self._fetch_minute_candles(stock_code, tic_scope="1", last_n_days=last_n_days)
 
     def get_3min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
-        """
-        주식 종목의 3분봉 차트 데이터를 조회합니다.
-        """
-        logger.info(f"Fetching 3-minute candles for stock code {stock_code}...")
-        try:
-            result = self.chart_api.stock_minute_chart_request_ka10080(
-                stk_cd=stock_code + "_AL",
-                tic_scope="3",
-                upd_stkpc_tp="1"
-            )
-            if not result:
-                return []
-                
-            raw_candles = result.get("stk_min_pole_chart_qry", [])
-            if not raw_candles:
-                return []
-                
-            parsed_candles = []
-            for item in raw_candles:
-                raw_time = item.get("cntr_tm", "").strip()
-                if len(raw_time) < 12:
-                    continue
-                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
-                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
-                
-                try:
-                    close_prc = abs(float(item.get("cur_prc", 0.0)))
-                    open_prc = abs(float(item.get("open_pric", 0.0)))
-                    high_prc = abs(float(item.get("high_pric", 0.0)))
-                    low_prc = abs(float(item.get("low_pric", 0.0)))
-                    volume = int(item.get("trde_qty", 0))
-                except (ValueError, TypeError):
-                    continue
-                    
-                parsed_candles.append({
-                    "time": dt_str,
-                    "date": date_only,
-                    "open": open_prc,
-                    "high": high_prc,
-                    "low": low_prc,
-                    "close": close_prc,
-                    "volume": volume
-                })
-                
-            parsed_candles.sort(key=lambda x: x["time"])
-            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
-            target_dates = unique_dates[-last_n_days:]
-            return [c for c in parsed_candles if c["date"] in target_dates]
-        except Exception as e:
-            logger.error(f"Error fetching 3-min candles: {e}")
-            return []
+        """주식 종목의 3분봉 차트 데이터를 조회합니다."""
+        return self._fetch_minute_candles(stock_code, tic_scope="3", last_n_days=last_n_days)
 
     def get_5min_candles(self, stock_code: str, last_n_days: int = 2) -> list:
-        """
-        주식 종목의 5분봉 차트 데이터를 조회합니다.
-        """
-        logger.info(f"Fetching 5-minute candles for stock code {stock_code}...")
-        try:
-            result = self.chart_api.stock_minute_chart_request_ka10080(
-                stk_cd=stock_code + "_AL",
-                tic_scope="5",
-                upd_stkpc_tp="1"
-            )
-            if not result:
-                return []
-                
-            raw_candles = result.get("stk_min_pole_chart_qry", [])
-            if not raw_candles:
-                return []
-                
-            parsed_candles = []
-            for item in raw_candles:
-                raw_time = item.get("cntr_tm", "").strip()
-                if len(raw_time) < 12:
-                    continue
-                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
-                date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
-                
-                try:
-                    close_prc = abs(float(item.get("cur_prc", 0.0)))
-                    open_prc = abs(float(item.get("open_pric", 0.0)))
-                    high_prc = abs(float(item.get("high_pric", 0.0)))
-                    low_prc = abs(float(item.get("low_pric", 0.0)))
-                    volume = int(item.get("trde_qty", 0))
-                except (ValueError, TypeError):
-                    continue
-                    
-                parsed_candles.append({
-                    "time": dt_str,
-                    "date": date_only,
-                    "open": open_prc,
-                    "high": high_prc,
-                    "low": low_prc,
-                    "close": close_prc,
-                    "volume": volume
-                })
-                
-            parsed_candles.sort(key=lambda x: x["time"])
-            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
-            target_dates = unique_dates[-last_n_days:]
-            return [c for c in parsed_candles if c["date"] in target_dates]
-        except Exception as e:
-            logger.error(f"Error fetching 5-min candles: {e}")
-            return []
+        """주식 종목의 5분봉 차트 데이터를 조회합니다."""
+        return self._fetch_minute_candles(stock_code, tic_scope="5", last_n_days=last_n_days)
 
 
     def get_daily_candles(self, stock_code: str, last_n_days: int = 200) -> list:
@@ -657,7 +565,8 @@ class KiwoomRealClient:
         """
         logger.info(f"Fetching stock name for stock code {stock_code}...")
         try:
-            code = str(stock_code).replace("_AL", "").replace("_NX", "").strip().zfill(6)
+            # 데이터 조회용이므로 원본 코드를 그대로 사용
+            code = stock_code
             result = self.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
             if result and result.get("return_code") == 0:
                 name = result.get("stk_nm", "").strip()
@@ -678,7 +587,8 @@ class KiwoomRealClient:
             return {}
             
         logger.info(f"Fetching stock names for {len(stock_codes)} codes in batch...")
-        codes = [str(c).replace("_AL", "").replace("_NX", "").strip().zfill(6) for c in stock_codes if c]
+        # 데이터 조회용이므로 원본 코드를 그대로 사용
+        codes = [c for c in stock_codes if c]
         chunk_size = 50
         result_map = {}
         
@@ -740,7 +650,7 @@ class KiwoomRealClient:
         try:
             from kiwoom_rest_api.koreanstock.market_condition import MarketCondition
             mc = MarketCondition(base_url=self.base_url, token_manager=self.token_manager)
-            clean_code = str(stock_code).replace("_AL", "").replace("_NX", "").strip().zfill(6)
+            clean_code = self._sanitize_code(stock_code)
             nxt_code = clean_code + "_NX"
             
             result = mc.stock_quote_request_ka10004(stock_code=nxt_code)
@@ -790,11 +700,12 @@ class KiwoomRealClient:
         """
         미체결 주문을 취소합니다.
         """
-        clean_code = str(stock_code).replace("_AL", "").replace("_NX", "").strip().zfill(6)
-        logger.warning(f"⚠️ SENDING CANCEL ORDER: No={order_no}, Code={clean_code}, Qty={cancel_qty}")
+        clean_code = self._sanitize_code(stock_code)
+        dmst_stex_tp, _, _ = self._determine_exchange_and_order_type("0")
+        logger.warning(f"⚠️ SENDING CANCEL ORDER: No={order_no}, Code={clean_code}, Qty={cancel_qty}, Exchange={dmst_stex_tp}")
         try:
             result = self.order_api.stock_cancel_order_request_kt10003(
-                dmst_stex_tp="2", # NXT 취소일수도 있고 KRX일수도 있지만 보통 SOR/2로 통합 전송
+                dmst_stex_tp=dmst_stex_tp,
                 orig_ord_no=order_no,
                 stk_cd=clean_code,
                 cncl_qty=str(cancel_qty)
