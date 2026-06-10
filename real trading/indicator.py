@@ -470,10 +470,52 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                 is_perfect_breakout = True
     return candles
 
+def calculate_obv(candles):
+    """Calculates On Balance Volume (OBV)."""
+    n = len(candles)
+    obv = []
+    current_obv = 0
+    for i in range(n):
+        if i == 0:
+            obv.append(0)
+            continue
+        c_prev = candles[i-1]['close']
+        c_curr = candles[i]['close']
+        v = candles[i].get('volume', 0)
+        
+        if c_curr > c_prev:
+            current_obv += v
+        elif c_curr < c_prev:
+            current_obv -= v
+            
+        obv.append(current_obv)
+    return obv
+
+def calculate_indicators_1min(candles):
+    """
+    Calculates technical indicators for 1-minute candles (used as a leading indicator).
+    Calculates TEMA 3, TEMA 60, OBV.
+    """
+    n = len(candles)
+    if n == 0:
+        return candles
+        
+    closes = [c['close'] for c in candles]
+    tema3 = calculate_tema(closes, 3)
+    tema60 = calculate_tema(closes, 60)
+    obv = calculate_obv(candles)
+    
+    for i in range(n):
+        candles[i]['tema3'] = tema3[i]
+        candles[i]['tema60'] = tema60[i]
+        candles[i]['obv'] = obv[i]
+        
+    return candles
+
 def calculate_indicators_3min(candles):
     """
     Calculates technical indicators for 3-minute candles.
-    Calculates TEMA 20, SMA 40, SMA 20.
+    Calculates TEMA 20, SMA 40, SMA 20, OBV, and 3-candle average volume.
     """
     n = len(candles)
     if n == 0:
@@ -488,6 +530,7 @@ def calculate_indicators_3min(candles):
     sma60 = calculate_sma(closes, 60)
     tema3 = calculate_tema(closes, 3)
     bb20_upper, bb20_mid, bb20_lower = calculate_bollinger_bands(closes, 20, 2.0)
+    obv = calculate_obv(candles)
     
     for i in range(n):
         candles[i]['tema20'] = tema20[i]
@@ -497,7 +540,15 @@ def calculate_indicators_3min(candles):
         candles[i]['sma60'] = sma60[i]
         candles[i]['tema3'] = tema3[i]
         candles[i]['bb20_upper'] = bb20_upper[i]
+        candles[i]['obv'] = obv[i]
         
+        # Calculate 3-candle average volume (excluding current candle)
+        if i >= 3:
+            avg_v = (candles[i-1].get('volume', 0) + candles[i-2].get('volume', 0) + candles[i-3].get('volume', 0)) / 3.0
+            candles[i]['vol_avg_3'] = avg_v
+        else:
+            candles[i]['vol_avg_3'] = 0
+            
     return candles
 
 if __name__ == "__main__":

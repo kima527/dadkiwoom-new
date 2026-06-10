@@ -837,10 +837,19 @@ def run_trading_bot():
                     logger.info(f"🔍 [3분봉 매매 모드 동작 중] {name}({code}) 3분봉 데이터를 기반으로 TEMA3 데드크로스 및 기준선 이탈 여부 실시간 감시 중...")
                     candles_3m = stock_data.get("candles_3m")
                     if candles_3m:
-                        from indicator import calculate_indicators_3min
+                        from indicator import calculate_indicators_3min, calculate_indicators_1min
                         calculate_indicators_3min(candles_3m)
                         latest_3m = candles_3m[-1]
                         prev_3m = candles_3m[-2] if len(candles_3m) > 1 else latest_3m
+                        
+                        candles_1m = stock_data.get("candles_1m", [])
+                        if candles_1m:
+                            calculate_indicators_1min(candles_1m)
+                            latest_1m = candles_1m[-1]
+                            prev_1m = candles_1m[-2] if len(candles_1m) > 1 else latest_1m
+                        else:
+                            latest_1m = {}
+                            prev_1m = {}
                         
                         tema3_3m = latest_3m.get("tema3")
                         tema60_3m = latest_3m.get("tema60")
@@ -861,14 +870,32 @@ def run_trading_bot():
                                 is_3m_dead_cross = True
                                 logger.info(f"🔴 [3분봉 데드크로스 감지] {name}({code}) TEMA3({tema3_3m:,.0f}) < TEMA60({tema60_3m:,.0f})")
                         
-                        # 골든크로스 (재매수 조건): 이전 캔들에서 TEMA3 < TEMA60 → 현재 캔들에서 TEMA3 >= TEMA60 교차
-                        # 또는 현재 TEMA3 >= TEMA60 상태 (이미 크로스 지나갔어도 캐치)
+                        # 골든크로스 (재매수 조건) + OBV 및 거래량 150% 필터 + 1분봉 선행 지표
                         # 추가 조건: TEMA60 지표 선의 기울기가 +0.05% 이상일 때만 (상승 턴)
                         if tema3_3m is not None and tema60_3m is not None and prev_tema60_3m is not None and prev_tema60_3m != 0:
                             slope_3m = ((tema60_3m - prev_tema60_3m) / prev_tema60_3m) * 100
                             if tema3_3m >= tema60_3m and slope_3m >= 0.05:
-                                is_3m_gold_cross = True
-                                logger.info(f"🟢 [3분봉 재매수 감지] {name}({code}) TEMA3 >= TEMA60 & 60이평 상승 턴 (기울기: {slope_3m:+.3f}%)")
+                                vol_3m = latest_3m.get("volume", 0)
+                                vol_avg_3 = latest_3m.get("vol_avg_3", 0)
+                                obv_now = latest_3m.get("obv", 0)
+                                obv_prev = prev_3m.get("obv", 0)
+                                
+                                is_vol_surge = (vol_avg_3 > 0 and vol_3m >= vol_avg_3 * 1.5)
+                                is_obv_rising = (obv_now > obv_prev)
+                                
+                                # 1분봉 선행 필터: 1분봉 수급폭발이 있거나 1분봉 TEMA3가 상승 중일 때
+                                from indicator import check_short_term_sugeub
+                                sugeub_1m_ok = False
+                                if candles_1m:
+                                    sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
+                                
+                                is_1m_ok = sugeub_1m_ok
+                                
+                                if is_vol_surge and is_obv_rising and is_1m_ok:
+                                    is_3m_gold_cross = True
+                                    logger.info(f"🟢 [3분봉 재매수 확정] {name}({code}) TEMA3>=TEMA60, 거래량급증({vol_3m}/{vol_avg_3:.0f}), OBV상승, 1분봉수급OK")
+                                else:
+                                    logger.info(f"⏳ [3분봉 재매수 보류] {name}({code}) 크로스발생이나 필터미달(vol:{is_vol_surge}, obv:{is_obv_rising}, 1m:{is_1m_ok})")
                                 
                         # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
                         # 1) 보유 중일 때 -> 3m 매도 방어망 작동 (최후의 보루, L선 이탈, 변곡 쌍봉 감지, 데드크로스)
@@ -890,14 +917,26 @@ def run_trading_bot():
                                 should_sell = True
                                 sell_reason_str = "전고점 지지선(L선) 붕괴"
                                 
-                            # 방어망 3: K선 변곡 도달 실패 (쌍봉 예측)
+                            # 방어망 3: K선 변곡 도달 실패 (쌍봉 예측) + 1분봉 선행 지표 결합
                             candles_15m = stock_data.get("candles_15m", [])
                             if not should_sell and len(candles_15m) >= 6 and tema3_3m is not None and prev_tema3_3m is not None:
                                 target_price = candles_15m[-6]["close"]
-                                # 주가가 변곡 목표가를 넘지 못하고 3분봉 TEMA3가 꺾일 때
-                                if close_price < target_price and tema3_3m < prev_tema3_3m:
+                                # 기존 3분봉 꺾임 조건
+                                is_3m_dropping = (close_price < target_price and tema3_3m < prev_tema3_3m)
+                                
+                                # 1분봉 선행 꺾임 조건 (빠른 쌍봉 예측)
+                                tema3_1m = latest_1m.get("tema3")
+                                prev_tema3_1m = prev_1m.get("tema3")
+                                is_1m_dropping = False
+                                if tema3_1m is not None and prev_tema3_1m is not None:
+                                    is_1m_dropping = (close_price < target_price and tema3_1m < prev_tema3_1m)
+                                
+                                if is_3m_dropping or is_1m_dropping:
                                     should_sell = True
-                                    sell_reason_str = f"상승 동력 고갈 (목표가 {target_price:,.0f}원 미달 및 꺾임)"
+                                    if is_1m_dropping and not is_3m_dropping:
+                                        sell_reason_str = f"1분봉 선행 꺾임 감지 (목표가 {target_price:,.0f}원 미달)"
+                                    else:
+                                        sell_reason_str = f"상승 동력 고갈 (목표가 {target_price:,.0f}원 미달 및 꺾임)"
                                     
                             # 방어망 4: 기존 3분봉 데드크로스
                             if not should_sell and is_3m_dead_cross:
