@@ -1093,7 +1093,7 @@ def run_trading_bot():
                             # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
                             # 매수 4대 핵심 관문 (15분봉 정배열 + 가산점 + 3분봉 기울기 + 1분봉 수급)
                             trend_15m_ok = stock_data.get("trend_ok", False)
-                            has_bonus = stock_data.get("theme_bonus", False) or (stock_data.get("flu_delta", 0.0) >= 1.0) or stock_data.get("sugeub_spike", False)
+                            has_bonus = stock_data.get("theme_bonus", False) or (stock_data.get("flu_delta", 0.0) >= 1.0)
                             
                             buy_condition_met = trend_15m_ok and has_bonus and trend_3m_ok and sugeub_1m_ok
                             cond_type = "15m정배열 + 가산점 + 3m기울기 + 1m수급"

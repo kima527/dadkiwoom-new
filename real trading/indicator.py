@@ -426,41 +426,14 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         else:
             candles[i]['disparity_pct'] = None
 
-    # 9. 수급(거래대금) 급증 및 돌파 시그널 계산
+    # 10. 기준선(L) & 세력선(whale_line) 동시 상향 돌파 시그널 (빨간 다이아몬드 지점)
     for i in range(n):
         c = candles[i]
-        h = float(c.get('high', c['close']))
-        l = float(c.get('low', c['close']))
-        o = float(c.get('open', c['close']))
         close_val = float(c['close'])
-        v = float(c.get('volume', 0))
-        
-        # 수급 = (H+L+O+C)/4 * V / 100,000,000 (단위: 억 원)
-        sugeub_val = ((h + l + o + close_val) / 4.0) * v / 100000000.0
-        c['sugeub'] = sugeub_val
-        
-        # 조건 검증: 양봉, 몸통 > 윗꼬리 * 1.2, 수급 >= 직전 2봉 평균 수급 * 2
-        is_sugeub_spike = False
-        if o < close_val:
-            body = close_val - o
-            upper_shadow = h - close_val
-            if body > (upper_shadow * 1.2):
-                if i >= 2:
-                    prev_sugeub_1 = candles[i-1].get('sugeub', 0.0)
-                    prev_sugeub_2 = candles[i-2].get('sugeub', 0.0)
-                    avg_prev_sugeub = (prev_sugeub_1 + prev_sugeub_2) / 2.0
-                    
-                    if avg_prev_sugeub > 0 and sugeub_val >= (avg_prev_sugeub * 2.0):
-                        is_sugeub_spike = True
-                else:
-                    is_sugeub_spike = False
-        c['signal_sugeub_spike'] = is_sugeub_spike
-
-        # 10. 기준선(L) & 세력선(whale_line) 동시 상향 돌파 시그널 (빨간 다이아몬드 지점)
         is_perfect_breakout = False
         c_prev = candles[i-1] if i > 0 else None
-        if (is_sugeub_spike and 
-            c.get('L') is not None and c.get('whale_line') is not None and 
+        
+        if (c.get('L') is not None and c.get('whale_line') is not None and 
             c_prev is not None and c_prev.get('L') is not None and c_prev.get('whale_line') is not None):
             
             above_lines = (close_val > c['L']) and (close_val > c['whale_line'])
