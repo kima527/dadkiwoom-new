@@ -21,7 +21,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 KAKAO_APP_KEY = os.getenv("KAKAO_APP_KEY", "")
 KAKAO_REFRESH_TOKEN = os.getenv("KAKAO_REFRESH_TOKEN", "")
 
-# Watchlist Excel File Name
+# ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
+# Watchlist Excel File Name (종목 선정은 반드시 이 파일에 있는 종목으로만 한정합니다)
 WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_pick.xlsx")
 
 # TEMA Gate Line Settings

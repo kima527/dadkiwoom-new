@@ -320,7 +320,8 @@ def run_trading_bot():
         held_dict = {h["code"]: h for h in holdings}
         cash = client.get_cash_balance()
 
-        # Load watchlist dynamically in case user edited the file
+        # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
+        # 종목 선정은 반드시 my_pick.xlsx 파일에 있는 종목으로만 매매하도록 제한합니다. (전체 종목 스캔 방지)
         watchlist = load_watchlist(WATCHLIST_PATH)
         
         # 관심종목과 계좌 보유 종목을 합산하여 감시 대상 리스트 구성
