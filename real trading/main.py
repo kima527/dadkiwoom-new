@@ -336,13 +336,7 @@ def run_trading_bot():
             time.sleep(60)
             continue
 
-        # Fetch real-time fluctuation rates map (NXT 장 개장 08시부터 실시간 조회)
-        top_flu_rates_map = {}
-        now_kst = datetime.now(timezone(timedelta(hours=9)))
-        try:
-            top_flu_rates_map = client.get_top_fluctuation_stocks_with_rates(market_type="000", limit=100)
-        except Exception:
-            pass
+        # 시장 전체 등락률 실시간 조회(get_top_fluctuation_stocks_with_rates) API 호출 삭제됨 (사용자 요청)
 
         # ── 매일 장 시작 시 일일 매매 종목 선정 및 초기화 (오버나잇 보유 허용) ──
         liquidation_file = "last_liquidation.txt"
@@ -574,12 +568,12 @@ def run_trading_bot():
                         slope_pct = (diff_now - diff_prev) / diff_prev * 100.0
                         score += slope_pct * 10.0
             
-            # ③ 등락률 점수 가중치 (+10 * 등락률%)
-            flu_pct = top_flu_rates_map.get(code, 0.0)
-            if flu_pct == 0.0:
-                if len(candles) >= 5:
-                    c_start = candles[-5]
-                    flu_pct = ((latest["close"] - c_start["close"]) / c_start["close"]) * 100.0
+            # ③ 당일 등락률 점수 가중치 (+10 * 등락률%)
+            flu_pct = 0.0
+            if daily_candles and len(daily_candles) >= 2:
+                prev_close = daily_candles[-2]['close']
+                if prev_close > 0:
+                    flu_pct = ((latest["close"] - prev_close) / prev_close) * 100.0
             
             score += flu_pct * 10.0
             
@@ -876,9 +870,41 @@ def run_trading_bot():
                                 is_3m_gold_cross = True
                                 logger.info(f"🟢 [3분봉 재매수 감지] {name}({code}) TEMA3 >= TEMA60 & 60이평 상승 턴 (기울기: {slope_3m:+.3f}%)")
                                 
-                        # 1) 보유 중일 때 -> 3m TEMA3 & TEMA60 데드크로스 매도 또는 기준선(L) 이탈 시 매도
+                        # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
+                        # 1) 보유 중일 때 -> 3m 매도 방어망 작동 (최후의 보루, L선 이탈, 변곡 쌍봉 감지, 데드크로스)
                         if is_held:
-                            if is_3m_dead_cross:
+                            sell_reason_str = ""
+                            should_sell = False
+                            
+                            latest_15m = stock_data["latest"]
+                            
+                            # 방어망 1: 15분봉 최후의 보루 (관문선 1% 이탈)
+                            gate_line = latest_15m.get("tema_gate_line")
+                            if gate_line and close_price < gate_line * 0.99:
+                                should_sell = True
+                                sell_reason_str = "관문선 1% 하향 이탈 (최후 방어선 붕괴)"
+                                
+                            # 방어망 2: 15분봉 L선 (추세 지지선) 이탈
+                            L_line = latest_15m.get("L")
+                            if not should_sell and L_line and close_price < L_line:
+                                should_sell = True
+                                sell_reason_str = "전고점 지지선(L선) 붕괴"
+                                
+                            # 방어망 3: K선 변곡 도달 실패 (쌍봉 예측)
+                            candles_15m = stock_data.get("candles_15m", [])
+                            if not should_sell and len(candles_15m) >= 6 and tema3_3m is not None and prev_tema3_3m is not None:
+                                target_price = candles_15m[-6]["close"]
+                                # 주가가 변곡 목표가를 넘지 못하고 3분봉 TEMA3가 꺾일 때
+                                if close_price < target_price and tema3_3m < prev_tema3_3m:
+                                    should_sell = True
+                                    sell_reason_str = f"상승 동력 고갈 (목표가 {target_price:,.0f}원 미달 및 꺾임)"
+                                    
+                            # 방어망 4: 기존 3분봉 데드크로스
+                            if not should_sell and is_3m_dead_cross:
+                                should_sell = True
+                                sell_reason_str = "3분봉 데드크로스 하락"
+
+                            if should_sell:
                                 if sent_alerts[code]["sell"] != candle_time:
                                     sent_alerts[code]["sell"] = candle_time
                                     qty_to_sell = held_info["quantity"]
@@ -887,8 +913,6 @@ def run_trading_bot():
                                         sent_alerts[code]["sold_qty"] = qty_to_sell
                                         pur_price = held_info["buy_price"]
                                         ret_rate = ((close_price - pur_price) / pur_price) * 100.0
-                                        
-                                        sell_reason_str = "3m 데드크로스"
                                         
                                         trade_info = {
                                             "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -966,9 +990,15 @@ def run_trading_bot():
 
             if tracking_mode == "15m":
                 # ── ① 매수 로직 (15분봉 정배열 + 1분봉 수급폭발 진입) ─────
+                if not is_buy_window and not is_held:
+                    if rank <= 3:
+                        logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 신규 매수 시간(08:00~12:00)이 아님")
+                        
                 if is_buy_window and not is_held:
                     # 계좌에 이미 보유 중인 종목이 있다면 신규 매수 차단 (1종목 몰빵 규칙)
                     if len(holdings) >= 1:
+                        if rank <= 3:
+                            logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 이미 보유 중인 종목이 있음 (1종목 몰빵 규칙)")
                         continue
 
                     # 오늘 이미 다른 종목 신규 매수를 완료했는지 체크
@@ -983,6 +1013,11 @@ def run_trading_bot():
                         except Exception as e:
                             logger.error(f"Error reading buy date file: {e}")
 
+                    if already_bought_today:
+                        if rank <= 3:
+                            logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 오늘 이미 신규 매수를 진행한 이력이 있음")
+                        continue
+                        
                     if not already_bought_today:
                         if sent_alerts[code]["buy"] != candle_time:
                             # ── 1분봉 수급폭발 확인 (유일한 수급 조건) ──
@@ -1016,16 +1051,30 @@ def run_trading_bot():
                                         trend_3m_ok = True
                                         logger.info(f"✅ [TEMA60 기울기 만족] {name}({code}) 기울기: {slope:+.3f}% (기준: +0.05%)")
                             
-                            # 매수 조건: 1분봉 수급폭발 + 3분봉 정배열(TEMA3 > TEMA60) 및 기울기 상승
-                            buy_condition_met = sugeub_1m_ok and trend_3m_ok
-                            cond_type = "1분봉 수급폭발 + 3분봉 정배열(TEMA60 상승)"
+                            # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
+                            # 매수 4대 핵심 관문 (15분봉 정배열 + 가산점 + 3분봉 기울기 + 1분봉 수급)
+                            trend_15m_ok = stock_data.get("trend_ok", False)
+                            has_bonus = stock_data.get("theme_bonus", False) or (stock_data.get("flu_delta", 0.0) >= 1.0) or stock_data.get("sugeub_spike", False)
                             
+                            buy_condition_met = trend_15m_ok and has_bonus and trend_3m_ok and sugeub_1m_ok
+                            cond_type = "15m정배열 + 가산점 + 3m기울기 + 1m수급"
+                            
+                            if not buy_condition_met:
+                                if rank <= 3:
+                                    reasons = []
+                                    if not trend_15m_ok: reasons.append("15분봉 정배열 아님(역배열)")
+                                    if not has_bonus: reasons.append("가산점(테마/급등/수급) 없음")
+                                    if not trend_3m_ok: reasons.append("3분봉 TEMA60 기울기 0.05% 미만 또는 역배열")
+                                    if not sugeub_1m_ok: reasons.append("1분봉 수급 부족")
+                                    
+                                    logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류 사유: {', '.join(reasons)}")
+                                    
                             if buy_condition_met:
-                                # 수급 동시 확인! +1호가 매수 진행
+                                # 수급 동시 확인! +1호가 매수 진입
                                 from indicator import adjust_price_by_ticks
                                 buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
                                 
-                                logger.info(f"🚀 [수급 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
+                                logger.info(f"🚀 [최종 관문 통과 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
                                 
                                 sent_alerts[code]["buy"] = candle_time
                                 sent_alerts[code]["buy_reason"] = "sugeub_mtf"
