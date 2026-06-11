@@ -461,6 +461,61 @@ class KiwoomRealClient:
         """주식 종목의 5분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="5", last_n_days=last_n_days)
 
+    def get_tick_data(self, stock_code: str, tick_unit: str = "120", limit: int = 100) -> list:
+        """
+        주식 종목의 틱 차트 데이터를 조회합니다. (TR: opt10079 호환 REST API 엔드포인트 사용)
+        :param stock_code: 종목코드 (6자리)
+        :param tick_unit: 틱 단위 (기본: "120")
+        :param limit: 가져올 최대 틱 데이터 수 (기본 100)
+        :return: 과거순(오름차순) 정렬된 틱 데이터 딕셔너리 리스트
+        """
+        logger.info(f"Fetching {tick_unit}-tick data for stock code {stock_code}...")
+        try:
+            result = self.chart_api.stock_tick_chart_request_ka10079(
+                stk_cd=stock_code,
+                tic_scope=tick_unit,
+                upd_stkpc_tp="1"
+            )
+            
+            if not result:
+                return []
+                
+            raw_candles = result.get("stk_dt_pole_chart_qry", [])
+            if not raw_candles:
+                return []
+                
+            parsed_candles = []
+            for item in raw_candles[:limit]:
+                raw_time = item.get("dt", "").strip()
+                if len(raw_time) < 14:
+                    continue
+                # dt 형식: YYYYMMDDHHMMSS
+                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
+                
+                try:
+                    close_prc = abs(float(item.get("cur_prc", 0.0)))
+                    open_prc = abs(float(item.get("open_pric", 0.0)))
+                    high_prc = abs(float(item.get("high_pric", 0.0)))
+                    low_prc = abs(float(item.get("low_pric", 0.0)))
+                    volume = int(item.get("trde_qty", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
+                parsed_candles.append({
+                    "time": dt_str,
+                    "open": open_prc,
+                    "high": high_prc,
+                    "low": low_prc,
+                    "close": close_prc,
+                    "volume": volume
+                })
+                
+            parsed_candles.sort(key=lambda x: x["time"])
+            return parsed_candles
+        except Exception as e:
+            logger.error(f"Error fetching tick data for {stock_code}: {e}")
+            return []
+
 
     def get_daily_candles(self, stock_code: str, last_n_days: int = 200) -> list:
         """

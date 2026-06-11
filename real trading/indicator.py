@@ -483,12 +483,25 @@ def calculate_indicators_1min(candles):
     closes = [c['close'] for c in candles]
     tema3 = calculate_tema(closes, 3)
     tema60 = calculate_tema(closes, 60)
+    sma20 = calculate_sma(closes, 20)
     obv = calculate_obv(candles)
+    
+    # 1분봉 관문선 계산 (테마1, 테마2)
+    tema1 = calculate_tema(closes, 5)
+    tema2 = calculate_tema(closes, 20)
+    gate_line_val = None
     
     for i in range(n):
         candles[i]['tema3'] = tema3[i]
         candles[i]['tema60'] = tema60[i]
+        candles[i]['sma20'] = sma20[i]
         candles[i]['obv'] = obv[i]
+        
+        # 1분봉 관문선 고정 로직
+        if i > 0 and tema1[i] is not None and tema2[i] is not None and tema1[i-1] is not None and tema2[i-1] is not None:
+            if tema1[i-1] < tema2[i-1] and tema1[i] >= tema2[i]:
+                gate_line_val = tema1[i]
+        candles[i]['tema_gate_line'] = gate_line_val
         
     return candles
 
