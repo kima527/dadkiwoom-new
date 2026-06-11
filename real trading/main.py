@@ -48,6 +48,11 @@ BOT_STATE = {
 # ─────────────────────────────────────────────────────────
 PREV_FLU_RATES = {}
 
+# ─────────────────────────────────────────────────────────
+# 이전 스캔 주기의 체결강도 저장소 (장초반 턴어라운드 조건 3 추적용)
+# ─────────────────────────────────────────────────────────
+PREV_VP_STATE = {}
+
 # Filepath for watchlist Excel
 WATCHLIST_PATH = config.WATCHLIST_FILE
 
@@ -305,6 +310,45 @@ def run_trading_bot():
     BOT_STATE["today_realized_profit"] = client.get_today_realized_profit()
     BOT_STATE["today_filled_orders"] = client.get_today_filled_orders()
 
+    from data_manager import RealtimeDataManager
+    from kiwoom_websocket import KiwoomWebSocketRunner
+    from data_feeder import HybridDataFeeder
+
+    # --- Phase 0: 장 시작 전 로컬 데이터 매니저 및 웹소켓 초기화 ---
+    watchlist = load_watchlist(WATCHLIST_PATH)
+    DATA_MANAGERS = {}
+    WS_RUNNERS = {}
+    FEEDERS = {}
+    
+    for s in watchlist:
+        c = s["code"]
+        dm = RealtimeDataManager(stock_code=c, max_len=120)
+        DATA_MANAGERS[c] = dm
+        
+        try:
+            logger.info(f"[{c}] 초기 시드 데이터(1m, 120t) 다운로드 중...")
+            seed_1m = client.get_1min_candles(c, last_n_days=1)
+            time.sleep(0.2)
+            seed_120t = client.get_tick_data(c, "120", limit=100)
+            time.sleep(0.2)
+            
+            # API 반환 형태 변환 (dict로 안정화)
+            past_1m = [{'time': i['time'], 'date': i['date'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_1m]
+            past_120 = [{'time': i['time'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_120t]
+                
+            dm.seed_initial_data(past_120, past_1m)
+        except Exception as e:
+            logger.error(f"[{c}] 초기 시드 주입 실패: {e}")
+            
+        # 웹소켓 러너 세팅 (실패 시 차선책으로 하이브리드 피더 수동가동 가능)
+        ws = KiwoomWebSocketRunner(client.token_manager, dm)
+        WS_RUNNERS[c] = ws
+        feeder = HybridDataFeeder(client, dm, interval=1.0)
+        FEEDERS[c] = feeder
+        
+        # 1순위: 웹소켓 가동
+        ws.start()
+
     # 3. Main Polling Loop
     while True:
         # For mock testing, ignore market hours so user can test on weekends
@@ -356,6 +400,12 @@ def run_trading_bot():
         current_date = datetime.now(KST).strftime("%Y-%m-%d")
         if is_market_open() and current_date != last_liquidation_date:
             logger.info(f"New trading day detected ({current_date}). Initializing daily parameters (overnight positions maintained).")
+            
+            # 장 시작 시 전일의 체결강도 및 등락률 상태 일괄 초기화 (조건 꼬임 방지)
+            PREV_VP_STATE.clear()
+            PREV_FLU_RATES.clear()
+            logger.info("장초반 턴어라운드 및 급등 추적을 위한 체결강도/등락률 상태(PREV_VP_STATE, PREV_FLU_RATES)가 안전하게 초기화되었습니다.")
+            
             try:
                 with open(liquidation_file, "w") as f:
                     f.write(current_date)
@@ -406,20 +456,29 @@ def run_trading_bot():
             daily_candles = []
             tick_res = {}
             
-            # 키움 API 초당 요청 제한(Throttling) 방어 - 순차 조회 및 딜레이 적용
+            # ────────────────────────────────────────────────────────────
+            # Phase 1: 하이브리드/웹소켓 메모리 획득 (과부하 대폭 감소)
+            # ────────────────────────────────────────────────────────────
+            dm = DATA_MANAGERS.get(code)
+            
+            # 장기 분봉은 서버 폴링 유지되지만, 극심한 폴링은 완화됨
             candles_15m = client.get_15min_candles(code, 7)
-            time.sleep(0.2)
             candles_3m = client.get_3min_candles(code, 2)
-            time.sleep(0.2)
-            candles_1m = client.get_1min_candles(code, 1)
-            time.sleep(0.2)
             daily_candles = client.get_daily_candles(code, 200)
-            time.sleep(0.2)
+            
+            if dm and len(dm.get_1min_list()) > 0:
+                candles_1m = dm.get_1min_list()
+            else:
+                candles_1m = client.get_1min_candles(code, 1)
+                
             try:
+                # 체결강도 및 당일 종합 정보는 여전히 필요하므로 폴링
                 tick_res = client.stock_info_api.daily_stock_price_request_ka10003(stock_code=code)
             except Exception:
                 tick_res = {}
-            time.sleep(0.2)
+                
+            # Sleep은 유지하되 0.1초로 극단적으로 줄임 (웹소켓이 모든 틱을 감당하므로)
+            time.sleep(0.1)
                     
             # ────────────────────────────────────────────────────────────
             # Phase 2: 데이터 무결성 독립 검증 (Sanity Check)
@@ -613,10 +672,84 @@ def run_trading_bot():
             # ⑤ 체결강도 및 1억 이상 대량매수 건수 가산점 반영 (온디맨드 실시간 비교용)
             volume_power = 100.0
             block_buy_count = 0
+            is_early_cond1_ok = False
+            is_early_cond3_ok = False
+            
             try:
                 # 틱 체결 데이터 파싱 (미리 병렬 수집된 tick_res 사용)
-                from indicator import parse_tick_execution_data
+                from indicator import parse_tick_execution_data, calculate_bollinger_bands
                 volume_power, block_buy_count = parse_tick_execution_data(tick_res)
+                
+                # [신규] 체결강도 변동 추적 (조건 3 및 선제적 매도 감지용)
+                has_real_tick_data = (tick_res and "cntr_infr" in tick_res and len(tick_res["cntr_infr"]) > 0)
+                
+                prev_vp_for_rejection = volume_power
+                if has_real_tick_data:
+                    if code not in PREV_VP_STATE:
+                        PREV_VP_STATE[code] = {'prev_vp': volume_power, 'was_below_100': (volume_power < 100.0)}
+                    
+                    state = PREV_VP_STATE[code]
+                    prev_vp_for_rejection = state['prev_vp']
+                    
+                    if volume_power < 100.0:
+                        state['was_below_100'] = True
+                    
+                    if state['was_below_100']:
+                        if volume_power >= 100.0 or volume_power >= state['prev_vp'] * 1.2:
+                            is_early_cond3_ok = True
+                    
+                    # 상태 업데이트
+                    state['prev_vp'] = volume_power
+
+                # 장초반 초고속 턴어라운드 조건 확인 (08:00~08:10, 09:00~09:10)
+                t_hour = datetime.now(KST).hour
+                t_min = datetime.now(KST).minute
+                is_early_turnaround_window = (t_hour == 8 and 0 <= t_min <= 10) or (t_hour == 9 and 0 <= t_min <= 10)
+                
+                # 120틱 데이터는 장초반 윈도우이거나, 현재 보유 중인 종목일 경우(선제적 매도 감시) 수집
+                tick_upper_shadow = 0.0
+                tick_body = 0.0
+                is_price_rejection = False
+                
+                if is_early_turnaround_window or (code in held_dict):
+                    # 로컬 큐에서 120틱 데이터 즉시 획득 (딜레이 0초)
+                    dm = DATA_MANAGERS.get(code)
+                    if dm and len(dm.get_120tick_list()) >= 20:
+                        ticks_120 = dm.get_120tick_list()
+                    else:
+                        ticks_120 = client.get_tick_data(code, "120", limit=40)
+                        time.sleep(0.1)
+                        
+                    if ticks_120 and len(ticks_120) >= 20:
+                        # 120틱 윗꼬리 및 몸통 계산 (최근 틱 기준)
+                        curr_120_t = ticks_120[-1]
+                        tick_upper_shadow = curr_120_t['high'] - max(curr_120_t['close'], curr_120_t['open'])
+                        tick_body = abs(curr_120_t['close'] - curr_120_t['open'])
+                        
+                        # 윗꼬리가 몸통의 1.5배 초과 & 체결강도가 직전 대비 30% 이상 급감 시 돌파 실패 판정
+                        if (tick_upper_shadow > tick_body * 1.5) and (volume_power < prev_vp_for_rejection * 0.7):
+                            is_price_rejection = True
+                        
+                        # 장초반 조건 1 평가
+                        if is_early_turnaround_window:
+                            # 조건 1: 120틱 하락 멈춤 및 볼린저 밴드 하단 확인
+                            closes_120 = [t['close'] for t in ticks_120]
+                            bb_up, bb_mid, bb_low = calculate_bollinger_bands(closes_120, 20, 2.0)
+                            
+                            if bb_low[-2] is not None and bb_low[-1] is not None:
+                                curr_t = ticks_120[-1]
+                                prev_t = ticks_120[-2]
+                                
+                                # 직전 혹은 현재 틱이 하단선 근처(1% 이내)인지 확인
+                                near_lower_band = (curr_t['close'] <= bb_low[-1] * 1.01) or (prev_t['close'] <= bb_low[-2] * 1.01)
+                                
+                                # 음봉 확인 및 축소 (이전 캔들 대비 현재 캔들의 몸통이 작거나 양봉 전환)
+                                prev_body = prev_t['open'] - prev_t['close'] # 양수면 음봉
+                                curr_body = curr_t['open'] - curr_t['close']
+                                
+                                if near_lower_band and prev_body > 0:
+                                    if curr_body < prev_body: # 음봉이 작아지거나 양봉 전환
+                                        is_early_cond1_ok = True
                 
                 # 체결강도 가산점: (체결강도 - 100) * 2.0
                 score += (volume_power - 100.0) * 2.0
@@ -641,6 +774,9 @@ def run_trading_bot():
                 "sugeub_spike": latest.get("signal_sugeub_spike", False),
                 "volume_power": volume_power,
                 "block_buy_count": block_buy_count,
+                "is_early_cond1_ok": is_early_cond1_ok,
+                "is_early_cond3_ok": is_early_cond3_ok,
+                "is_price_rejection": is_price_rejection,
                 "candles_1m": candles_1m,
                 "candles_3m": candles_3m,
                 "daily_candles": daily_candles,
@@ -649,8 +785,8 @@ def run_trading_bot():
             # 다음 스캔 비교를 위해 현재 등락률 저장
             PREV_FLU_RATES[code] = flu_pct
             
-            # Delay to comply with API rate limits
-            time.sleep(0.5)
+            # 웹소켓 로컬 큐 사용으로 인해 폴링 부담이 크게 줄었으므로 딜레이 단축
+            time.sleep(0.1)
 
         # ────────────────────────────────────────────────────────────
         # [NEW] Phase 1B: Calculate Theme Momentum and apply Bonus
@@ -896,6 +1032,12 @@ def run_trading_bot():
                                 if tema3_1m < sma20_1m:
                                     should_sell = True
                                     sell_reason_str = "1분봉 TEMA3 < SMA20 데드크로스 (단기 고점 감지)"
+                                    
+                            # [신규] 방어망 3: 120틱 윗꼬리 돌파 실패 및 체결강도 급감 (선제적 매도)
+                            is_price_rejection = stock_data.get("is_price_rejection", False)
+                            if not should_sell and is_price_rejection:
+                                should_sell = True
+                                sell_reason_str = "120틱 윗꼬리 돌파 실패 및 체결강도 급감 (선제적 매도)"
                                 
                             # 상승 후 대처: L선 / K선은 추후 확장 로직(순환 상태)을 위해 남겨둠
 
@@ -906,6 +1048,7 @@ def run_trading_bot():
                                     order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
                                     if order_res and order_res.get("return_code") == 0:
                                         sent_alerts[code]["sold_qty"] = qty_to_sell
+                                        sent_alerts[code]["last_sell_time"] = time.time()  # 매도 시점 기록 (쿨타임용)
                                         pur_price = held_info["buy_price"]
                                         ret_rate = ((close_price - pur_price) / pur_price) * 100.0
                                         
@@ -936,6 +1079,12 @@ def run_trading_bot():
                         
                         else:
                             if is_rebuy_signal:
+                                # [신규] 재진입 전 60초 쿨타임(Cool-time) 필터 검사
+                                last_sell_time = sent_alerts[code].get("last_sell_time", 0)
+                                if time.time() - last_sell_time < 60:
+                                    logger.info(f"⏳ [쿨타임] {name}({code}) - 매도 후 60초가 경과하지 않아 재진입을 보류합니다.")
+                                    continue
+                                
                                 qty_to_buy = sent_alerts[code].get("sold_qty", 0)
                                 if qty_to_buy <= 0:
                                     # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 주문가능금액(예수금) 95% 풀매수
@@ -1054,20 +1203,37 @@ def run_trading_bot():
                             trend_15m_ok = stock_data.get("trend_ok", False)
                             has_bonus = stock_data.get("theme_bonus", False) or (stock_data.get("flu_delta", 0.0) >= 1.0)
                             
-                            buy_condition_met = trend_15m_ok and has_bonus and trend_3m_ok and sugeub_1m_ok
-                            cond_type = "WMA관문돌파 + 가산점 + 3m기울기 + 1m수급"
+                            t_hour_kst = datetime.now(KST).hour
+                            t_min_kst = datetime.now(KST).minute
+                            is_early_turnaround_window = (t_hour_kst == 8 and 0 <= t_min_kst <= 10) or (t_hour_kst == 9 and 0 <= t_min_kst <= 10)
+                            
+                            if is_early_turnaround_window:
+                                buy_condition_met = stock_data.get("is_early_cond1_ok", False) and stock_data.get("is_early_cond3_ok", False)
+                                cond_type = "장초반 초고속 턴어라운드 (조건1+조건3)"
+                            else:
+                                buy_condition_met = trend_15m_ok and has_bonus and trend_3m_ok and sugeub_1m_ok
+                                cond_type = "WMA관문돌파 + 가산점 + 3m기울기 + 1m수급"
                             
                             if not buy_condition_met:
                                 if rank <= 3:
                                     reasons = []
-                                    if not trend_15m_ok: reasons.append("WMA5/20 관문선 돌파 실패")
-                                    if not has_bonus: reasons.append("가산점(테마/급등/수급) 없음")
-                                    if not trend_3m_ok: reasons.append("3분봉 TEMA60 기울기 0.05% 미만 또는 역배열")
-                                    if not sugeub_1m_ok: reasons.append("1분봉 수급 부족")
+                                    if is_early_turnaround_window:
+                                        if not stock_data.get("is_early_cond1_ok"): reasons.append("조건1(120틱 하락멈춤) 미달")
+                                        if not stock_data.get("is_early_cond3_ok"): reasons.append("조건3(체결강도 복구) 미달")
+                                    else:
+                                        if not trend_15m_ok: reasons.append("WMA5/20 관문선 돌파 실패")
+                                        if not has_bonus: reasons.append("가산점(테마/급등/수급) 없음")
+                                        if not trend_3m_ok: reasons.append("3분봉 TEMA60 기울기 0.05% 미만 또는 역배열")
+                                        if not sugeub_1m_ok: reasons.append("1분봉 수급 부족")
                                     
                                     logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류 사유: {', '.join(reasons)}")
                                     
                             if buy_condition_met:
+                                # [신규] 매수 전 60초 쿨타임(Cool-time) 필터 검사
+                                last_sell_time = sent_alerts[code].get("last_sell_time", 0)
+                                if time.time() - last_sell_time < 60:
+                                    logger.info(f"⏳ [쿨타임] {name}({code}) - 매도 후 60초가 경과하지 않아 신규 진입을 보류합니다.")
+                                    continue
                                 # 수급 동시 확인! +1호가 매수 진입
                                 from indicator import adjust_price_by_ticks
                                 buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
