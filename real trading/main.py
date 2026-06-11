@@ -305,8 +305,8 @@ def run_trading_bot():
     while True:
         # For mock testing, ignore market hours so user can test on weekends
         if not config.KIWOOM_IS_MOCK and not is_market_open():
-            logger.info("Market is closed. Sleeping for 10 minutes...")
-            time.sleep(600)
+            logger.info("Market is closed. Sleeping for 1 minute...")
+            time.sleep(60)
             continue
             
         logger.info("Polling market data...")
@@ -552,8 +552,9 @@ def run_trading_bot():
             slope_pct = 0.0
             
             if t3_now is not None and t60_now is not None:
-                # ① TEMA3 > TEMA60 (정배열 상승세) -> +100점
-                if t3_now > t60_now:
+                # ① 15분봉 정배열 대신 WMA 관문선 돌파를 1관문(trend_ok)으로 사용
+                wma_gate_line = latest.get("wma_gate_line")
+                if wma_gate_line is not None and latest["close"] >= wma_gate_line:
                     score += 100.0
                     trend_ok = True
                 
@@ -757,9 +758,9 @@ def run_trading_bot():
             t_min  = now_kst.minute
 
             # ① 동적 매수 윈도우 (08:00 ~ 12:00)
-            is_buy_window = (8 <= t_hour < 12)
+            is_buy_window = True # (8 <= t_hour < 12) 사용자 요청으로 시간제한 해제
             # ② 재매수 윈도우 (10:00 ~ 15:20)
-            is_rebuy_window = (t_hour >= 10 and (t_hour < 15 or (t_hour == 15 and t_min < 20)))
+            is_rebuy_window = True # (t_hour >= 10 and (t_hour < 15 or (t_hour == 15 and t_min < 20))) 사용자 요청으로 해제
             # ③ 10:00 이후 : L선 하향 이탈 추가 매도 활성화
             is_post_ten     = (t_hour >= 10)
 
@@ -859,7 +860,8 @@ def run_trading_bot():
                         prev_tema60_3m = prev_3m.get("tema60")
                         
                         is_3m_dead_cross = False
-                        is_3m_gold_cross = False
+                        is_rebuy_signal = False
+                        rebuy_reason_str = ""
                         
                         # 3분봉 TEMA3/TEMA60 값 로깅
                         logger.info(f"📊 [3분봉 지표] {name}({code}) | 현재: TEMA3={tema3_3m:,.0f}, TEMA60={tema60_3m:,.0f} | 이전: TEMA3={prev_tema3_3m:,.0f}, TEMA60={prev_tema60_3m:,.0f}" if all(v is not None for v in [tema3_3m, tema60_3m, prev_tema3_3m, prev_tema60_3m]) else "")
@@ -888,15 +890,34 @@ def run_trading_bot():
                                 from indicator import check_short_term_sugeub
                                 sugeub_1m_ok = False
                                 if candles_1m:
-                                    sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
+                                    sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1, threshold=1.5)
                                 
                                 is_1m_ok = sugeub_1m_ok
                                 
                                 if is_vol_surge and is_obv_rising and is_1m_ok:
-                                    is_3m_gold_cross = True
+                                    is_rebuy_signal = True
+                                    rebuy_reason_str = "3분봉 골든크로스"
                                     logger.info(f"🟢 [3분봉 재매수 확정] {name}({code}) TEMA3>=TEMA60, 거래량급증({vol_3m}/{vol_avg_3:.0f}), OBV상승, 1분봉수급OK")
                                 else:
                                     logger.info(f"⏳ [3분봉 재매수 보류] {name}({code}) 크로스발생이나 필터미달(vol:{is_vol_surge}, obv:{is_obv_rising}, 1m:{is_1m_ok})")
+                                
+                        # ── [신규 추가] 1분봉 L선, K선 동시 돌파 (쌍끌이 돌파) 확인 ──
+                        latest_15m = stock_data["latest"]
+                        k_line = latest_15m.get("K")
+                        l_line = latest_15m.get("L")
+                        
+                        if not is_rebuy_signal and candles_1m and len(candles_1m) >= 2 and k_line is not None and l_line is not None:
+                            curr_1m_close = candles_1m[-1]["close"]
+                            prev_1m_close = candles_1m[-2]["close"]
+                            
+                            # 1분봉 현재가가 K선과 L선 모두보다 높고, 직전 1분봉 종가는 둘 중 하나라도 아래에 있었던 경우 (방금 돌파)
+                            if curr_1m_close > k_line and curr_1m_close > l_line:
+                                if prev_1m_close <= k_line or prev_1m_close <= l_line:
+                                    from indicator import check_short_term_sugeub
+                                    if check_short_term_sugeub(candles_1m, 1, threshold=1.5):
+                                        is_rebuy_signal = True
+                                        rebuy_reason_str = "1분봉 쌍끌이 돌파(K선+L선)"
+                                        logger.info(f"🚀 [1분봉 쌍끌이 돌파!] {name}({code}) K선({k_line:,.0f}) 및 L선({l_line:,.0f}) 동시 돌파 + 수급 150% 폭발!")
                                 
                         # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
                         # 1) 보유 중일 때 -> 3m 매도 방어망 작동 (최후의 보루, L선 이탈, 변곡 쌍봉 감지, 데드크로스)
@@ -980,7 +1001,7 @@ def run_trading_bot():
                                         _add_alert("sell", f"{sell_reason_str} {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
                         
                         else:
-                            if is_3m_gold_cross:
+                            if is_rebuy_signal:
                                 qty_to_buy = sent_alerts[code].get("sold_qty", 0)
                                 if qty_to_buy <= 0:
                                     # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 주문가능금액(예수금) 95% 풀매수
@@ -1004,26 +1025,26 @@ def run_trading_bot():
                                         order_res = client.place_buy_order(code, qty_to_buy, price=buy_price, order_type="0")
                                         if order_res and order_res.get("return_code") == 0:
                                             msg = (
-                                                f"🔄 <b>[재매수 - 3분봉 골든크로스!]</b>\n"
+                                                f"🔄 <b>[재매수 - {rebuy_reason_str}!]</b>\n"
                                                 f"종목: {name} ({code})\n"
                                                 f"매수단가: {buy_price:,.0f}원 (지정가 +1호가)\n"
                                                 f"매수수량: {qty_to_buy}주\n"
                                                 f"시간: {candle_time}\n"
                                             )
                                             notifier.send_all(msg)
-                                            _add_alert("buy", f"3m 골든크로스 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +1호가)", code, name)
+                                            _add_alert("buy", f"{rebuy_reason_str} 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +1호가)", code, name)
                                             sent_alerts[code]["sold_qty"] = 0
                                             sent_alerts[code]["buy_reason"] = "dynamic"
                                         else:
                                             err_msg = order_res.get("return_msg") if order_res else "응답 없음"
                                             msg = (
-                                                f"❌ <b>[재매수 실패 - 3분봉 골든크로스]</b>\n"
+                                                f"❌ <b>[재매수 실패 - {rebuy_reason_str}]</b>\n"
                                                 f"종목: {name} ({code})\n"
                                                 f"에러내용: {err_msg}"
                                             )
                                             # 실패 알림 제거
                                             # notifier.send_all(msg)
-                                            _add_alert("error", f"3m 골든크로스 재매수 실패: {err_msg}", code, name)
+                                            _add_alert("error", f"{rebuy_reason_str} 재매수 실패: {err_msg}", code, name)
                         continue
                     else:
                         logger.warning(f"Failed to fetch 1-min candles for {name} ({code}) in 1m tracking mode. Falling back to 15m logic.")
@@ -1035,11 +1056,11 @@ def run_trading_bot():
                         logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 신규 매수 시간(08:00~12:00)이 아님")
                         
                 if is_buy_window and not is_held:
-                    # 계좌에 이미 보유 중인 종목이 있다면 신규 매수 차단 (1종목 몰빵 규칙)
-                    if len(holdings) >= 1:
-                        if rank <= 3:
-                            logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 이미 보유 중인 종목이 있음 (1종목 몰빵 규칙)")
-                        continue
+                    # 계좌에 이미 보유 중인 종목이 있다면 신규 매수 차단 (1종목 몰빵 규칙) 해제
+                    # if len(holdings) >= 1:
+                    #     if rank <= 3:
+                    #         logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 이미 보유 중인 종목이 있음 (1종목 몰빵 규칙)")
+                    #     continue
 
                     # 오늘 이미 다른 종목 신규 매수를 완료했는지 체크
                     already_bought_today = False
@@ -1055,11 +1076,11 @@ def run_trading_bot():
 
                     if already_bought_today:
                         if rank <= 3:
-                            logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 오늘 이미 신규 매수를 진행한 이력이 있음")
-                        continue
+                            logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 참고: 오늘 이미 신규 매수를 진행한 이력이 있으나 제한하지 않고 다중 매수 진행")
+                        # continue
                         
-                    if not already_bought_today:
-                        if sent_alerts[code]["buy"] != candle_time:
+                    # if not already_bought_today:
+                    if sent_alerts[code]["buy"] != candle_time:
                             # ── 1분봉 수급폭발 확인 (유일한 수급 조건) ──
                             from indicator import check_short_term_sugeub
                             
@@ -1097,12 +1118,12 @@ def run_trading_bot():
                             has_bonus = stock_data.get("theme_bonus", False) or (stock_data.get("flu_delta", 0.0) >= 1.0)
                             
                             buy_condition_met = trend_15m_ok and has_bonus and trend_3m_ok and sugeub_1m_ok
-                            cond_type = "15m정배열 + 가산점 + 3m기울기 + 1m수급"
+                            cond_type = "WMA관문돌파 + 가산점 + 3m기울기 + 1m수급"
                             
                             if not buy_condition_met:
                                 if rank <= 3:
                                     reasons = []
-                                    if not trend_15m_ok: reasons.append("15분봉 정배열 아님(역배열)")
+                                    if not trend_15m_ok: reasons.append("WMA5/20 관문선 돌파 실패")
                                     if not has_bonus: reasons.append("가산점(테마/급등/수급) 없음")
                                     if not trend_3m_ok: reasons.append("3분봉 TEMA60 기울기 0.05% 미만 또는 역배열")
                                     if not sugeub_1m_ok: reasons.append("1분봉 수급 부족")

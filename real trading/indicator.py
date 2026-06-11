@@ -204,13 +204,20 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
                 last_whale = c['sma5']
         c['whale_line'] = last_whale
 
-    # 4. WMAs
+    # 4. WMAs & WMA Gate Line (ValueWhen(1, CrossUp(WMA5, WMA20), WMA5))
     wma5 = calculate_wma(closes, 5)
     wma20 = calculate_wma(closes, 20)
     
+    last_wma_gate = None
     for i in range(n):
         candles[i]['wma5'] = wma5[i]
         candles[i]['wma20'] = wma20[i]
+        
+        if i > 0 and wma5[i] is not None and wma20[i] is not None and wma5[i-1] is not None and wma20[i-1] is not None:
+            if wma5[i-1] < wma20[i-1] and wma5[i] >= wma20[i]:
+                last_wma_gate = wma5[i]
+                
+        candles[i]['wma_gate_line'] = last_wma_gate
 
     # 4-b. EMA40 (지수이동평균 40스 접선)
     ema40 = calculate_ema(closes, 40)
@@ -269,7 +276,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         try:
             t_part = c["time"].split(" ")[1]
             h = int(t_part.split(":")[0])
-            is_buy_window = (8 <= h < 12)
+            is_buy_window = True # (8 <= h < 12) 사용자 요청으로 시간제한 해제
         except Exception:
             is_buy_window = True
 
@@ -407,7 +414,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         # Overwrite candle K-line with trade-specific K-line for orders & display
         c['K'] = trade_K
         # Map to dynamic buy signal for main.py integration
-        c['signal_buy_dynamic'] = c['signal_buy']
+        c['signal_buy_dynamic'] = c['signal_buy'] or c.get('signal_buy_bb_rebound', False)
         
         # Macro indicators and filters
         c['sma5_gt_tema60'] = (c['sma5'] > c['tema60']) if (c['sma5'] is not None and c['tema60'] is not None) else False
@@ -578,14 +585,14 @@ if __name__ == "__main__":
         ))
 
 
-def check_short_term_sugeub(candles, timeframe_minutes):
+def check_short_term_sugeub(candles, timeframe_minutes, threshold=2.0):
     """
     Checks if the latest candle in 1-min or 5-min intervals represents a volume (sugeub) spike.
     timeframe_minutes must be either 1 or 5.
     
     Conditions:
       1. Bullish candle (close > open)
-      2. Current volume >= 2.0x the average volume of the previous 2 candles.
+      2. Current volume >= threshold * the average volume of the previous 2 candles.
     """
     if not candles or len(candles) < 3:
         return False
@@ -601,12 +608,12 @@ def check_short_term_sugeub(candles, timeframe_minutes):
     if c <= o:
         return False
         
-    # 2. Volume spike check (>= 2.0x average of last 2 candles)
+    # 2. Volume spike check (>= threshold * average of last 2 candles)
     prev_vol_1 = float(candles[-2].get('volume', 0))
     prev_vol_2 = float(candles[-3].get('volume', 0))
     avg_prev_vol = (prev_vol_1 + prev_vol_2) / 2.0
     
-    if avg_prev_vol <= 0 or v < (avg_prev_vol * 2.0):
+    if avg_prev_vol <= 0 or v < (avg_prev_vol * threshold):
         return False
         
     return True
