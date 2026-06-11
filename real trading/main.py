@@ -1395,6 +1395,10 @@ def run_single_stock_trading_advanced():
                 qty = my_stock["quantity"]
                 
                 # ── 매도 로직 (초단기 120틱 데이터 기반 선제 대응) ──
+                # 0. 시간 청산 (오후 7시 ~ 8시 사이 무조건 전량 매도)
+                now_kst = datetime.now(kst)
+                is_time_liquidation = (now_kst.hour == 19)
+                
                 # 1. 120틱 기준 TEMA 3 이평선이 SMA 20 이평선을 데드크로스 할 때 전량 매도
                 tema3_tick = candles_120tick[-1].get("tema3")
                 sma20_tick = candles_120tick[-1].get("sma20")
@@ -1409,13 +1413,27 @@ def run_single_stock_trading_advanced():
                 L_line_tick = candles_120tick[-1].get("L")
                 is_l_line_break = (L_line_tick is not None and current_price < L_line_tick)
                 
-                if is_dead_cross or is_l_line_break:
+                # 3. 고점 낮아짐(Lower High) 반등 저항 매도
+                K_line_tick = candles_120tick[-1].get("K")
+                is_lower_high_rebound = False
+                if K_line_tick is not None and L_line_tick is not None:
+                    # 현재 K선이 이전 변곡점 K선(L선)보다 낮을 때 (고점이 낮아졌을 때)
+                    if K_line_tick < L_line_tick:
+                        # 주가가 위로 반등해서 K선이나 L선에 도달(터치)하면 저항으로 보고 매도
+                        if current_price >= K_line_tick or current_price >= L_line_tick:
+                            is_lower_high_rebound = True
+                
+                if is_time_liquidation or is_dead_cross or is_l_line_break or is_lower_high_rebound:
                     from indicator import adjust_price_by_ticks
                     sell_price = get_ext_adjusted_price(client, code, current_price, "sell", default_ticks=0)
                     
                     res = client.place_sell_order(code, qty, sell_price, "00")
                     if res and res.get("return_code") == 0:
-                        reason = "📉TEMA3-SMA20 데드크로스" if is_dead_cross else "⚠️L선 하향이탈"
+                        if is_time_liquidation: reason = "⏰19시 시간청산"
+                        elif is_lower_high_rebound: reason = "📈고점낮아짐(K<L) 반등저항"
+                        elif is_dead_cross: reason = "📉TEMA3-SMA20 데드크로스"
+                        else: reason = "⚠️L선 하향이탈"
+                        
                         profit_rate = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
                         msg = f"💰 [매도] 청산 완료 ({reason})\n종목: {name} | 수량: {qty:,}주 | 수익률: {profit_rate:.2f}%"
                         notifier.send_all(msg)
