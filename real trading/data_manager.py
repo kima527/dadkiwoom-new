@@ -1,4 +1,4 @@
-import pandas as pd
+
 
 # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
 # ── RealtimeDataManager (과부하 0% 실시간 캔들 조립 공장) ──

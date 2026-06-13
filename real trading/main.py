@@ -19,6 +19,7 @@ import openpyxl
 import config
 from kiwoom_client import KiwoomClient
 from indicator import calculate_indicators_pure
+from strategy import evaluate_trend_buy, evaluate_rebuy, evaluate_inflection_sell
 from notifier import Notifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -264,7 +265,7 @@ def run_trading_bot():
             ws = wb.active
             ws.title = "My Pick"
             ws.append(["종목코드", "종목명", "보유수량", "매입단가", "현재가"])
-            ws.append(["005930", "삼성전자", "", "", ""])
+            ws.append(["066570", "LG전자", "", "", ""])
             ws.append(["000660", "SK하이닉스", "", "", ""])
             ws.append(["086960", "MDS테크", "", "", ""])
             wb.save(WATCHLIST_PATH)
@@ -463,6 +464,7 @@ def run_trading_bot():
             
             # 장기 분봉은 서버 폴링 유지되지만, 극심한 폴링은 완화됨
             candles_15m = client.get_15min_candles(code, 7)
+            candles_5m = client.get_5min_candles(code, 2)
             candles_3m = client.get_3min_candles(code, 2)
             daily_candles = client.get_daily_candles(code, 200)
             
@@ -488,7 +490,7 @@ def run_trading_bot():
                 time.sleep(0.5)
                 continue
                 
-            if not candles_3m or not candles_1m or not daily_candles:
+            if not candles_5m or not candles_3m or not candles_1m or not daily_candles:
                 logger.warning(f"Missing auxiliary candle data for {name} ({code}). Skipping to prevent wrong analysis.")
                 time.sleep(0.5)
                 continue
@@ -547,6 +549,14 @@ def run_trading_bot():
                 tema_period1=config.TEMA_PERIOD_SHORT,
                 tema_period2=config.TEMA_PERIOD_LONG
             )
+            
+            if candles_5m and len(candles_5m) > 0:
+                calculate_indicators_pure(
+                    candles_5m,
+                    use_compressed_peak=True,
+                    tema_period1=config.TEMA_PERIOD_SHORT,
+                    tema_period2=config.TEMA_PERIOD_LONG
+                )
             
             # Fetch and calculate daily/weekly conditions
             daily_bonus_ok = False
@@ -777,6 +787,7 @@ def run_trading_bot():
                 "is_early_cond1_ok": is_early_cond1_ok,
                 "is_early_cond3_ok": is_early_cond3_ok,
                 "is_price_rejection": is_price_rejection,
+                "candles_15m": candles_15m,
                 "candles_1m": candles_1m,
                 "candles_3m": candles_3m,
                 "daily_candles": daily_candles,
@@ -911,524 +922,124 @@ def run_trading_bot():
             is_held = code in held_dict
             held_info = held_dict.get(code)
 
-            if "tracking_mode" not in sent_alerts[code]:
-                if is_held or code == "005930":
-                    sent_alerts[code]["tracking_mode"] = "3m"
-                else:
-                    sent_alerts[code]["tracking_mode"] = "15m"
-                
-            if sent_alerts[code]["tracking_mode"] == "done_today":
-                if sent_alerts[code].get("done_date") != current_date:
-                    sent_alerts[code]["tracking_mode"] = "15m"
+            tracking_mode = "15m"
+            sent_alerts[code]["tracking_mode"] = tracking_mode
+            
+            latest_15m = stock_data.get("latest", {})
+            candles_15m = stock_data.get("candles_15m", [])
+            
+            # ── 1. 매수 조건 확인 (15분봉 전용) ──
+            if is_buy_window and not is_held:
+                if sent_alerts[code].get("buy") != candle_time:
+                    buy_condition_met = False
+                    cond_type = ""
                     
-            tracking_mode = sent_alerts[code]["tracking_mode"]
-
-            if tracking_mode == "3m":
-                # ─── 3분봉 추적매매 모드 ───
-                # A) 15분봉 TEMA3/TEMA60 데드크로스 발생 시 우선순위로 즉시 전량 매도 및 15m 모드 복귀
-                if latest.get("signal_sell_tema3_tema60_dead") and code != "005930":
-                    logger.info(f"🚨 [15m TEMA3 데드크로스 감지] 3분봉 매매 해제 및 전량 매도 처리: {name} ({code})")
-                    sent_alerts[code]["tracking_mode"] = "15m"
-                    sent_alerts[code]["sold_qty"] = 0
-                    
-                    if is_held and held_info:
-                        qty_to_sell = held_info["quantity"]
-                        from indicator import adjust_price_by_ticks
-                        sell_price = get_ext_adjusted_price(client, code, close_price, "sell", -2)
-                        order_res = client.place_sell_order(code, qty_to_sell, price=sell_price, order_type="0")
-                        if order_res and order_res.get("return_code") == 0:
-                            pur_price = held_info["buy_price"]
-                            ret_rate = ((sell_price - pur_price) / pur_price) * 100.0
-                            trade_info = {
-                                "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                                "code": code,
-                                "name": name,
-                                "buy_price": pur_price,
-                                "sell_price": sell_price,
-                                "return_pct": round(ret_rate, 2),
-                                "reason": "15m TEMA3-TEMA60 Dead Cross"
-                            }
-                            BOT_STATE["completed_trades"].insert(0, trade_info)
-                            if len(BOT_STATE["completed_trades"]) > 50:
-                                BOT_STATE["completed_trades"].pop()
-                            msg = (
-                                f"📉 <b>[매도 체결 - 15m TEMA3-TEMA60 Dead Cross!]</b>\n"
-                                f"종목: {name} ({code})\n"
-                                f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
-                                f"매수단가: {pur_price:,.0f}원\n"
-                                f"매도수량: {qty_to_sell}주\n"
-                                f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
-                                f"시간: {candle_time}\n"
-                            )
-                            notifier.send_all(msg)
-                            _add_alert("sell", f"15m TEMA3-TEMA60 Dead Cross 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 (지정가 -2호가)", code, name)
-                    continue
-
-                # B) 15m TEMA3 <= TEMA60 일 경우 3m 모드 비활성화 (15m 모드로 복귀 및 15m 매도 로직 적용)
-                elif not latest.get("tema3_gt_tema60") and code != "005930":
-                    logger.info(f"ℹ️ [15m TEMA3 <= TEMA60 감지] 3분봉 매매 모드 해제: {name} ({code})")
-                    sent_alerts[code]["tracking_mode"] = "15m"
-                    sent_alerts[code]["sold_qty"] = 0
-                    tracking_mode = "15m"
-                
-                else:
-                    # 15m TEMA3 > TEMA60 인 정상 3m 추적 상태
-                    # 3분봉 데이터 및 지표 계산
-                    logger.info(f"🔍 [3분봉 매매 모드 동작 중] {name}({code}) 3분봉 데이터를 기반으로 TEMA3 데드크로스 및 기준선 이탈 여부 실시간 감시 중...")
-                    candles_3m = stock_data.get("candles_3m")
-                    if candles_3m:
-                        from indicator import calculate_indicators_3min, calculate_indicators_1min
-                        calculate_indicators_3min(candles_3m)
-                        latest_3m = candles_3m[-1]
-                        prev_3m = candles_3m[-2] if len(candles_3m) > 1 else latest_3m
+                    if len(candles_15m) >= 2:
+                        curr_15m = candles_15m[-1]
+                        close_price_15m = curr_15m.get("close")
                         
-                        candles_1m = stock_data.get("candles_1m", [])
-                        if candles_1m:
-                            calculate_indicators_1min(candles_1m)
-                            latest_1m = candles_1m[-1]
-                            prev_1m = candles_1m[-2] if len(candles_1m) > 1 else latest_1m
+                        # 추세 매수 로직 평가 (15m 골든크로스+관문선지지+거래량)
+                        is_trend_buy, trend_reason = evaluate_trend_buy(curr_15m)
+                        
+                        # 재매수 로직 평가 (15m 볼린저하단 반등)
+                        is_rebuy, rebuy_reason = evaluate_rebuy(curr_15m, code, BOT_STATE.get("completed_trades", []), current_date)
+                        
+                        # Evaluate final entry
+                        if is_trend_buy:
+                            buy_condition_met = True
+                            cond_type = trend_reason
+                        elif is_rebuy:
+                            buy_condition_met = True
+                            cond_type = rebuy_reason
+                            
+                    if buy_condition_met:
+                        last_sell_time = sent_alerts[code].get("last_sell_time", 0)
+                        if time.time() - last_sell_time < 60:
+                            logger.info(f"⏳ [쿨타임] {name}({code}) - 매도 후 60초가 경과하지 않아 신규 진입을 보류합니다.")
                         else:
-                            latest_1m = {}
-                            prev_1m = {}
-                        
-                        
-                        
-                        is_rebuy_signal = False
-                        rebuy_reason_str = ""
-                        
-                        gate_line_3m = latest_3m.get("tema_gate_line")
-                        bb_lower_3m = latest_3m.get("bb20_lower")
-                        close_3m = latest_3m.get("close")
-                        
-                        gate_line_1m = latest_1m.get("tema_gate_line")
-                        close_1m = latest_1m.get("close")
-                        
-                        if gate_line_3m and bb_lower_3m and gate_line_1m:
-                            # 매수 조건: 3분봉 관문선 지지 + 3분봉 볼린저 하단 눌림 + 1분봉 관문선 지지
-                            is_3m_support = close_3m > gate_line_3m
-                            is_bb_touched = close_3m <= bb_lower_3m
-                            is_1m_support = close_1m >= gate_line_1m
+                            from indicator import adjust_price_by_ticks
+                            buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
+                            logger.info(f"🚀 [최종 관문 통과 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
                             
-                            if is_3m_support and is_bb_touched and is_1m_support:
-                                is_rebuy_signal = True
-                                rebuy_reason_str = "관문선 지지 + 볼린저 하단 눌림"
-                                logger.info(f"🟢 [매수 타점 포착] {name}({code}) 3분/1분 관문선 안착 및 3분봉 볼린저 하단 도달!")
-                                
-                        # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
-                        # 1) 보유 중일 때 -> 3m 매도 방어망 작동 (최후의 보루, L선 이탈, 변곡 쌍봉 감지, 데드크로스)
-                        if is_held:
-                            sell_reason_str = ""
-                            should_sell = False
+                            sent_alerts[code]["buy"] = candle_time
+                            sent_alerts[code]["buy_reason"] = cond_type
                             
-                            # 방어망 1: 1분봉 관문선 확정 이탈 (즉각 손절/초기 방어)
-                            if gate_line_1m and close_price < gate_line_1m:
-                                should_sell = True
-                                sell_reason_str = "1분봉 관문선 하방 이탈 (즉각 손절)"
-                                
-                            # 방어망 2: 1분봉 TEMA3 < SMA20 데드크로스 (상단 타기 종료 및 단기 고점 감지)
-                            tema3_1m = latest_1m.get("tema3")
-                            sma20_1m = latest_1m.get("sma20")
-                            if not should_sell and tema3_1m is not None and sma20_1m is not None:
-                                if tema3_1m < sma20_1m:
-                                    should_sell = True
-                                    sell_reason_str = "1분봉 TEMA3 < SMA20 데드크로스 (단기 고점 감지)"
-                                    
-                            # [신규] 방어망 3: 120틱 윗꼬리 돌파 실패 및 체결강도 급감 (선제적 매도)
-                            is_price_rejection = stock_data.get("is_price_rejection", False)
-                            if not should_sell and is_price_rejection:
-                                should_sell = True
-                                sell_reason_str = "120틱 윗꼬리 돌파 실패 및 체결강도 급감 (선제적 매도)"
-                                
-                            # 상승 후 대처: L선 / K선은 추후 확장 로직(순환 상태)을 위해 남겨둠
-
-                            if should_sell:
-                                if sent_alerts[code]["sell"] != candle_time:
-                                    sent_alerts[code]["sell"] = candle_time
-                                    qty_to_sell = held_info["quantity"]
-                                    order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
-                                    if order_res and order_res.get("return_code") == 0:
-                                        sent_alerts[code]["sold_qty"] = qty_to_sell
-                                        sent_alerts[code]["last_sell_time"] = time.time()  # 매도 시점 기록 (쿨타임용)
-                                        pur_price = held_info["buy_price"]
-                                        ret_rate = ((close_price - pur_price) / pur_price) * 100.0
-                                        
-                                        trade_info = {
-                                            "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                                            "code": code,
-                                            "name": name,
-                                            "buy_price": pur_price,
-                                            "sell_price": close_price,
-                                            "return_pct": round(ret_rate, 2),
-                                            "reason": sell_reason_str
-                                        }
-                                        BOT_STATE["completed_trades"].insert(0, trade_info)
-                                        if len(BOT_STATE["completed_trades"]) > 50:
-                                            BOT_STATE["completed_trades"].pop()
-                                        
-                                        msg = (
-                                            f"📉 <b>[매도 체결 - {sell_reason_str}!]</b>\n"
-                                            f"종목: {name} ({code})\n"
-                                            f"매도단가: {close_price:,.0f}원\n"
-                                            f"매수단가: {pur_price:,.0f}원\n"
-                                            f"매도수량: {qty_to_sell}주\n"
-                                            f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
-                                            f"시간: {candle_time}\n"
-                                        )
-                                        notifier.send_all(msg)
-                                        _add_alert("sell", f"{sell_reason_str} {qty_to_sell}주 @ {close_price:,.0f}원", code, name)
-                        
-                        else:
-                            if is_rebuy_signal:
-                                # [신규] 재진입 전 60초 쿨타임(Cool-time) 필터 검사
-                                last_sell_time = sent_alerts[code].get("last_sell_time", 0)
-                                if time.time() - last_sell_time < 60:
-                                    logger.info(f"⏳ [쿨타임] {name}({code}) - 매도 후 60초가 경과하지 않아 재진입을 보류합니다.")
-                                    continue
-                                
-                                qty_to_buy = sent_alerts[code].get("sold_qty", 0)
-                                if qty_to_buy <= 0:
-                                    # 봇 재시작 등으로 sold_qty 정보가 유실되었거나 수동 매도된 경우 주문가능금액(예수금) 95% 풀매수
-                                    budget = cash * 0.95
-                                    qty_to_buy = int(budget // close_price)
-                                if getattr(config, 'TEST_MODE_1_SHARE', False):
-                                    qty_to_buy = 1
-                                        
-                                if qty_to_buy > 0:
-                                    if sent_alerts[code]["buy"] != candle_time:
-                                        # 관문선과 기준선 이격 2% 미만 시 관망 (당일 종료 아님)
-                                        latest_15m = stock_data["latest"]
-                                        gate_line = latest_15m.get("tema_gate_line")
-                                        l_line = latest_15m.get("L")
-                                        if gate_line is not None and l_line is not None and l_line > 0:
-                                            gap_pct = abs(gate_line - l_line) / l_line * 100.0
-                                            if gap_pct < 2.0:
-                                                _add_alert("info", f"3m 재매수 관망 (이격 {gap_pct:.2f}% < 2%)", code, name)
-                                                continue
-
-                                        sent_alerts[code]["buy"] = candle_time
-                                        from indicator import adjust_price_by_ticks
-                                        buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
-                                        order_res = client.place_buy_order(code, qty_to_buy, price=buy_price, order_type="0")
-                                        if order_res and order_res.get("return_code") == 0:
-                                            msg = (
-                                                f"🔄 <b>[재매수 - {rebuy_reason_str}!]</b>\n"
-                                                f"종목: {name} ({code})\n"
-                                                f"매수단가: {buy_price:,.0f}원 (지정가 +1호가)\n"
-                                                f"매수수량: {qty_to_buy}주\n"
-                                                f"시간: {candle_time}\n"
-                                            )
-                                            notifier.send_all(msg)
-                                            _add_alert("buy", f"{rebuy_reason_str} 재매수 {qty_to_buy}주 @ {buy_price:,.0f}원 (지정가 +1호가)", code, name)
-                                            sent_alerts[code]["sold_qty"] = 0
-                                            sent_alerts[code]["buy_reason"] = "dynamic"
-                                        else:
-                                            err_msg = order_res.get("return_msg") if order_res else "응답 없음"
-                                            msg = (
-                                                f"❌ <b>[재매수 실패 - {rebuy_reason_str}]</b>\n"
-                                                f"종목: {name} ({code})\n"
-                                                f"에러내용: {err_msg}"
-                                            )
-                                            # 실패 알림 제거
-                                            # notifier.send_all(msg)
-                                            _add_alert("error", f"{rebuy_reason_str} 재매수 실패: {err_msg}", code, name)
-                        continue
-                    else:
-                        logger.warning(f"Failed to fetch 1-min candles for {name} ({code}) in 1m tracking mode. Falling back to 15m logic.")
-
-            if tracking_mode == "15m":
-                # ── ① 매수 로직 (15분봉 정배열 + 1분봉 수급폭발 진입) ─────
-                if not is_buy_window and not is_held:
-                    if rank <= 3:
-                        logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 신규 매수 시간(08:00~12:00)이 아님")
-                        
-                if is_buy_window and not is_held:
-                    # 계좌에 이미 보유 중인 종목이 있다면 신규 매수 차단 (1종목 몰빵 규칙) 해제
-                    # if len(holdings) >= 1:
-                    #     if rank <= 3:
-                    #         logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류: 이미 보유 중인 종목이 있음 (1종목 몰빵 규칙)")
-                    #     continue
-
-                    # 오늘 이미 다른 종목 신규 매수를 완료했는지 체크
-                    already_bought_today = False
-                    buy_date_file = "last_buy_date.txt"
-                    if os.path.exists(buy_date_file):
-                        try:
-                            with open(buy_date_file, "r") as f:
-                                last_buy_date = f.read().strip()
-                            if last_buy_date == current_date:
-                                already_bought_today = True
-                        except Exception as e:
-                            logger.error(f"Error reading buy date file: {e}")
-
-                    if already_bought_today:
-                        if rank <= 3:
-                            logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 참고: 오늘 이미 신규 매수를 진행한 이력이 있으나 제한하지 않고 다중 매수 진행")
-                        # continue
-                        
-                    # if not already_bought_today:
-                    if sent_alerts[code]["buy"] != candle_time:
-                            # ── 1분봉 수급폭발 확인 (유일한 수급 조건) ──
-                            from indicator import check_short_term_sugeub
+                            budget = cash * 0.95
+                            qty = int(budget // buy_price)
+                            if getattr(config, 'TEST_MODE_1_SHARE', False):
+                                qty = 1
                             
-                            # 1분봉 수급 확인
-                            sugeub_1m_ok = False
-                            candles_1m = stock_data.get("candles_1m")
-                            if candles_1m:
-                                sugeub_1m_ok = check_short_term_sugeub(candles_1m, 1)
-                            
-                            # 3분봉 정배열 확인 (TEMA3 > TEMA60) 및 TEMA60 기울기 확인
-                            trend_3m_ok = False
-                            candles_3m = stock_data.get("candles_3m")
-                            if candles_3m and len(candles_3m) >= 60:
-                                calculate_indicators_pure(
-                                    candles_3m,
-                                    use_compressed_peak=True,
-                                    tema_period1=config.TEMA_PERIOD_SHORT,
-                                    tema_period2=config.TEMA_PERIOD_LONG
-                                )
-                                latest_3m = candles_3m[-1]
-                                prev_3m = candles_3m[-2] if len(candles_3m) > 1 else latest_3m
-                                t3_3m = latest_3m.get("tema3")
-                                t60_3m = latest_3m.get("tema60")
-                                prev_t60_3m = prev_3m.get("tema60")
-                                
-                                if t3_3m is not None and t60_3m is not None and prev_t60_3m is not None and prev_t60_3m != 0:
-                                    slope = ((t60_3m - prev_t60_3m) / prev_t60_3m) * 100
-                                    if t3_3m > t60_3m and slope >= 0.05:
-                                        trend_3m_ok = True
-                                        logger.info(f"✅ [TEMA60 기울기 만족] {name}({code}) 기울기: {slope:+.3f}% (기준: +0.05%)")
-                            
-                            # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
-                            # 매수 4대 핵심 관문 (15분봉 정배열 + 가산점 + 3분봉 기울기 + 1분봉 수급)
-                            trend_15m_ok = stock_data.get("trend_ok", False)
-                            has_bonus = stock_data.get("theme_bonus", False) or (stock_data.get("flu_delta", 0.0) >= 1.0)
-                            
-                            t_hour_kst = datetime.now(KST).hour
-                            t_min_kst = datetime.now(KST).minute
-                            is_early_turnaround_window = (t_hour_kst == 8 and 0 <= t_min_kst <= 10) or (t_hour_kst == 9 and 0 <= t_min_kst <= 10)
-                            
-                            if is_early_turnaround_window:
-                                buy_condition_met = stock_data.get("is_early_cond1_ok", False) and stock_data.get("is_early_cond3_ok", False)
-                                cond_type = "장초반 초고속 턴어라운드 (조건1+조건3)"
-                            else:
-                                buy_condition_met = trend_15m_ok and has_bonus and trend_3m_ok and sugeub_1m_ok
-                                cond_type = "WMA관문돌파 + 가산점 + 3m기울기 + 1m수급"
-                            
-                            if not buy_condition_met:
-                                if rank <= 3:
-                                    reasons = []
-                                    if is_early_turnaround_window:
-                                        if not stock_data.get("is_early_cond1_ok"): reasons.append("조건1(120틱 하락멈춤) 미달")
-                                        if not stock_data.get("is_early_cond3_ok"): reasons.append("조건3(체결강도 복구) 미달")
-                                    else:
-                                        if not trend_15m_ok: reasons.append("WMA5/20 관문선 돌파 실패")
-                                        if not has_bonus: reasons.append("가산점(테마/급등/수급) 없음")
-                                        if not trend_3m_ok: reasons.append("3분봉 TEMA60 기울기 0.05% 미만 또는 역배열")
-                                        if not sugeub_1m_ok: reasons.append("1분봉 수급 부족")
-                                    
-                                    logger.info(f"🔎 [모니터링: {rank}위] {name}({code}) ➡️ 보류 사유: {', '.join(reasons)}")
-                                    
-                            if buy_condition_met:
-                                # [신규] 매수 전 60초 쿨타임(Cool-time) 필터 검사
-                                last_sell_time = sent_alerts[code].get("last_sell_time", 0)
-                                if time.time() - last_sell_time < 60:
-                                    logger.info(f"⏳ [쿨타임] {name}({code}) - 매도 후 60초가 경과하지 않아 신규 진입을 보류합니다.")
-                                    continue
-                                # 수급 동시 확인! +1호가 매수 진입
-                                from indicator import adjust_price_by_ticks
-                                buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
-                                
-                                logger.info(f"🚀 [최종 관문 통과 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
-                                
-                                sent_alerts[code]["buy"] = candle_time
-                                sent_alerts[code]["buy_reason"] = "sugeub_mtf"
-                                
-                                # 주문가능금액(예수금) 95% 풀매수
-                                budget = cash * 0.95
-                                qty = int(budget // buy_price)
-                                if getattr(config, 'TEST_MODE_1_SHARE', False):
-                                    qty = 1
-                                
-                                if qty > 0:
-                                    order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")
-                                    if order_res and order_res.get("return_code") == 0:
-                                        # 오늘 매수 성공 → 날짜 기록 및 3분봉 추적모드 전환
-                                        try:
-                                            with open(buy_date_file, "w") as f:
-                                                f.write(current_date)
-                                        except Exception as e:
-                                            logger.error(f"Failed to write buy date file: {e}")
-                                        
-                                        # 매수 후 3분봉 추적 매매 모드로 전환
-                                        sent_alerts[code]["tracking_mode"] = "3m"
-                                        sent_alerts[code]["sold_qty"] = 0
-                                        logger.info(f"➡️ [모드 전환] 매수 체결 후 3분봉 추적매매 모드로 전환: {name} ({code})")
-        
-                                        msg = (
-                                            f"🚀 <b>[매수 체결 - {cond_type}]</b>\n"
-                                            f"종목: {name} ({code})\n"
-                                            f"체결단가: {buy_price:,.0f}원 (+1호가 지정가)\n"
-                                            f"수량: {qty}주\n"
-                                            f"시간: {candle_time}\n"
-                                            f"주문번호: {order_res.get('ord_no')}\n"
-                                            f"<i>매수 후 3분봉 추적매매 모드로 전환됩니다.</i>"
-                                        )
-                                        notifier.send_all(msg)
-                                        _add_alert("buy", f"{cond_type} 매수 {qty}주 @ {buy_price:,.0f}원 (+1호가)", code, name)
-                                    else:
-                                        err_msg = order_res.get("return_msg") if order_res else "응답 없음"
-                                        logger.error(f"❌ [매수 실패] {name} ({code}): {err_msg}")
-                                        msg = (
-                                            f"❌ <b>[매수 실패 - {cond_type}]</b>\n"
-                                            f"종목: {name} ({code})\n"
-                                            f"에러내용: {err_msg}"
-                                        )
-                                        # 매수 실패 알림 제거
-                                        # notifier.send_all(msg)
-                            else:
-                                # 수급 미달 로그
-                                miss = []
-                                if not sugeub_1m_ok: miss.append("1분봉")
-                                logger.debug(f"  {name}({code}) 수급 미달(단기모드): {', '.join(miss)} (1m={sugeub_1m_ok})")
-
-                # ── ② 매도 로직 (시간대 무관하게 항상 적용) ──────────
-                # A) 당일 종가 청산 강제 신호 부여 제거 (오버나잇 허용)
-                pass
-
-                # B) 매도 조건 충족 시 주문 처리 (시간대 무관하게 항상 적용)
-                if latest.get("signal_sell"):
-                    sell_reason = latest.get("sell_reason")
-                    if tracking_mode == "3m" and sell_reason == "BB5 Upper Reversal":
-                        pass  # 3분봉 모드에서는 볼린저밴드 매도를 무시
-                    elif sent_alerts[code]["sell"] != candle_time:
-                        sent_alerts[code]["sell"] = candle_time
-                        reason_kr = {
-                            "Pre-Power-Line Drop": "세력선 출현 전 종가 하락",
-                            "TEMA 3 Dead Cross": "TEMA 3 데드크로스",
-                            "BB5 Upper Reversal": "볼린저밴드 5상한선 반전 매도",
-                            "K-line Stop Loss": "K선 이탈 손실제한",
-                            "L-line 1% Stop Loss": "L선 1% 이탈 손절",
-                            "Gate-line 1% Stop Loss": "관문선 1% 이탈 손절",
-                            "Daily Close Liquidation": "당일 종가 청산",
-                            "15m TEMA3-TEMA60 Dead Cross": "15m TEMA3-TEMA60 데드크로스"
-                        }.get(sell_reason, "전략 매도")
-
-                        if is_held and held_info:
-                            qty_to_sell = held_info["quantity"]
-                            order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
-                            if order_res and order_res.get("return_code") == 0:
-                                # 15m BB5 Upper Reversal 매도 시에만 3m 추적모드로 진입
-                                if sell_reason == "BB5 Upper Reversal":
-                                    sent_alerts[code]["tracking_mode"] = "3m"
-                                    sent_alerts[code]["sold_qty"] = qty_to_sell
-                                    logger.info(f"➡️ [모드 전환] BB5 Upper Reversal 매도 후 3분봉 매매 모드로 전환: {name} ({code}), 수량: {qty_to_sell}")
-                                else:
-                                    sent_alerts[code]["tracking_mode"] = "15m"
+                            if qty > 0:
+                                order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")
+                                if order_res and order_res.get("return_code") == 0:
                                     sent_alerts[code]["sold_qty"] = 0
-                                    logger.info(f"➡️ [모드 유지] {sell_reason} 매도 발생으로 15m 모드 유지 및 sold_qty 초기화: {name} ({code})")
-
+                                    msg = (
+                                        f"🚀 <b>[매수 체결 - {cond_type}]</b>\n"
+                                        f"종목: {name} ({code})\n"
+                                        f"체결단가: {buy_price:,.0f}원 (+1호가 지정가)\n"
+                                        f"수량: {qty}주\n"
+                                        f"시간: {candle_time}\n"
+                                        f"주문번호: {order_res.get('ord_no')}"
+                                    )
+                                    notifier.send_all(msg)
+                                    _add_alert("buy", f"{cond_type} 매수 {qty}주 @ {buy_price:,.0f}원", code, name)
+                                else:
+                                    err_msg = order_res.get("return_msg") if order_res else "응답 없음"
+                                    logger.error(f"❌ [매수 실패] {name} ({code}): {err_msg}")
+                                    _add_alert("error", f"매수 실패: {err_msg}", code, name)
+            
+            # ── 2. 매도 로직 (15분봉 전용 + 5분봉 방어망) ──
+            if is_held and held_info:
+                # 변곡 추세 매도 로직 평가 (strategy.py 위임)
+                should_sell, sell_reason_str = evaluate_inflection_sell(candles_15m, candles_5m)
+                        
+                # 최종 매도 실행
+                if should_sell:
+                    if sent_alerts[code].get("sell") != candle_time:
+                            sent_alerts[code]["sell"] = candle_time
+                            qty_to_sell = held_info["quantity"]
+                            
+                            logger.info(f"🚨 [매도 감지] {sell_reason_str}: {name} ({code})")
+                            
+                            from indicator import adjust_price_by_ticks
+                            sell_price = get_ext_adjusted_price(client, code, close_price, "sell", -2)
+                            order_res = client.place_sell_order(code, qty_to_sell, price=sell_price, order_type="0")
+                            
+                            if order_res and order_res.get("return_code") == 0:
+                                sent_alerts[code]["sold_qty"] = qty_to_sell
                                 pur_price = held_info["buy_price"]
-                                ret_rate = ((close_price - pur_price) / pur_price) * 100.0
+                                ret_rate = ((sell_price - pur_price) / pur_price) * 100.0
                                 
-                                # 로그 및 대시보드 연동용 Trade 기록 추가
-                                logger.info(f"📉 [매도 체결] {name}({code}) | 매수가: {pur_price:,.0f}원 | 매도가: {close_price:,.0f}원 | 수익률: {ret_rate:+.2f}% | 사유: {reason_kr}")
                                 trade_info = {
                                     "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                                     "code": code,
                                     "name": name,
                                     "buy_price": pur_price,
-                                    "sell_price": close_price,
+                                    "sell_price": sell_price,
                                     "return_pct": round(ret_rate, 2),
-                                    "reason": reason_kr
+                                    "reason": sell_reason_str
                                 }
                                 BOT_STATE["completed_trades"].insert(0, trade_info)
                                 if len(BOT_STATE["completed_trades"]) > 50:
                                     BOT_STATE["completed_trades"].pop()
-
+                                    
                                 msg = (
-                                    f"📉 <b>[매도 체결 - {reason_kr}!]</b>\n"
+                                    f"📉 <b>[매도 체결 - {sell_reason_str}]</b>\n"
                                     f"종목: {name} ({code})\n"
-                                    f"매도단가: {close_price:,.0f}원\n"
+                                    f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
                                     f"매수단가: {pur_price:,.0f}원\n"
                                     f"매도수량: {qty_to_sell}주\n"
                                     f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
-                                    f"시간: {candle_time}\n"
-                                    f"주문번호: {order_res.get('ord_no')}"
+                                    f"시간: {candle_time}"
                                 )
-                                _add_alert("sell", f"{reason_kr} 매도 {qty_to_sell}주 @ {close_price:,.0f}원 (매수가: {pur_price:,.0f}원) | 수익률: {ret_rate:+.2f}%", code, name)
+                                notifier.send_all(msg)
+                                _add_alert("sell", f"{sell_reason_str} 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 | {ret_rate:+.2f}%", code, name)
+                                sent_alerts[code]["last_sell_time"] = time.time()
                             else:
                                 err_msg = order_res.get("return_msg") if order_res else "응답 없음"
-                                msg = (
-                                    f"❌ <b>[매도 실패 - {reason_kr}]</b>\n"
-                                    f"종목: {name} ({code})\n"
-                                    f"에러내용: {err_msg}"
-                                )
-                                _add_alert("error", f"{reason_kr} 매도실패: {err_msg}", code, name)
-                            # 매도 실패 알림 제거
-                            # notifier.send_all(msg)
-                        else:
-                            msg = (
-                                f"📉 <b>[{reason_kr} 매도알림 - 미보유]</b>\n"
-                                f"종목: {name} ({code})\n"
-                                f"현재가: {close_price:,.0f}원\n"
-                                f"시간: {candle_time}\n"
-                                f"<i>(매도 신호 발생 - 보유 수량 없음)</i>"
-                            )
-                            # 미보유 매도 신호 알림 제거
-                            # notifier.send_all(msg)
-                            _add_alert("sell", f"{reason_kr} (미보유) | {close_price:,.0f}원", code, name)
+                                logger.error(f"❌ [매도 실패] {name} ({code}): {err_msg}")
+                                _add_alert("error", f"매도 실패: {err_msg}", code, name)
 
-                # B) 세력선과 기준선 중 두번째 선 하향돌파 매도 (10:00 이후 추가 매도 조건)
-                second_line_val = latest.get("second_line_val")
-                if is_post_ten and latest.get("signal_sell_second_line") and second_line_val is not None:
-                    if sent_alerts[code]["sell_second_line"] != candle_time:
-                        sent_alerts[code]["sell_second_line"] = candle_time
-
-                        if is_held and held_info:
-                            qty_to_sell = held_info["quantity"]
-                            order_res = client.place_sell_order(code, qty_to_sell, price=close_price, order_type="0")
-                            if order_res and order_res.get("return_code") == 0:
-                                # Stay in 15m mode and reset sold_qty to 0
-                                sent_alerts[code]["tracking_mode"] = "15m"
-                                sent_alerts[code]["sold_qty"] = 0
-                                
-                                pur_price = held_info["buy_price"]
-                                ret_rate = ((close_price - pur_price) / pur_price) * 100.0
-                                msg = (
-                                    f"📉 <b>[매도 체결 - 두번째 선 하향돌파!]</b>\n"
-                                    f"종목: {name} ({code})\n"
-                                    f"매도단가: {close_price:,.0f}원\n"
-                                    f"매수단가: {pur_price:,.0f}원\n"
-                                    f"두번째 선: {second_line_val:,.0f}원 (이탈)\n"
-                                    f"매도수량: {qty_to_sell}주\n"
-                                    f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
-                                    f"시간: {candle_time}\n"
-                                    f"주문번호: {order_res.get('ord_no')}"
-                                )
-                                _add_alert("sell", f"하향돌파 매도 {qty_to_sell}주 @ {close_price:,.0f}원 | {ret_rate:+.2f}%", code, name)
-                            else:
-                                err_msg = order_res.get("return_msg") if order_res else "응답 없음"
-                                msg = (
-                                    f"❌ <b>[매도 실패 - 하향돌파]</b>\n"
-                                    f"종목: {name} ({code})\n"
-                                    f"에러내용: {err_msg}"
-                                )
-                                _add_alert("error", f"하향돌파 매도실패: {err_msg}", code, name)
-                            # 하향돌파 매도 실패 알림 제거
-                            # notifier.send_all(msg)
-                        else:
-                            # 미보유 종목은 알림만
-                            msg = (
-                                f"📉 <b>[하향돌파 알림 - 미보유]</b>\n"
-                                f"종목: {name} ({code})\n"
-                                f"현재가: {close_price:,.0f}원 | 두번째 선: {second_line_val:,.0f}원\n"
-                                f"시간: {candle_time}"
-                            )
-                            # 하향돌파 미보유 알림 제거
-                            # notifier.send_all(msg)
-                            _add_alert("sell", f"하향돌파 (미보유) | {close_price:,.0f}원", code, name)
-
-                    
         # Update the watchlist Excel file with latest positions and prices
         update_watchlist_excel(client, WATCHLIST_PATH)
 
@@ -1469,9 +1080,9 @@ def run_single_stock_trading_advanced():
     client = KiwoomClient()
     notifier = Notifier()
     
-    # 별도의 요청 전까지는 무조건 삼성전자로 묶어둠 (하드코딩)
-    code = "005930"
-    name = "삼성전자"
+    # 별도의 요청 전까지는 무조건 LG전자로 묶어둠 (하드코딩)
+    code = "066570"
+    name = "LG전자"
     
     logger.info(f"🎯 실시간 초정밀 감시 대상: {name} ({code}) - 고정 모드")
     
@@ -1497,16 +1108,22 @@ def run_single_stock_trading_advanced():
             holdings_map = {h["code"]: h for h in holdings}
             
             # 3. 💾 멀티 타임프레임 데이터 동시 수집
-            candles_3m = client.get_3min_candles(code, last_n_days=1)
+            candles_3m = client.get_3min_candles(code, last_n_days=5)
             time.sleep(0.2)
-            candles_1m = client.get_1min_candles(code, last_n_days=1)
+            candles_1m = client.get_1min_candles(code, last_n_days=5)
             time.sleep(0.2)
             candles_120tick = client.get_tick_data(code, tick_unit="120", limit=100)
             
-            if not candles_3m or not candles_1m or not candles_120tick:
+            if not candles_3m or not candles_1m:
                 logger.warning("시세 데이터를 가져오지 못했습니다. 재시도합니다.")
                 time.sleep(1)
                 continue
+            
+            is_120_fallback = False
+            if not candles_120tick:
+                logger.info("120틱 데이터를 수신하지 못해 1분봉 데이터로 대체하여 진행합니다.")
+                candles_120tick = candles_1m
+                is_120_fallback = True
                 
             current_price = candles_1m[-1]["close"]
             
@@ -1589,6 +1206,11 @@ def run_single_stock_trading_advanced():
                         if current_price >= K_line_tick or current_price >= L_line_tick:
                             is_lower_high_rebound = True
                 
+                # 대체(Fallback) 모드에서는 1분봉 데이터의 K/L선이 너무 거칠게 작용해 잦은 매매(Whipsaw)를 유발하므로 비활성화
+                if is_120_fallback:
+                    is_l_line_break = False
+                    is_lower_high_rebound = False
+                
                 if is_time_liquidation or is_dead_cross or is_l_line_break or is_lower_high_rebound:
                     from indicator import adjust_price_by_ticks
                     sell_price = get_ext_adjusted_price(client, code, current_price, "sell", default_ticks=0)
@@ -1620,7 +1242,7 @@ def run_single_stock_trading_advanced():
 
 if __name__ == "__main__":
     try:
-        run_single_stock_trading_advanced()
+        run_trading_bot()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
 

@@ -241,21 +241,21 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
         candles[i]['bb20_lower'] = bb20_lower[i]
 
     # 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY]
-    # ── 4-e. TEMA Gate Line (calculated early to be used as stop loss) ──
-    tema1 = calculate_tema(closes, tema_period1)
-    tema2 = calculate_tema(closes, tema_period2)
+    # ── 4-e. TEMA Gate Line (TEMA 3 & TEMA 20) ──
+    tema3 = calculate_tema(closes, 3)
+    tema20 = calculate_tema(closes, 20)
 
     gate_line_val = None
     for i in range(n):
-        candles[i]['tema1'] = tema1[i]
-        candles[i]['tema2'] = tema2[i]
+        candles[i]['tema1'] = tema3[i] # keeping for backward compatibility
+        candles[i]['tema2'] = tema20[i]
 
-        # CrossUp: TEMA1이 TEMA2를 상향돌파하는 순간
+        # CrossUp: TEMA3이 TEMA20을 상향돌파하는 순간
         if (i > 0
-                and tema1[i] is not None and tema2[i] is not None
-                and tema1[i-1] is not None and tema2[i-1] is not None):
-            if tema1[i-1] < tema2[i-1] and tema1[i] >= tema2[i]:
-                gate_line_val = tema1[i]
+                and tema3[i] is not None and tema20[i] is not None
+                and tema3[i-1] is not None and tema20[i-1] is not None):
+            if tema3[i-1] < tema20[i-1] and tema3[i] >= tema20[i]:
+                gate_line_val = tema3[i]
 
         candles[i]['tema_gate_line'] = gate_line_val
 
@@ -432,6 +432,13 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             candles[i]['disparity_pct'] = abs(candles[i]['close'] - gate_line_val) / gate_line_val * 100.0
         else:
             candles[i]['disparity_pct'] = None
+            
+        # Calculate 3-candle average volume for 15m
+        if i >= 3:
+            avg_v = (candles[i-1].get('volume', 0) + candles[i-2].get('volume', 0) + candles[i-3].get('volume', 0)) / 3.0
+            candles[i]['vol_avg_3'] = avg_v
+        else:
+            candles[i]['vol_avg_3'] = 0
 
     # 10. 기준선(L) & 세력선(whale_line) 동시 상향 돌파 시그널 (빨간 다이아몬드 지점)
     for i in range(n):
@@ -448,6 +455,7 @@ def calculate_indicators_pure(candles, use_compressed_peak=True, tema_period1=5,
             
             if above_lines and was_below:
                 is_perfect_breakout = True
+        c['signal_perfect_breakout'] = is_perfect_breakout
     return candles
 
 def calculate_obv(candles):

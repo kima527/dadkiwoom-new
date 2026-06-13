@@ -486,7 +486,7 @@ class KiwoomRealClient:
                 
             parsed_candles = []
             for item in raw_candles[:limit]:
-                raw_time = item.get("dt", "").strip()
+                raw_time = item.get("cntr_tm", item.get("dt", "")).strip()
                 if len(raw_time) < 14:
                     continue
                 # dt 형식: YYYYMMDDHHMMSS
