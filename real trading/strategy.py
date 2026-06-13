@@ -173,7 +173,40 @@ def evaluate_inflection_sell(candles_15m, candles_5m):
             
     return False, ""
 
+def check_highspeed_liquidation(candles_5m, current_tick_price):
+    """
+    [초고속 청산 가드] 3대 저항선(K선, L선, 관문선) 중 하나라도 돌파 실패 시 즉시 전량 매도
+    """
+    if not candles_5m or len(candles_5m) == 0:
+        return False, ""
+        
+    latest_5m = candles_5m[-1]
+    
+    # 세 가지 선 (사용자 정의: L선, K선, 테마급등관문선)
+    k_line = latest_5m.get("K")
+    l_line = latest_5m.get("L")
+    gate_line = latest_5m.get("tema_gate_line")
+    
+    active_resistance_lines = [
+        ("K선", k_line),
+        ("L선", l_line),
+        ("관문선", gate_line)
+    ]
+    
+    # 유효한 선들 필터링
+    valid_lines = [(name, val) for name, val in active_resistance_lines if val is not None]
+    if not valid_lines:
+        return False, ""
+        
+    # [매도 판단 핵심]
+    # 현재 가격이 유효한 저항선들보다 아래에 있거나, 
+    # 돌파를 시도했으나 저항선에 머리를 맞고 밀리는 형태가 감지되면 바로 매도 시동
+    for name, line_price in valid_lines:
+        if current_tick_price < line_price:
+            return True, f"초고속 청산 ({name} 이탈: {line_price:,.0f}원)"
+            
     return False, ""
+
 
 def convert_to_chart_list(api_response_list):
     """

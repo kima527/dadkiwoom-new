@@ -48,8 +48,8 @@ class DynamicPoolManager:
             
         logger.info("🔄 [다이내믹 리밸런싱] 시장 주도주 랭킹 분석 시작...")
         
-        # 1. 절대 삭제하면 안 되는 종목 가드 (엑셀 고정 + 잔고 보유 + 미체결)
-        protected_codes = set(my_pick_codes)
+        # 1. 절대 삭제하면 안 되는 종목 가드 (잔고 보유 + 미체결)
+        protected_codes = set()
         
         # 잔고 파싱 (보유 수량이 있는 종목 보호)
         for item in holdings_raw:
@@ -67,15 +67,22 @@ class DynamicPoolManager:
         # 2. 최신 실시간 랭킹 종목 로드
         fresh_ranking_codes = self.get_market_ranking_codes()
         
-        # 3. 새로운 풀 구성 (보호 종목을 최우선으로 담고, 빈자리를 랭킹 종목으로 채움)
+        # 3. 새로운 풀 구성 (보유/미체결 보호 종목 최우선)
         new_candidate_pool = list(protected_codes)
         
-        for code in fresh_ranking_codes:
+        # 4. [안전 지향 로직] 엑셀 관심종목(my_pick) 중 현재 시장 주도주(fresh_ranking)인 것을 1순위 편입
+        hot_my_picks = [c for c in my_pick_codes if c in fresh_ranking_codes]
+        for code in hot_my_picks:
             if len(new_candidate_pool) >= self.max_pool_size:
                 break
             if code not in new_candidate_pool:
-                # 대추세 가드 예비 검증을 여기에 넣을 수 있으나 (API 호출 부담)
-                # 메인 루프에서 어차피 걸러지므로 가볍게 풀에 편입만 시킴
+                new_candidate_pool.append(code)
+                
+        # 5. 그래도 슬롯이 남는다면 나머지 엑셀 관심종목으로 채움 (외부 종목 절대 차단)
+        for code in my_pick_codes:
+            if len(new_candidate_pool) >= self.max_pool_size:
+                break
+            if code not in new_candidate_pool:
                 new_candidate_pool.append(code)
                 
         # 4. 기존 풀(current_active_codes)과 비교하여 삭제/추가 리스트 분리

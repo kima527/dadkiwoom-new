@@ -18,8 +18,8 @@ from datetime import datetime, timezone, timedelta, time as dt_time
 import openpyxl
 import config
 from kiwoom_client import KiwoomClient
-from indicator import calculate_indicators_pure
-from strategy import evaluate_trend_buy, evaluate_rebuy, evaluate_inflection_sell
+from indicator import calculate_indicators_pure, get_ext_adjusted_price
+from strategy import evaluate_trend_buy, evaluate_rebuy, evaluate_inflection_sell, check_highspeed_liquidation
 from notifier import Notifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -454,13 +454,35 @@ def run_trading_bot():
             PREV_VP_STATE.clear()
             PREV_FLU_RATES.clear()
             FIRST_3M_HIGH.clear()
-            logger.info("장초반 턴어라운드 및 급등 추적을 위한 상태(PREV_VP_STATE, PREV_FLU_RATES) 및 첫3분봉 고가 라인(FIRST_3M_HIGH)이 초기화되었습니다.")
+            RECENT_SELLS.clear()
+            logger.info("장초반 턴어라운드 및 급등 추적을 위한 상태(PREV_VP_STATE, PREV_FLU_RATES, FIRST_3M_HIGH, RECENT_SELLS)가 초기화되었습니다.")
             
             try:
                 with open(liquidation_file, "w") as f:
                     f.write(current_date)
             except Exception as e:
                 logger.error(f"Failed to write liquidation file: {e}")
+
+        # ── 매일 야간장 종료 후 (20:01) 일간 결산 레이어 자동 구동 ──
+        settlement_file = "last_settlement_date.txt"
+        last_settled_date = ""
+        if os.path.exists(settlement_file):
+            try:
+                with open(settlement_file, "r") as f:
+                    last_settled_date = f.read().strip()
+            except Exception:
+                pass
+                
+        current_time_str = datetime.now(KST).strftime("%H%M")
+        if current_time_str >= "2001" and current_date != last_settled_date:
+            logger.info("🕒 20:01 PM reached. Triggering Daily Account Sync and Settlement...")
+            try:
+                from settlement_manager import sync_and_report_today
+                sync_and_report_today(client, BOT_STATE, notifier)
+                with open(settlement_file, "w") as f:
+                    f.write(current_date)
+            except Exception as e:
+                logger.error(f"❌ Failed to run daily settlement: {e}")
 
         # (계좌 잔고 및 예수금은 루프 시작부에서 일괄 조회하여 사용합니다)
         # ── 실시간 상태 업데이트 ──
@@ -853,6 +875,7 @@ def run_trading_bot():
                 "candles_1m": candles_1m,
                 "candles_3m": candles_3m,
                 "daily_candles": daily_candles,
+                "tick_current_price": tick_current_price,
             })
             
             # 다음 스캔 비교를 위해 현재 등락률 저장
@@ -1088,9 +1111,33 @@ def run_trading_bot():
                                     _add_alert("error", f"매수 실패: {err_msg}", code, name)
             
             # ── 2. 매도 로직 (15분봉 전용 + 5분봉 방어망) ──
+            # 즉시 메모리 삭제 가드 (최근 5초 이내 매도된 종목은 보유 상태에서 강제 제외)
+            if code in RECENT_SELLS and time.time() - RECENT_SELLS[code] < 5.0:
+                is_held = False
+                
             if is_held and held_info:
-                # 변곡 추세 매도 로직 평가 (strategy.py 위임)
-                should_sell, sell_reason_str = evaluate_inflection_sell(candles_15m, candles_5m)
+                pur_price = held_info["buy_price"]
+                current_p = stock_data.get("tick_current_price", close_price)
+                
+                # 0차: 절대 손절 가드 (-1.0%)
+                is_stop_loss = False
+                should_sell = False
+                sell_reason_str = ""
+                
+                if pur_price > 0:
+                    profit_rate = ((current_p - pur_price) / pur_price) * 100.0
+                    if profit_rate <= -1.0:
+                        is_stop_loss = True
+                        should_sell = True
+                        sell_reason_str = f"🛑 절대 손절가 도달 ({profit_rate:.2f}%)"
+                        
+                if not is_stop_loss:
+                    # 1차: 초고속 청산 가드 (틱 레벨 저항선 이탈 체크)
+                    should_sell, sell_reason_str = check_highspeed_liquidation(candles_5m, current_p)
+                    
+                    if not should_sell:
+                        # 2차: 변곡 추세 매도 로직 평가 (strategy.py 위임)
+                        should_sell, sell_reason_str = evaluate_inflection_sell(candles_15m, candles_5m)
                         
                 # 최종 매도 실행
                 if should_sell:
@@ -1134,6 +1181,13 @@ def run_trading_bot():
                                 notifier.send_all(msg)
                                 _add_alert("sell", f"{sell_reason_str} 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 | {ret_rate:+.2f}%", code, name)
                                 sent_alerts[code]["last_sell_time"] = time.time()
+                                RECENT_SELLS[code] = time.time()
+                                if code in held_dict:
+                                    del held_dict[code]
+                                    
+                                # [즉시 수혈 가동] 종목이 매도되어 빈자리가 생기면 다음 루프에서 다이내믹 풀 즉시 리밸런싱
+                                if 'pool_manager' in locals() or 'pool_manager' in globals():
+                                    pool_manager.last_rebalance_time = 0
                             else:
                                 err_msg = order_res.get("return_msg") if order_res else "응답 없음"
                                 logger.error(f"❌ [매도 실패] {name} ({code}): {err_msg}")
