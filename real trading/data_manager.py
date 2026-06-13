@@ -33,6 +33,63 @@ class RealtimeDataManager:
         
         logger.info(f"[{stock_code}] RealtimeDataManager 다중 타임프레임 모드 초기화 완료 (max_len={max_len})")
 
+    @staticmethod
+    def fill_void_gaps(candles: list, freq_minutes: int) -> list:
+        """
+        이빨 빠진 차트(거래량 0 구간)를 이전 종가로 복제(ffill)하여 수학적 무결성을 보장합니다.
+        Numpy/Pandas 없이 순수 파이썬(Pure Python)으로만 작동하여 충돌을 원천 방지합니다.
+        """
+        if not candles:
+            return []
+        import datetime
+        
+        try:
+            sorted_candles = sorted(candles, key=lambda x: x['time'])
+        except Exception:
+            return candles
+
+        filled_candles = []
+        prev_c = sorted_candles[0]
+        filled_candles.append(prev_c)
+        
+        step_delta = datetime.timedelta(minutes=freq_minutes)
+        
+        for current_c in sorted_candles[1:]:
+            try:
+                prev_time_str = prev_c['time']
+                curr_time_str = current_c['time']
+                
+                # 날짜 파싱 방어 코드
+                fmt_prev = '%Y-%m-%d %H:%M:%S' if '-' in prev_time_str else '%Y%m%d%H%M%S'
+                fmt_curr = '%Y-%m-%d %H:%M:%S' if '-' in curr_time_str else '%Y%m%d%H%M%S'
+                
+                prev_dt = datetime.datetime.strptime(prev_time_str[:19] if '-' in prev_time_str else prev_time_str, fmt_prev)
+                curr_dt = datetime.datetime.strptime(curr_time_str[:19] if '-' in curr_time_str else curr_time_str, fmt_curr)
+                    
+                expected_time = prev_dt + step_delta
+                
+                # 공백(Void Gap) 채우기 연산
+                while expected_time < curr_dt:
+                    if 8 <= expected_time.hour < 20: # 정규장 + 시간외(NXT) 포함 범위
+                        gap_candle = {
+                            'time': expected_time.strftime(fmt_prev),
+                            'date': prev_c.get('date', expected_time.strftime('%Y-%m-%d')),
+                            'open': prev_c['close'],
+                            'high': prev_c['close'],
+                            'low': prev_c['close'],
+                            'close': prev_c['close'],
+                            'volume': 0
+                        }
+                        filled_candles.append(gap_candle)
+                    expected_time += step_delta
+            except Exception:
+                pass
+                
+            filled_candles.append(current_c)
+            prev_c = current_c
+            
+        return filled_candles
+
     def seed_initial_data(self, past_120ticks: list, past_1m_candles: list, past_3m: list = None, past_5m: list = None, past_15m: list = None, past_daily: list = None):
         """
         장 시작 전(또는 스크립트 가동 시) REST API로 가져온 과거 데이터를 큐에 채워넣습니다.
@@ -40,7 +97,8 @@ class RealtimeDataManager:
         for t in past_120ticks:
             self.ticks_120_deque.append(t)
             
-        for c in past_1m_candles:
+        past_1m_filled = self.fill_void_gaps(past_1m_candles, 1)
+        for c in past_1m_filled:
             self.candles_1m_deque.append(c)
             
             # 마지막 분을 초기화하여 다음 체결 시 분 바뀜을 감지
@@ -54,15 +112,18 @@ class RealtimeDataManager:
                     pass
 
         if past_3m:
-            for c in past_3m: self.candles_3m_deque.append(c)
+            past_3m_filled = self.fill_void_gaps(past_3m, 3)
+            for c in past_3m_filled: self.candles_3m_deque.append(c)
         if past_5m:
-            for c in past_5m: self.candles_5m_deque.append(c)
+            past_5m_filled = self.fill_void_gaps(past_5m, 5)
+            for c in past_5m_filled: self.candles_5m_deque.append(c)
         if past_15m:
-            for c in past_15m: self.candles_15m_deque.append(c)
+            past_15m_filled = self.fill_void_gaps(past_15m, 15)
+            for c in past_15m_filled: self.candles_15m_deque.append(c)
         if past_daily:
             for c in past_daily: self.daily_candles_deque.append(c)
 
-        logger.info(f"[{self.stock_code}] 초기 시드 데이터 적재 완료 (1m/3m/5m/15m/daily)")
+        logger.info(f"[{self.stock_code}] 초기 시드 데이터 적재 및 공백(Void Gap) 보정 완료 (1m/3m/5m/15m/daily)")
 
     def process_realtime_tick(self, current_price: float, volume: int, volume_power: float, time_str: str):
         """
