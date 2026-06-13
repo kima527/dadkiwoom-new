@@ -332,17 +332,30 @@ def run_trading_bot():
         DATA_MANAGERS[c] = dm
         
         try:
-            logger.info(f"[{c}] 초기 시드 데이터(1m, 120t) 다운로드 중...")
+            logger.info(f"[{c}] 초기 시드 데이터 전체 (1m/3m/5m/15m/daily/120t) 다운로드 중...")
             seed_1m = client.get_1min_candles(c, last_n_days=1)
+            time.sleep(0.2)
+            seed_3m = client.get_3min_candles(c, 2)
+            time.sleep(0.2)
+            seed_5m = client.get_5min_candles(c, 2)
+            time.sleep(0.2)
+            seed_15m = client.get_15min_candles(c, 7)
+            time.sleep(0.2)
+            seed_daily = client.get_daily_candles(c, 200)
             time.sleep(0.2)
             seed_120t = client.get_tick_data(c, "120", limit=100)
             time.sleep(0.2)
             
             # API 반환 형태 변환 (dict로 안정화)
             past_1m = [{'time': i['time'], 'date': i['date'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_1m]
+            past_3m = [{'time': i['time'], 'date': i['date'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_3m]
+            past_5m = [{'time': i['time'], 'date': i['date'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_5m]
+            past_15m = [{'time': i['time'], 'date': i['date'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_15m]
+            past_daily = [{'time': i.get('time', i['date']), 'date': i['date'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_daily]
+            
             past_120 = [{'time': i['time'], 'open': i['open'], 'high': i['high'], 'low': i['low'], 'close': i['close'], 'volume': i['volume']} for i in seed_120t]
                 
-            dm.seed_initial_data(past_120, past_1m)
+            dm.seed_initial_data(past_120, past_1m, past_3m, past_5m, past_15m, past_daily)
         except Exception as e:
             logger.error(f"[{c}] 초기 시드 주입 실패: {e}")
             
@@ -464,19 +477,23 @@ def run_trading_bot():
             tick_res = {}
             
             # ────────────────────────────────────────────────────────────
-            # Phase 1: 하이브리드/웹소켓 메모리 획득 (과부하 대폭 감소)
+            # Phase 1: 하이브리드/웹소켓 메모리 획득 (과부하 0% 완전 전환)
             # ────────────────────────────────────────────────────────────
             dm = DATA_MANAGERS.get(code)
             
-            # 장기 분봉은 서버 폴링 유지되지만, 극심한 폴링은 완화됨
-            candles_15m = client.get_15min_candles(code, 7)
-            candles_5m = client.get_5min_candles(code, 2)
-            candles_3m = client.get_3min_candles(code, 2)
-            daily_candles = client.get_daily_candles(code, 200)
-            
-            if dm and len(dm.get_1min_list()) > 0:
+            # 이제 모든 분봉은 폴링을 멈추고 메모리(웹소켓)에서 즉시 획득합니다.
+            if dm and len(dm.get_15min_list()) > 0:
+                candles_15m = dm.get_15min_list()
+                candles_5m = dm.get_5min_list()
+                candles_3m = dm.get_3min_list()
+                daily_candles = dm.get_daily_list()
                 candles_1m = dm.get_1min_list()
             else:
+                # 비상 Fallback (웹소켓 연결 지연 시에만 1회성 REST 호출)
+                candles_15m = client.get_15min_candles(code, 7)
+                candles_5m = client.get_5min_candles(code, 2)
+                candles_3m = client.get_3min_candles(code, 2)
+                daily_candles = client.get_daily_candles(code, 200)
                 candles_1m = client.get_1min_candles(code, 1)
                 
             try:

@@ -13,7 +13,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class RealtimeDataManager:
-    def __init__(self, stock_code: str, max_len: int = 100):
+    def __init__(self, stock_code: str, max_len: int = 120):
         self.stock_code = stock_code
         self.max_len = max_len
         
@@ -23,13 +23,17 @@ class RealtimeDataManager:
         # 로컬에 적립할 최종 캔들 큐 (속도 향상을 위해 deque 사용)
         self.ticks_120_deque = deque(maxlen=max_len)
         self.candles_1m_deque = deque(maxlen=max_len)
+        self.candles_3m_deque = deque(maxlen=max_len)
+        self.candles_5m_deque = deque(maxlen=max_len)
+        self.candles_15m_deque = deque(maxlen=max_len)
+        self.daily_candles_deque = deque(maxlen=250)
         
         # 1분봉 경계면 체크를 위한 변수 (HHMM)
         self.last_processed_minute = ""
         
-        logger.info(f"[{stock_code}] RealtimeDataManager 초기화 완료 (max_len={max_len})")
+        logger.info(f"[{stock_code}] RealtimeDataManager 다중 타임프레임 모드 초기화 완료 (max_len={max_len})")
 
-    def seed_initial_data(self, past_120ticks: list, past_1m_candles: list):
+    def seed_initial_data(self, past_120ticks: list, past_1m_candles: list, past_3m: list = None, past_5m: list = None, past_15m: list = None, past_daily: list = None):
         """
         장 시작 전(또는 스크립트 가동 시) REST API로 가져온 과거 데이터를 큐에 채워넣습니다.
         """
@@ -49,7 +53,16 @@ class RealtimeDataManager:
                 except:
                     pass
 
-        logger.info(f"[{self.stock_code}] 초기 시드 데이터 적재 완료: 120틱({len(self.ticks_120_deque)}개), 1분봉({len(self.candles_1m_deque)}개)")
+        if past_3m:
+            for c in past_3m: self.candles_3m_deque.append(c)
+        if past_5m:
+            for c in past_5m: self.candles_5m_deque.append(c)
+        if past_15m:
+            for c in past_15m: self.candles_15m_deque.append(c)
+        if past_daily:
+            for c in past_daily: self.daily_candles_deque.append(c)
+
+        logger.info(f"[{self.stock_code}] 초기 시드 데이터 적재 완료 (1m/3m/5m/15m/daily)")
 
     def process_realtime_tick(self, current_price: float, volume: int, volume_power: float, time_str: str):
         """
@@ -129,11 +142,80 @@ class RealtimeDataManager:
                 
             self.last_processed_minute = current_minute
 
+        # ----------------------------------------------------
+        # 3. 3분, 5분, 15분, 일봉 실시간 라이브 업데이트
+        # ----------------------------------------------------
+        try:
+            hour = int(current_minute[:2])
+            minute = int(current_minute[2:4])
+            
+            import datetime
+            now = datetime.datetime.now()
+            date_only = f"{now.year}-{now.month:02d}-{now.day:02d}"
+            
+            def update_live_candle(deque_obj, dt_str, price, vol):
+                if len(deque_obj) > 0 and deque_obj[-1].get('time', '').startswith(dt_str[:16]):
+                    deque_obj[-1]['high'] = max(deque_obj[-1].get('high', price), price)
+                    deque_obj[-1]['low'] = min(deque_obj[-1].get('low', price), price)
+                    deque_obj[-1]['close'] = price
+                    deque_obj[-1]['volume'] = deque_obj[-1].get('volume', 0) + vol
+                else:
+                    deque_obj.append({
+                        'time': dt_str,
+                        'date': date_only,
+                        'open': price,
+                        'high': price,
+                        'low': price,
+                        'close': price,
+                        'volume': vol
+                    })
+                    
+            m_3 = (minute // 3) * 3
+            dt_3m = f"{date_only} {hour:02d}:{m_3:02d}:00"
+            update_live_candle(self.candles_3m_deque, dt_3m, float(current_price), int(volume))
+            
+            m_5 = (minute // 5) * 5
+            dt_5m = f"{date_only} {hour:02d}:{m_5:02d}:00"
+            update_live_candle(self.candles_5m_deque, dt_5m, float(current_price), int(volume))
+            
+            m_15 = (minute // 15) * 15
+            dt_15m = f"{date_only} {hour:02d}:{m_15:02d}:00"
+            update_live_candle(self.candles_15m_deque, dt_15m, float(current_price), int(volume))
+            
+            # 일봉은 날짜만 비교 (startswith date_only)
+            if len(self.daily_candles_deque) > 0 and self.daily_candles_deque[-1].get('date', '').startswith(date_only):
+                self.daily_candles_deque[-1]['high'] = max(self.daily_candles_deque[-1].get('high', float(current_price)), float(current_price))
+                self.daily_candles_deque[-1]['low'] = min(self.daily_candles_deque[-1].get('low', float(current_price)), float(current_price))
+                self.daily_candles_deque[-1]['close'] = float(current_price)
+                self.daily_candles_deque[-1]['volume'] = self.daily_candles_deque[-1].get('volume', 0) + int(volume)
+            else:
+                self.daily_candles_deque.append({
+                    'time': f"{date_only} 00:00:00",
+                    'date': date_only,
+                    'open': float(current_price),
+                    'high': float(current_price),
+                    'low': float(current_price),
+                    'close': float(current_price),
+                    'volume': int(volume)
+                })
+        except Exception as e:
+            logger.error(f"라이브 캔들 조립 중 에러: {e}")
+
     def get_120tick_list(self):
         """메인 루프에서 Phase 2 연산용으로 즉시 가져가는 120틱 리스트 (df 변환 불필요, 딕셔너리 리스트 반환)"""
-        # 기존 main.py 구조가 리스트(딕셔너리)를 기반으로 작동하므로 그대로 반환
         return list(self.ticks_120_deque)
 
     def get_1min_list(self):
-        """메인 루프에서 Phase 2 연산용으로 즉시 가져가는 1분봉 리스트"""
         return list(self.candles_1m_deque)
+
+    def get_3min_list(self):
+        return list(self.candles_3m_deque)
+
+    def get_5min_list(self):
+        return list(self.candles_5m_deque)
+
+    def get_15min_list(self):
+        return list(self.candles_15m_deque)
+        
+    def get_daily_list(self):
+        return list(self.daily_candles_deque)
