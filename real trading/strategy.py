@@ -1,14 +1,15 @@
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
-import pandas as pd
-import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
-def evaluate_trend_buy(curr_15m):
+def evaluate_trend_buy(curr_15m, candles_3m=None, first_3m_high=None):
     """
     추세 매수 로직 (15분봉 골든크로스 + 관문선 지지 + 거래량 1.2배 급증)
+    또는 관문선을 놓쳤을 때 3분봉 데이터를 활용한 신규 추세 추격 매수,
+    또는 오전장 갭상승 첫 3분봉 고가 돌파 매수 허용
     """
     curr_t3 = curr_15m.get("tema3")
     curr_t60 = curr_15m.get("tema60")
@@ -21,7 +22,7 @@ def evaluate_trend_buy(curr_15m):
     # 1. 15m TEMA3 > TEMA60 (Golden Cross state)
     is_golden_cross_state = (curr_t3 is not None and curr_t60 is not None and curr_t3 > curr_t60)
     
-    # 2. Gate Line Support
+    # 2. Gate Line Support (기존 타점)
     is_gate_supported = False
     if curr_gate and low_price is not None and close_price_15m is not None:
         is_gate_supported = (low_price <= curr_gate * 1.005) and (close_price_15m >= curr_gate)
@@ -32,11 +33,46 @@ def evaluate_trend_buy(curr_15m):
     if is_golden_cross_state and is_gate_supported and is_volume_spike:
         return True, "15m 골든크로스+관문선지지+거래량급증"
         
+    # 4. 신규 추세 추격 매수 (Momentum Chasing)
+    # 이미 주가가 높이 떠서 15분봉상 관문선을 터치하지 않은 경우 (low_price > curr_gate * 1.005)
+    is_momentum_chase = False
+    if is_golden_cross_state and curr_gate and low_price is not None and low_price > curr_gate * 1.005:
+        if candles_3m and len(candles_3m) >= 1:
+            curr_3m = candles_3m[-1]
+            c3_t3 = curr_3m.get("tema3")
+            c3_t60 = curr_3m.get("tema60")
+            c3_close = curr_3m.get("close")
+            c3_vol = curr_3m.get("volume", 0)
+            c3_vol_avg3 = curr_3m.get("vol_avg_3", 0)
+            
+            # 3분봉 상에서도 정배열이며, 주가가 단기선(TEMA3) 위에서 지지받는지 확인
+            is_3m_trend = (c3_t3 is not None and c3_t60 is not None and c3_t3 > c3_t60)
+            is_3m_support = (c3_t3 is not None and c3_close is not None and c3_close >= c3_t3)
+            # 사용자 요청: 3분봉 거래량이 최근 3캔들 평균 대비 120%(1.2배) 이상 폭발
+            is_3m_vol_spike = (c3_vol_avg3 > 0 and c3_vol >= c3_vol_avg3 * 1.2)
+            
+            if is_3m_trend and is_3m_support and is_3m_vol_spike:
+                is_momentum_chase = True
+                
+    if is_momentum_chase:
+        return True, "3m 강력추세+거래량120% 폭발 추격매수"
+        
+    # 5. 당일 첫 3분봉 고가 돌파 (Morning Breakout)
+    # [가드 레이어 1] 대추세 필터(15분봉 정배열)를 만족한 상태에서, 3분봉 종가가 아침 첫 3분봉 고가를 넘어서면 진입
+    is_morning_breakout = False
+    if is_golden_cross_state and first_3m_high is not None and candles_3m and len(candles_3m) >= 1:
+        c3_close = candles_3m[-1].get("close", 0)
+        if c3_close > first_3m_high:
+            is_morning_breakout = True
+            
+    if is_morning_breakout:
+        return True, f"장초반 첫 3분봉 고가({first_3m_high:,}원) 돌파 매수"
+        
     return False, ""
 
-def evaluate_rebuy(curr_15m, code, completed_trades, current_date):
+def evaluate_rebuy(curr_15m, candles_3m, code, completed_trades, current_date):
     """
-    재매수 로직 (당일 매도 이력 있는 종목의 15분봉 볼린저 밴드 하단 눌림목 반등)
+    재매수 로직 (당일 매도 이력 있는 종목 또는 매수기회를 놓쳤던 종목의 15분봉 볼린저 밴드 하단 눌림목 반등)
     """
     curr_t3 = curr_15m.get("tema3")
     curr_t60 = curr_15m.get("tema60")
@@ -44,9 +80,16 @@ def evaluate_rebuy(curr_15m, code, completed_trades, current_date):
     low_price = curr_15m.get("low")
     close_price_15m = curr_15m.get("close")
     
-    # 기본 전제: TEMA3 > TEMA60
+    # 기본 전제: 15m TEMA3 > TEMA60
     is_golden_cross_state = (curr_t3 is not None and curr_t60 is not None and curr_t3 > curr_t60)
     if not is_golden_cross_state:
+        return False, ""
+        
+    # 15분봉 볼린저 밴드 하단 부근 터치 또는 이탈 확인
+    is_touching_lower = (bb5_lower is not None and low_price is not None and 
+                         low_price <= bb5_lower and close_price_15m > bb5_lower)
+                         
+    if not is_touching_lower:
         return False, ""
         
     has_sold_today = False
@@ -55,11 +98,39 @@ def evaluate_rebuy(curr_15m, code, completed_trades, current_date):
             has_sold_today = True
             break
             
-    is_bb_rebuy = (bb5_lower is not None and low_price is not None and 
-                   low_price <= bb5_lower and close_price_15m > bb5_lower and has_sold_today)
-                   
-    if is_bb_rebuy:
+    # 3분봉 반등 시그널 체크 (양봉 전환 + K/L 골든크로스 또는 TEMA3 회복)
+    is_3m_rebound = False
+    if candles_3m and len(candles_3m) >= 2:
+        curr_3m = candles_3m[-1]
+        prev_3m = candles_3m[-2]
+        
+        # 3분봉 양봉 확인 (종가 > 시가)
+        c3_open = curr_3m.get("open", 0)
+        c3_close = curr_3m.get("close", 0)
+        is_bullish = c3_close > c3_open
+        
+        # 보조지표 상승 반전 확인 (K/L 골든크로스 또는 단기 TEMA3 회복)
+        c3_k = curr_3m.get("K")
+        c3_l = curr_3m.get("L")
+        p3_k = prev_3m.get("K")
+        p3_l = prev_3m.get("L")
+        
+        c3_t3 = curr_3m.get("tema3")
+        
+        is_golden_k_l = (c3_k is not None and c3_l is not None and p3_k is not None and p3_l is not None and
+                         p3_k <= p3_l and c3_k > c3_l)
+        is_tema_recovery = (c3_t3 is not None and c3_close > c3_t3)
+        
+        if is_bullish and (is_golden_k_l or is_tema_recovery):
+            is_3m_rebound = True
+            
+    # 1. 당일 이미 매도이력이 있는 종목 (기존 재매수)
+    if has_sold_today:
         return True, "15m 볼린저하단 반등 재매수"
+        
+    # 2. 당일 매도 이력이 없더라도 3분봉에서 확실한 턴어라운드(양봉+지표회복) 시그널 발생 시 신규 매수 (눌림목 진입)
+    if is_3m_rebound:
+        return True, "15m 하단눌림+3m 확실한 양봉턴어라운드 신규매수"
         
     return False, ""
 
@@ -102,252 +173,171 @@ def evaluate_inflection_sell(candles_15m, candles_5m):
             
     return False, ""
 
-def convert_to_chart_df(api_response_list):
+    return False, ""
+
+def convert_to_chart_list(api_response_list):
     """
-    stk_min_pole_chart_qry 리스트 데이터를 Pandas DataFrame으로 변환
+    stk_min_pole_chart_qry 리스트 데이터를 순수 파이썬 리스트(dict)로 변환 (Pandas 제거)
     """
     if not api_response_list:
-        return pd.DataFrame()
+        return []
         
-    df = pd.DataFrame(api_response_list)
-    
-    # 1. 필드명 매핑 및 정수형 변환 (부호 제거 및 절대값 처리)
-    df['open'] = df['open_pric'].astype(float).abs().astype(int)
-    df['high'] = df['high_pric'].astype(float).abs().astype(int)
-    df['low'] = df['low_pric'].astype(float).abs().astype(int)
-    df['close'] = df['cur_prc'].astype(float).abs().astype(int)
-    df['volume'] = df['trde_qty'].astype(float).abs().astype(int)
-    
-    # 2. 시간 축 설정 (cntr_tm: YYYYMMDDHHMMSS)
-    df['datetime'] = pd.to_datetime(df['cntr_tm'], format='%Y%m%d%H%M%S')
-    df.set_index('datetime', inplace=True)
-    
-    # 3. HTS 정렬 방식 맞추기 (과거 -> 최신순 오름차순 정렬)
-    df.sort_index(ascending=True, inplace=True)
-    
-    # 필요한 컬럼만 추출
-    return df[['open', 'high', 'low', 'close', 'volume']]
-
-def update_realtime_15min_candle(df_15min, current_tick):
-    """
-    current_tick: 웹소켓 등으로 수신한 실시간 데이터 딕셔너리
-    예: {'cntr_tm': '20260612100325', 'cur_prc': 80500, 'trde_qty': 120}
-    """
-    tick_time = pd.to_datetime(current_tick['cntr_tm'], format='%Y%m%d%H%M%S')
-    tick_price = abs(int(float(current_tick['cur_prc'])))
-    tick_qty = abs(int(float(current_tick['trde_qty'])))
-    
-    # 15분봉의 기준 시작 시간 계산 (예: 10:03:25 -> 10:00:00 / 10:16:00 -> 10:15:00)
-    candle_time = tick_time.floor('15min')
-    
-    if candle_time in df_15min.index:
-        # 기존에 존재하는 15분봉 업데이트 (장중 실시간 변동)
-        df_15min.loc[candle_time, 'high'] = max(df_15min.loc[candle_time, 'high'], tick_price)
-        df_15min.loc[candle_time, 'low'] = min(df_15min.loc[candle_time, 'low'], tick_price)
-        df_15min.loc[candle_time, 'close'] = tick_price
-        df_15min.loc[candle_time, 'volume'] += tick_qty
-    else:
-        # 새로운 15분봉 시작 (새로운 캔들 생성)
-        new_row = pd.DataFrame([{
-            'open': tick_price, 'high': tick_price, 'low': tick_price, 'close': tick_price, 'volume': tick_qty
-        }], index=[candle_time])
-        df_15min = pd.concat([df_15min, new_row])
+    parsed = []
+    for item in api_response_list:
+        raw_time = item.get("cntr_tm", "").strip()
+        if len(raw_time) < 14:
+            continue
+        dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
         
-        # 메모리 관리를 위해 너무 오래된 데이터는 삭제 (최근 500개만 유지)
-        if len(df_15min) > 500:
-            df_15min = df_15min.iloc[-500:]
+        try:
+            open_p = abs(int(float(item.get("open_pric", 0))))
+            high_p = abs(int(float(item.get("high_pric", 0))))
+            low_p = abs(int(float(item.get("low_pric", 0))))
+            close_p = abs(int(float(item.get("cur_prc", 0))))
+            vol = abs(int(float(item.get("trde_qty", 0))))
+        except ValueError:
+            continue
             
-    return df_15min
+        parsed.append({
+            "time": dt_str,
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": close_p,
+            "volume": vol
+        })
+        
+    parsed.sort(key=lambda x: x["time"])
+    return parsed
+
+def update_realtime_15min_candle_pure(candles_15m, current_tick):
+    """
+    순수 파이썬을 이용한 실시간 15분봉 업데이트 (Pandas 의존성 제거)
+    """
+    raw_time = str(current_tick.get('cntr_tm', ''))
+    if len(raw_time) < 14:
+        return candles_15m
+        
+    try:
+        tick_time = datetime.strptime(raw_time, '%Y%m%d%H%M%S')
+        tick_price = abs(int(float(current_tick.get('cur_prc', 0))))
+        tick_qty = abs(int(float(current_tick.get('trde_qty', 0))))
+    except ValueError:
+        return candles_15m
+        
+    # 15분 단위 내림 연산 (08:03 -> 08:00)
+    minute_floored = (tick_time.minute // 15) * 15
+    candle_time = tick_time.replace(minute=minute_floored, second=0, microsecond=0)
+    candle_time_str = candle_time.strftime("%Y-%m-%d %H:%M:%S")
+    
+    if candles_15m and candles_15m[-1]['time'] == candle_time_str:
+        # 기존 15분봉 업데이트
+        last = candles_15m[-1]
+        last['high'] = max(last['high'], tick_price)
+        last['low'] = min(last['low'], tick_price)
+        last['close'] = tick_price
+        last['volume'] += tick_qty
+    else:
+        # 새로운 15분봉 생성
+        candles_15m.append({
+            'time': candle_time_str,
+            'open': tick_price,
+            'high': tick_price,
+            'low': tick_price,
+            'close': tick_price,
+            'volume': tick_qty
+        })
+        
+        # 최근 500개 유지
+        if len(candles_15m) > 500:
+            candles_15m = candles_15m[-500:]
+            
+    return candles_15m
 
 class TradingBot15Min:
     def __init__(self, stk_cd):
         self.stk_cd = stk_cd
-        self.df = pd.DataFrame()       # 15분봉 차트 데이터 구조
+        self.candles = []              # 15분봉 차트 리스트 구조
         self.balance = {}              # 예수금 및 잔고 구조
         self.open_orders = {}          # 미체결 주문 구조
         
     def refresh_market_data(self, api_client):
-        """15분봉 과거 데이터 조회 및 구조화"""
-        raw_chart = api_client.get_chart_data(self.stk_cd, type='min') # 수신 키: stk_min_pole_chart_qry
-        self.df = convert_to_chart_df(raw_chart['stk_min_pole_chart_qry'])
+        raw_chart = api_client.get_chart_data(self.stk_cd, type='min')
+        self.candles = convert_to_chart_list(raw_chart.get('stk_min_pole_chart_qry', []))
         
     def refresh_account_data(self, api_client):
-        """계좌 잔고, 예수금, 미체결 현황 갱신"""
         acnt_data = api_client.get_account_info()
-        
-        # 예수금 갱신 (prsm_dpst_aset_amt)
         self.balance['cash'] = int(acnt_data.get('prsm_dpst_aset_amt', 0))
         
-        # 보유 종목 구조화 (acnt_evlt_remn_indv_tot)
         holdings = acnt_data.get('acnt_evlt_remn_indv_tot', [])
         self.balance['items'] = {
             item['stk_cd']: {
-                'qty': int(item['rmnd_qty']),
-                'pur_price': int(item['pur_pric']),
-                'cur_price': int(item['cur_prc'])
+                'qty': int(item.get('rmnd_qty', 0)),
+                'pur_price': int(item.get('pur_pric', 0)),
+                'cur_price': int(item.get('cur_prc', 0))
             } for item in holdings
         }
         
-        # 미체결 주문 구조화 (ccld_nccld_qry)
-        unfilled = api_client.get_unfilled_orders() # ccld_nccld_qry 수신
+        unfilled = api_client.get_unfilled_orders()
         self.open_orders = {
             ord['ord_no']: {
-                'stk_cd': ord['stk_cd'],
-                'qty': int(ord['nccld_qty']),
-                'price': int(ord['ord_uv']),
-                'type': ord['sell_buy_tp_nm'] # 매수/매도
+                'stk_cd': ord.get('stk_cd'),
+                'qty': int(ord.get('nccld_qty', 0)),
+                'price': int(ord.get('ord_uv', 0)),
+                'type': ord.get('sell_buy_tp_nm')
             } for ord in unfilled.get('ccld_nccld_qry', [])
         }
 
-    def check_strategy_and_order(self, api_client):
-        """15분봉 기술 지표 계산 및 매매 판단"""
-        if len(self.df) < 20: return # 최소 데이터 확보
+def update_nxt_15min_candle_pure(candles_15m, current_tick):
+    raw_time = str(current_tick.get('cntr_tm', ''))
+    if len(raw_time) < 14:
+        return candles_15m
         
-        # 예시: 15분봉 종가 기준 5일 이동평균선 계산
-        self.df['ma5'] = self.df['close'].rolling(window=5).mean()
+    try:
+        tick_time = datetime.strptime(raw_time, '%Y%m%d%H%M%S')
+    except ValueError:
+        return candles_15m
         
-        # 가장 최근에 '완성된' 캔들의 지표 확인 (현재 진행중인 [-1] 대신 바로 전 [-2] 사용 권장)
-        last_completed_candle = self.df.iloc[-2]
-        
-        # 보유 수량 확인
-        my_qty = self.balance['items'].get(self.stk_cd, {}).get('qty', 0)
-        
-        # 매매 로직 예시 (5MA 골든크로스 등)
-        if last_completed_candle['close'] > last_completed_candle['ma5'] and my_qty == 0:
-            if not self.open_orders: # 미체결 주문이 없을 때만
-                print("15분봉 조건 만족: 매수 주문 전송")
-                # api_client.send_order(...) 호출
-
-def update_nxt_15min_candle(df_15min, current_tick):
-    """
-    NXT 시장 거래시간(08:00~20:00)을 반영한 15분봉 실시간 생성 로직
-    """
-    tick_time = pd.to_datetime(current_tick['cntr_tm'], format='%Y%m%d%H%M%S')
-    
-    # 1. NXT 정규 거래 시간 체크 (08시 이전 또는 20시 이후 데이터 필터링)
     if tick_time.hour < 8 or tick_time.hour >= 20:
-        return df_15min  # 처리하지 않고 반환
+        return candles_15m
         
-    tick_price = abs(int(float(current_tick['cur_prc'])))
-    tick_qty = abs(int(float(current_tick['trde_qty'])))
-    
-    # 2. 15분 기준 버킷 내림 처리 (08:03 -> 08:00 / 15:25 -> 15:15)
-    candle_time = tick_time.floor('15min')
-    
-    # 3. 데이터프레임 업데이트 구조
-    if candle_time in df_15min.index:
-        df_15min.loc[candle_time, 'high'] = max(df_15min.loc[candle_time, 'high'], tick_price)
-        df_15min.loc[candle_time, 'low'] = min(df_15min.loc[candle_time, 'low'], tick_price)
-        df_15min.loc[candle_time, 'close'] = tick_price
-        df_15min.loc[candle_time, 'volume'] += tick_qty
-    else:
-        # 새로운 NXT 타임슬롯 진입 시 캔들 생성
-        new_row = pd.DataFrame([{
-            'open': tick_price, 'high': tick_price, 'low': tick_price, 'close': tick_price, 'volume': tick_qty
-        }], index=[candle_time])
-        df_15min = pd.concat([df_15min, new_row])
-        
-    return df_15min
+    return update_realtime_15min_candle_pure(candles_15m, current_tick)
 
-# [NXT 필수] 장 시작(08시)부터 끝(20시)까지의 완전한 15분 연속 시간축 만들기
-def fill_nxt_void_slots(df):
-    if df.empty: return df
-    
-    # 현재 데이터의 날짜 추출
-    current_date = df.index.min().strftime('%Y-%m-%d')
-    
-    # NXT 거래시간인 08:00부터 19:45까지 15분 간격의 완전한 타임라인 생성
-    nxt_full_timeline = pd.date_range(
-        start=f"{current_date} 08:00:00", 
-        end=f"{current_date} 19:45:00", 
-        freq='15min'
-    )
-    
-    # 비어있는 분봉 칸을 뼈대 위에 매핑 후 이전 종가로 전방 채움(Forward Fill)
-    df = df.reindex(nxt_full_timeline)
-    df['close'] = df['close'].ffill()
-    df['open'] = df['open'].fillna(df['close'])
-    df['high'] = df['high'].fillna(df['close'])
-    df['low'] = df['low'].fillna(df['close'])
-    df['volume'] = df['volume'].fillna(0)  # 거래가 없었으므로 거래량은 0
-    
-    return df
-
-def convert_nxt_only_df(api_response_list):
-    if not api_response_list:
-        return pd.DataFrame()
-        
-    df = pd.DataFrame(api_response_list)
-    
-    # 1. 원천 데이터 형변환 및 부호 제거
-    df['open'] = df['open_pric'].astype(float).abs().astype(int)
-    df['high'] = df['high_pric'].astype(float).abs().astype(int)
-    df['low'] = df['low_pric'].astype(float).abs().astype(int)
-    df['close'] = df['cur_prc'].astype(float).abs().astype(int)
-    df['volume'] = df['trde_qty'].astype(float).abs().astype(int)
-    
-    # 2. NXT 타임 인덱스 설정
-    df['datetime'] = pd.to_datetime(df['cntr_tm'], format='%Y%m%d%H%M%S')
-    df.set_index('datetime', inplace=True)
-    df.sort_index(ascending=True, inplace=True)
-    
-    # 3. [NXT 단독 필수] 거래 시간 가드 필터 (08:00 ~ 20:00 사이 데이터만 생존)
-    # nxt_only_df = df.between_time('08:00', '19:59:59')
-    
-    return df[['open', 'high', 'low', 'close', 'volume']]
-
-def aggregate_nxt_realtime_tick(df_nxt, current_tick):
+def fill_nxt_void_slots_pure(candles):
     """
-    NXT 단독 세션 실시간 틱 수신 시 15분봉 업데이트 로직
+    NXT 장 시작(08:00)부터 끝(19:45)까지 비어있는 15분봉 칸을 전방 채움(Forward Fill)
     """
-    tick_time = pd.to_datetime(current_tick['cntr_tm'], format='%Y%m%d%H%M%S')
-    
-    # NXT 정규 세션 타임 외의 틱 데이터 진입 원천 차단
-    if tick_time.hour < 8 or tick_time.hour >= 20:
-        return df_nxt
+    if not candles:
+        return candles
         
-    tick_price = abs(int(float(current_tick['cur_prc'])))
-    tick_qty = abs(int(float(current_tick['trde_qty'])))
+    current_date = candles[0]['time'][:10] # YYYY-MM-DD
+    start_time = datetime.strptime(f"{current_date} 08:00:00", "%Y-%m-%d %H:%M:%S")
+    end_time = datetime.strptime(f"{current_date} 19:45:00", "%Y-%m-%d %H:%M:%S")
     
-    # 15분 단위 내림 연산 (08:01 -> 08:00 / 19:54 -> 19:45)
-    candle_time = tick_time.floor('15min')
+    # 기존 데이터를 딕셔너리로 매핑 (빠른 검색용)
+    candle_dict = {c['time']: c for c in candles}
     
-    if candle_time in df_nxt.index:
-        # 실시간 진행 중인 15분봉 업데이트
-        df_nxt.loc[candle_time, 'high'] = max(df_nxt.loc[candle_time, 'high'], tick_price)
-        df_nxt.loc[candle_time, 'low'] = min(df_nxt.loc[candle_time, 'low'], tick_price)
-        df_nxt.loc[candle_time, 'close'] = tick_price
-        df_nxt.loc[candle_time, 'volume'] += tick_qty
-    else:
-        # 새로운 15분 타임슬롯 생성
-        new_row = pd.DataFrame([{
-            'open': tick_price, 'high': tick_price, 'low': tick_price, 'close': tick_price, 'volume': tick_qty
-        }], index=[candle_time])
-        df_nxt = pd.concat([df_nxt, new_row])
+    filled_candles = []
+    curr_time = start_time
+    last_close = candles[0]['close'] if candles else 0
+    
+    while curr_time <= end_time:
+        time_str = curr_time.strftime("%Y-%m-%d %H:%M:%S")
+        if time_str in candle_dict:
+            c = candle_dict[time_str]
+            filled_candles.append(c)
+            last_close = c['close']
+        else:
+            # 빈 타임슬롯 생성 (이전 종가로 채움, 거래량 0)
+            filled_candles.append({
+                'time': time_str,
+                'open': last_close,
+                'high': last_close,
+                'low': last_close,
+                'close': last_close,
+                'volume': 0
+            })
+        curr_time += timedelta(minutes=15)
         
-    return df_nxt
+    return filled_candles
 
-def finalize_nxt_time_series(df):
-    if df.empty: return df
-    
-    # 현재 데이터프레임의 날짜 기준 추출
-    current_date = df.index.min().strftime('%Y-%m-%d')
-    
-    # 08:00부터 19:45까지 총 48개의 완벽한 NXT 15분봉 타임프레임 표준 생성
-    nxt_standard_timeline = pd.date_range(
-        start=f"{current_date} 08:00:00", 
-        end=f"{current_date} 19:45:00", 
-        freq='15min'
-    )
-    
-    # 표준 타임라인에 기존 데이터를 매핑하여 빈 구멍(Gap) 찾아내기
-    df = df.reindex(nxt_standard_timeline)
-    
-    # 거래가 없던 15분 구간은 이전 15분봉의 '종가'를 그대로 유지
-    df['close'] = df['close'].ffill()
-    df['open'] = df['open'].fillna(df['close'])
-    df['high'] = df['high'].fillna(df['close'])
-    df['low'] = df['low'].fillna(df['close'])
-    df['volume'] = df['volume'].fillna(0) # 거래량만 0 처리
-    
-    return df

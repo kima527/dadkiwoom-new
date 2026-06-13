@@ -54,6 +54,11 @@ PREV_FLU_RATES = {}
 # ─────────────────────────────────────────────────────────
 PREV_VP_STATE = {}
 
+# ─────────────────────────────────────────────────────────
+# 오전장 갭상승 첫 3분봉(08:00~08:03) 고가 라인 추적용
+# ─────────────────────────────────────────────────────────
+FIRST_3M_HIGH = {}
+
 # Filepath for watchlist Excel
 WATCHLIST_PATH = config.WATCHLIST_FILE
 
@@ -405,7 +410,8 @@ def run_trading_bot():
             # 장 시작 시 전일의 체결강도 및 등락률 상태 일괄 초기화 (조건 꼬임 방지)
             PREV_VP_STATE.clear()
             PREV_FLU_RATES.clear()
-            logger.info("장초반 턴어라운드 및 급등 추적을 위한 체결강도/등락률 상태(PREV_VP_STATE, PREV_FLU_RATES)가 안전하게 초기화되었습니다.")
+            FIRST_3M_HIGH.clear()
+            logger.info("장초반 턴어라운드 및 급등 추적을 위한 상태(PREV_VP_STATE, PREV_FLU_RATES) 및 첫3분봉 고가 라인(FIRST_3M_HIGH)이 초기화되었습니다.")
             
             try:
                 with open(liquidation_file, "w") as f:
@@ -553,6 +559,14 @@ def run_trading_bot():
             if candles_5m and len(candles_5m) > 0:
                 calculate_indicators_pure(
                     candles_5m,
+                    use_compressed_peak=True,
+                    tema_period1=config.TEMA_PERIOD_SHORT,
+                    tema_period2=config.TEMA_PERIOD_LONG
+                )
+                
+            if candles_3m and len(candles_3m) > 0:
+                calculate_indicators_pure(
+                    candles_3m,
                     use_compressed_peak=True,
                     tema_period1=config.TEMA_PERIOD_SHORT,
                     tema_period2=config.TEMA_PERIOD_LONG
@@ -788,6 +802,7 @@ def run_trading_bot():
                 "is_early_cond3_ok": is_early_cond3_ok,
                 "is_price_rejection": is_price_rejection,
                 "candles_15m": candles_15m,
+                "candles_5m": candles_5m,
                 "candles_1m": candles_1m,
                 "candles_3m": candles_3m,
                 "daily_candles": daily_candles,
@@ -927,10 +942,46 @@ def run_trading_bot():
             
             latest_15m = stock_data.get("latest", {})
             candles_15m = stock_data.get("candles_15m", [])
+            candles_5m = stock_data.get("candles_5m", [])
+            candles_3m = stock_data.get("candles_3m", [])
+            
+            # ── [당일 첫 3분봉 고가 라인 추출 (Morning Breakout 전략용)] ──
+            if code not in FIRST_3M_HIGH and candles_3m:
+                for c in candles_3m:
+                    # 키움 시간 문자열(YYYY-MM-DD HH:MM:SS) 중 08:00:00 또는 08:03:00 캔들 고가 캡처
+                    if " 08:00:00" in c["time"] or " 08:03:00" in c["time"]:
+                        # 오늘 날짜인지 확인
+                        if current_date in c["time"]:
+                            FIRST_3M_HIGH[code] = c["high"]
+                            logger.info(f"🌅 [{name}] 오전장 첫 3분봉 고가 라인 구축 완료: {c['high']:,}원")
+                            break
+            
+            first_3m_high_val = FIRST_3M_HIGH.get(code, None)
+            
+            # 현재 3분봉 타임슬롯 추출
+            current_3m_slot = candles_3m[-1]["time"] if candles_3m else candle_time
+            
+            # ── 0. 미체결 3분봉 타임아웃 즉시 취소 로직 (Slippage 방지) ──
+            # 이 종목에 미체결 주문이 있고, 주문했던 3분봉 타임슬롯이 이미 지나갔다면 취소
+            unfilled_list = client.get_unfilled_orders()
+            if unfilled_list:
+                for u in unfilled_list:
+                    if u.get("code") == code:
+                        last_buy_slot = sent_alerts[code].get("buy_3m_slot")
+                        if last_buy_slot and last_buy_slot != current_3m_slot:
+                            order_no = u.get("order_no")
+                            unfilled_qty = int(u.get("unfilled_qty", 0))
+                            if unfilled_qty > 0:
+                                logger.info(f"⏳ [미체결 타임아웃] 3분 타임슬롯 갱신에 따른 즉시 취소: {name} ({code})")
+                                client.cancel_order(order_no, code, unfilled_qty)
+                                notifier.send_all(f"⏳ [미체결 취소] 새로운 3분봉 갱신으로 지정가 매수 취소: {name}")
+                                # 취소했으므로 다시 타점을 노릴 수 있도록 락 해제
+                                sent_alerts[code]["buy_3m_slot"] = ""
             
             # ── 1. 매수 조건 확인 (15분봉 전용) ──
             if is_buy_window and not is_held:
-                if sent_alerts[code].get("buy") != candle_time:
+                # 3분봉 타임슬롯 락 (같은 3분봉 내 중복 발사 방지)
+                if sent_alerts[code].get("buy_3m_slot") != current_3m_slot:
                     buy_condition_met = False
                     cond_type = ""
                     
@@ -938,11 +989,11 @@ def run_trading_bot():
                         curr_15m = candles_15m[-1]
                         close_price_15m = curr_15m.get("close")
                         
-                        # 추세 매수 로직 평가 (15m 골든크로스+관문선지지+거래량)
-                        is_trend_buy, trend_reason = evaluate_trend_buy(curr_15m)
+                        # 추세 매수 로직 평가 (15m 골든크로스+관문선지지+거래량+장초반돌파)
+                        is_trend_buy, trend_reason = evaluate_trend_buy(curr_15m, candles_3m, first_3m_high_val)
                         
                         # 재매수 로직 평가 (15m 볼린저하단 반등)
-                        is_rebuy, rebuy_reason = evaluate_rebuy(curr_15m, code, BOT_STATE.get("completed_trades", []), current_date)
+                        is_rebuy, rebuy_reason = evaluate_rebuy(curr_15m, candles_3m, code, BOT_STATE.get("completed_trades", []), current_date)
                         
                         # Evaluate final entry
                         if is_trend_buy:
@@ -962,6 +1013,7 @@ def run_trading_bot():
                             logger.info(f"🚀 [최종 관문 통과 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
                             
                             sent_alerts[code]["buy"] = candle_time
+                            sent_alerts[code]["buy_3m_slot"] = current_3m_slot  # 3분봉 타임락 체결!
                             sent_alerts[code]["buy_reason"] = cond_type
                             
                             budget = cash * 0.95
