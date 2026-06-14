@@ -30,8 +30,11 @@ class KiwoomWebSocketRunner:
 
     def stop(self):
         self.is_running = False
-        if self.loop:
-            self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.loop and not self.loop.is_closed():
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except RuntimeError:
+                pass
 
     def _run_async_loop(self):
         self.loop = asyncio.new_event_loop()
