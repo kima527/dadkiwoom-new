@@ -151,6 +151,38 @@ def update_watchlist_excel(client: KiwoomClient, filepath: str):
     except Exception as e:
         logger.error(f"Failed to save updated watchlist Excel: {e}")
 
+def overwrite_my_pick_excel(client: KiwoomClient, filepath: str, monitor_list: list):
+    """
+    Overwrites the watchlist Excel file with the dynamically selected monitor_list.
+    """
+    logger.info(f"Overwriting watchlist Excel file with {len(monitor_list)} dynamic pool stocks...")
+    holdings = client.get_holdings()
+    holdings_map = {h["code"]: h for h in holdings}
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "My Pick"
+    
+    header = ["종목코드", "종목명", "보유수량", "매입단가", "현재가", "테마"]
+    for i, col_name in enumerate(header, 1):
+        ws.cell(row=1, column=i).value = col_name
+        
+    for r_idx, stock in enumerate(monitor_list, 2):
+        code = stock["code"]
+        name = stock["name"]
+        theme = stock.get("theme", "기타")
+        
+        if code in holdings_map:
+            h = holdings_map[code]
+            ws.append([code, name, h["quantity"], h["buy_price"], h.get("current_price", ""), theme])
+        else:
+            ws.append([code, name, "", "", "", theme])
+            
+    try:
+        wb.save(filepath)
+    except Exception as e:
+        logger.error(f"Failed to save overwritten watchlist Excel: {e}")
+
 def load_watchlist(filepath: str) -> list:
     """Loads watchlisted stocks. Returns all watchlist stocks for multi-stock trading."""
     # 실시간 다중 종목 대응을 위해 항상 전체 관심종목을 반환합니다.
@@ -444,6 +476,14 @@ def run_trading_bot():
             monitor_list.append({"code": c, "name": name_val, "theme": "주도주/보유"})
         
         BOT_STATE["watchlist_count"] = len(monitor_list)
+        
+        # 엑셀 파일은 다이내믹 풀 리밸런싱이 발생했거나, 봇 시작 시점에만 저장 (과부하 방지)
+        if not hasattr(pool_manager, 'excel_saved_once'):
+            if monitor_list:
+                overwrite_my_pick_excel(client, WATCHLIST_PATH, monitor_list)
+                pool_manager.excel_saved_once = True
+        elif (to_add or to_remove) and monitor_list:
+            overwrite_my_pick_excel(client, WATCHLIST_PATH, monitor_list)
         if not monitor_list:
             logger.warning("Monitor list is empty. Sleeping for 1 minute...")
             time.sleep(60)

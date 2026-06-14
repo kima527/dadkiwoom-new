@@ -11,26 +11,27 @@ class DynamicPoolManager:
         self.rebalance_interval = 600  # 10분 (초)
         
     def get_market_ranking_codes(self):
-        """거래대금 및 등락률 상위 종목 수집"""
-        combined_codes = []
+        """거래대금 및 등락률 상위 종목 수집 및 교집합 계산"""
+        intersection_codes = []
+        trade_codes = []
         try:
-            # 등락률 상위
+            # 등락률 상위 100종목 추출
             fluct_codes = []
             if hasattr(self.api_client, 'get_top_fluctuation_stocks'):
-                fluct_codes = self.api_client.get_top_fluctuation_stocks(market_type="000", limit=30)
+                fluct_codes = self.api_client.get_top_fluctuation_stocks(market_type="000", limit=100)
                 
-            # 거래대금 상위
-            trade_codes = []
+            # 거래대금 상위 100종목 추출
             if hasattr(self.api_client, 'get_top_trading_value_stocks'):
-                trade_codes = self.api_client.get_top_trading_value_stocks(market_type="000", limit=30)
+                trade_codes = self.api_client.get_top_trading_value_stocks(market_type="000", limit=100)
                 
-            for c in trade_codes + fluct_codes:
-                if c and c not in combined_codes:
-                    combined_codes.append(c)
+            # 교집합 추출
+            for c in trade_codes:
+                if c in fluct_codes and c not in intersection_codes:
+                    intersection_codes.append(c)
         except Exception as e:
             logger.error(f"마켓 랭킹 수집 에러: {e}")
             
-        return combined_codes
+        return intersection_codes, trade_codes
         
     def rebalance_pool(self, current_active_codes, my_pick_codes, holdings_raw, unfilled_raw):
         """
@@ -65,21 +66,20 @@ class DynamicPoolManager:
                 protected_codes.add(code.replace('A', ''))
                 
         # 2. 최신 실시간 랭킹 종목 로드
-        fresh_ranking_codes = self.get_market_ranking_codes()
+        intersection_codes, trade_codes = self.get_market_ranking_codes()
         
         # 3. 새로운 풀 구성 (보유/미체결 보호 종목 최우선)
         new_candidate_pool = list(protected_codes)
         
-        # 4. [안전 지향 로직] 엑셀 관심종목(my_pick) 중 현재 시장 주도주(fresh_ranking)인 것을 1순위 편입
-        hot_my_picks = [c for c in my_pick_codes if c in fresh_ranking_codes]
-        for code in hot_my_picks:
+        # 4. [1순위] 거래대금 & 등락률 교집합 종목 편입
+        for code in intersection_codes:
             if len(new_candidate_pool) >= self.max_pool_size:
                 break
             if code not in new_candidate_pool:
                 new_candidate_pool.append(code)
                 
-        # 5. 그래도 슬롯이 남는다면 나머지 엑셀 관심종목으로 채움 (외부 종목 절대 차단)
-        for code in my_pick_codes:
+        # 5. [2순위] 슬롯이 남으면 거래대금 최상위 종목들로 순차적 채움
+        for code in trade_codes:
             if len(new_candidate_pool) >= self.max_pool_size:
                 break
             if code not in new_candidate_pool:
