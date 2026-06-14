@@ -336,7 +336,20 @@ def run_trading_bot():
     initial_codes = list(set(my_pick_codes + to_add))
     
     def init_engine_for_code(c):
-        dm = RealtimeDataManager(stock_code=c, max_len=120)
+        limit = 100000000
+        try:
+            info = client.stock_info_api.basic_stock_information_request_ka10001(stock_code=c)
+            if info and info.get("return_code") == 0:
+                mac_str = info.get("mac", "0")
+                if mac_str:
+                    mac_val = int(mac_str)
+                    if mac_val >= 10000: # 1조원 이상
+                        limit = 200000000
+                        logger.info(f"[{c}] 대형주 감지 (시총: {mac_val}억) -> 수급 기준 2억으로 상향")
+        except Exception as e:
+            logger.warning(f"[{c}] 시가총액 조회 중 에러 (기본 1억 적용): {e}")
+
+        dm = RealtimeDataManager(stock_code=c, max_len=120, cumulative_limit=limit)
         DATA_MANAGERS[c] = dm
         
         try:

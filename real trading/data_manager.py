@@ -13,9 +13,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 class RealtimeDataManager:
-    def __init__(self, stock_code: str, max_len: int = 120):
+    def __init__(self, stock_code: str, max_len: int = 120, cumulative_limit: int = 100000000):
         self.stock_code = stock_code
         self.max_len = max_len
+        self.cumulative_limit = cumulative_limit
         
         # 원시 틱 체결 데이터 임시 저장소 (120틱 및 1분봉 생성용)
         self.raw_tick_buffer = []
@@ -32,6 +33,9 @@ class RealtimeDataManager:
         self.last_processed_minute = ""
         
         logger.info(f"[{stock_code}] RealtimeDataManager 다중 타임프레임 모드 초기화 완료 (max_len={max_len})")
+
+        self.sugeub_history = deque()
+        self.last_tick_price = 0.0
 
     @staticmethod
     def fill_void_gaps(candles: list, freq_minutes: int) -> list:
@@ -144,6 +148,33 @@ class RealtimeDataManager:
         }
         self.raw_tick_buffer.append(tick_data)
 
+        # [필터링 1] 매수 체결 여부 추론 (현재가가 직전 체결가 이상이면 매수세로 간주)
+        is_buy = False
+        if self.last_tick_price == 0.0:
+            is_buy = True
+        elif current_price >= self.last_tick_price:
+            is_buy = True
+        self.last_tick_price = current_price
+
+        # [필터링 2] 3초 누적 1억 원 or 단일 5천만 원 돌파 감지
+        sugeub_spike_triggered = False
+        if is_buy:
+            import time
+            current_time_sec = time.time()
+            amount = float(current_price) * abs(volume)
+            
+            self.sugeub_history.append((current_time_sec, amount))
+            
+            # 3초가 지난 과거 데이터 메모리에서 즉시 삭제
+            while self.sugeub_history and (current_time_sec - self.sugeub_history[0][0] > 3.0):
+                self.sugeub_history.popleft()
+                
+            total_3s_amount = sum(x[1] for x in self.sugeub_history)
+            
+            if amount >= 50000000 or total_3s_amount >= self.cumulative_limit:
+                sugeub_spike_triggered = True
+                logger.info(f"🚨 [수급포착] {self.stock_code} | 순간체결: {amount:,.0f}원 | 3초누적: {total_3s_amount:,.0f}원 (기준: {self.cumulative_limit:,.0f}원)")
+
         # ----------------------------------------------------
         # 1. 120틱 캔들 생성 로직 (120회 체결마다 1개 봉 생성)
         # ----------------------------------------------------
@@ -221,7 +252,7 @@ class RealtimeDataManager:
                     deque_obj[-1]['close'] = price
                     deque_obj[-1]['volume'] = deque_obj[-1].get('volume', 0) + vol
                 else:
-                    deque_obj.append({
+                    new_candle = {
                         'time': dt_str,
                         'date': date_only,
                         'open': price,
@@ -229,7 +260,11 @@ class RealtimeDataManager:
                         'low': price,
                         'close': price,
                         'volume': vol
-                    })
+                    }
+                    deque_obj.append(new_candle)
+                    
+                if sugeub_spike_triggered and len(deque_obj) > 0:
+                    deque_obj[-1]['signal_sugeub_spike'] = True
                     
             m_3 = (minute // 3) * 3
             dt_3m = f"{date_only} {hour:02d}:{m_3:02d}:00"
@@ -259,6 +294,10 @@ class RealtimeDataManager:
                     'close': float(current_price),
                     'volume': int(volume)
                 })
+                
+            if sugeub_spike_triggered and len(self.daily_candles_deque) > 0:
+                self.daily_candles_deque[-1]['signal_sugeub_spike'] = True
+                
         except Exception as e:
             logger.error(f"라이브 캔들 조립 중 에러: {e}")
 
