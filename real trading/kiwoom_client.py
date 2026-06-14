@@ -720,6 +720,45 @@ class KiwoomRealClient:
             logger.error(f"Error fetching NXT hoga for {stock_code}: {e}")
             return None
 
+    def get_hoga_ask_volume(self, stock_code: str) -> dict:
+        """
+        특정 종목의 실시간 호가 잔량을 조회하여, 매도 1호가~5호가의 총 잔량 금액을 계산합니다.
+        """
+        try:
+            from kiwoom_rest_api.koreanstock.market_condition import MarketCondition
+            mc = MarketCondition(base_url=self.base_url, token_manager=self.token_manager)
+            clean_code = self._sanitize_code(stock_code)
+            
+            # 주간/야간 자동 판별 (기존 로직 재사용)
+            data_code = self._get_data_code(clean_code)
+            
+            result = mc.stock_quote_request_ka10004(stock_code=data_code)
+            if not result or result.get("return_code") != 0:
+                return None
+                
+            ask_amount = 0.0
+            
+            # 1호가
+            price1 = abs(float(result.get("sel_fpr_bid", "0").replace("+", "").replace("-", "")))
+            vol1 = float(result.get("sel_fpr_req", "0"))
+            ask_amount += (price1 * vol1)
+            
+            # 2~5호가
+            for i in range(2, 6):
+                p_str = result.get(f"sel_{i}th_pre_bid", "0").replace("+", "").replace("-", "")
+                v_str = result.get(f"sel_{i}th_pre_req", "0")
+                price = abs(float(p_str))
+                vol = float(v_str)
+                ask_amount += (price * vol)
+                
+            return {
+                "total_ask_5_amount": ask_amount
+            }
+            
+        except Exception as e:
+            logger.error(f"Error fetching hoga ask volume for {stock_code}: {e}")
+            return None
+
     def get_unfilled_orders(self) -> list:
         """
         실전 계좌의 미체결 주문 목록을 조회합니다.

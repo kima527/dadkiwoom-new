@@ -1092,8 +1092,8 @@ def run_trading_bot():
                             logger.info(f"⏳ [쿨타임] {name}({code}) - 매도 후 60초가 경과하지 않아 신규 진입을 보류합니다.")
                         else:
                             from indicator import adjust_price_by_ticks
-                            buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 1)
-                            logger.info(f"🚀 [최종 관문 통과 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+1호가)")
+                            buy_price = get_ext_adjusted_price(client, code, close_price, "buy", 5)
+                            logger.info(f"🚀 [최종 관문 통과 매수 진입] {name} ({code}) {cond_type} | 현재가: {close_price:,.0f}원 → 매수가: {buy_price:,.0f}원 (+5호가)")
                             
                             sent_alerts[code]["buy"] = candle_time
                             sent_alerts[code]["buy_3m_slot"] = current_3m_slot  # 3분봉 타임락 체결!
@@ -1104,6 +1104,16 @@ def run_trading_bot():
                             if getattr(config, 'TEST_MODE_1_SHARE', False):
                                 qty = 1
                             
+                            # [호가 잔량 방어막(Orderbook Defense) 로직]
+                            if budget > 0:
+                                hoga_data = client.get_hoga_ask_volume(code)
+                                if hoga_data and "total_ask_5_amount" in hoga_data:
+                                    total_ask_volume_amount = hoga_data["total_ask_5_amount"]
+                                    # 1회 진입 예산의 3배 미만일 경우 슬리피지 위험으로 간주하고 취소
+                                    if total_ask_volume_amount < (budget * 3):
+                                        logger.warning(f"⚠️ [진입 취소] {name}({code}) 매도 호가창이 너무 얇습니다. (1~5호가 잔량: {total_ask_volume_amount:,.0f}원 < 안전기준: {budget*3:,.0f}원)")
+                                        continue
+                                        
                             if qty > 0:
                                 order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")
                                 if order_res and order_res.get("return_code") == 0:
