@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta, time as dt_time
 import openpyxl
 import config
 from kiwoom_client import KiwoomClient
-from indicator import calculate_indicators_pure, get_ext_adjusted_price
+from indicator import calculate_indicators_pure
 from strategy import evaluate_trend_buy, evaluate_rebuy, evaluate_inflection_sell, check_highspeed_liquidation
 from notifier import Notifier
 
