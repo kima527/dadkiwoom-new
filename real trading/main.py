@@ -792,17 +792,44 @@ def run_trading_bot():
                 prev_vp_for_rejection = volume_power
                 if has_real_tick_data:
                     if code not in PREV_VP_STATE:
-                        PREV_VP_STATE[code] = {'prev_vp': volume_power, 'was_below_100': (volume_power < 100.0)}
+                        import time as _time
+                        PREV_VP_STATE[code] = {
+                            'prev_vp': volume_power, 
+                            'was_below_100': (volume_power < 100.0),
+                            'history': []
+                        }
                     
                     state = PREV_VP_STATE[code]
                     prev_vp_for_rejection = state['prev_vp']
+                    
+                    import time as _time
+                    current_t = _time.time()
+                    state['history'].append((current_t, volume_power))
+                    
+                    # 10초가 지난 과거 데이터는 제거
+                    while state['history'] and current_t - state['history'][0][0] > 10.0:
+                        state['history'].pop(0)
                     
                     if volume_power < 100.0:
                         state['was_below_100'] = True
                     
                     if state['was_below_100']:
-                        if volume_power >= 100.0 or volume_power >= state['prev_vp'] * 1.2:
-                            is_early_cond3_ok = True
+                        # [가속도 로직 추가] 1단계: 세력 수급 3초 내 1억/2억 유입 조건이 만족된 상태에서만 활성화
+                        if latest.get('signal_sugeub_spike', False):
+                            is_steep_slope = False
+                            if len(state['history']) >= 2:
+                                old_t, old_vp = state['history'][0]
+                                time_diff = current_t - old_t
+                                vp_diff = volume_power - old_vp
+                                if time_diff > 0:
+                                    slope = vp_diff / time_diff
+                                    if slope >= 1.5:
+                                        is_steep_slope = True
+                                        logger.info(f"🚨 [가속도 포착] {name}({code}) 세력 수급 확인 + 체결강도 수직 상승! (기울기: +{slope:.2f}p/sec)")
+                                        
+                            # 1단계 수급이 확인된 상태에서, 체결강도가 100을 돌파하며 가속도가 붙었거나 20% 급증했을 때
+                            if (volume_power >= 100.0 and is_steep_slope) or volume_power >= state['prev_vp'] * 1.2:
+                                is_early_cond3_ok = True
                     
                     # 상태 업데이트
                     state['prev_vp'] = volume_power
