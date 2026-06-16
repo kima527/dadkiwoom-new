@@ -49,8 +49,13 @@ class DynamicPoolManager:
         # 2. 최신 실시간 랭킹 종목 로드
         intersection_codes, trade_codes = self.get_market_ranking_codes()
         
-        # 3. 새로운 풀 구성 (보유/미체결 보호 종목 최우선)
-        new_candidate_pool = list(protected_codes)
+        # 3. 새로운 풀 구성 (보유/미체결 + 엑셀 관심종목 모두 포함)
+        new_candidate_pool = list(set(list(protected_codes) + my_pick_codes))
+        
+        # 🛡️ [물리적 방어막: AI 무단 수정 방지 락] 🛡️
+        # 사용자가 수동으로 1종목으로 줄여달라고 명시하기 전까지 절대 이 코드를 삭제하거나 조건(my_pick_codes 제외)을 변경하지 마세요.
+        # 기존 버그(모니터링 1종목으로 축소되는 현상)의 원인이었던 풀 청소 로직을 영구적으로 방어합니다.
+        assert all(code in new_candidate_pool for code in my_pick_codes), "[AI CONTEXT LOCK] FATAL: 엑셀 관심종목(my_pick_codes)은 무조건 감시 풀에 포함되어야 합니다!"
         
         # 4. [1순위] 거래대금 & 등락률 교집합 종목 편입
         for code in intersection_codes:

@@ -375,6 +375,17 @@ def run_trading_bot():
     to_add, _ = pool_manager.rebalance_pool([], my_pick_codes, init_holdings, [])
     initial_codes = list(set(my_pick_codes + to_add))
     
+    global_seed_cache = {}
+    seed_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed_data", "seed_data.json")
+    if os.path.exists(seed_cache_path):
+        try:
+            import json
+            with open(seed_cache_path, "r", encoding="utf-8") as f:
+                global_seed_cache = json.load(f)
+            logger.info(f"Loaded {len(global_seed_cache)} seed cache entries from {seed_cache_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load seed cache: {e}")
+
     def init_engine_for_code(c):
         limit = 100000000
         try:
@@ -440,7 +451,7 @@ def run_trading_bot():
             
         ws = KiwoomWebSocketRunner(client.token_manager, dm)
         WS_RUNNERS[c] = ws
-        feeder = HybridDataFeeder(client, dm, interval=1.0)
+        feeder = HybridDataFeeder(client, dm, interval=10.0)
         FEEDERS[c] = feeder
         ws.start()
 
@@ -1209,19 +1220,19 @@ def run_trading_bot():
                         curr_15m = candles_15m[-1]
                         close_price_15m = curr_15m.get("close")
                         
-                        # 추세 매수 로직 평가 (15m 골든크로스+관문선지지+거래량초반돌파 OR 5m 정배열)
-                        is_trend_buy, trend_reason = evaluate_trend_buy(candles_15m, candles_3m, first_3m_high_val, candles_5m)
-                        
+                        # 15분봉 SMA3/5 교차 추세 매수 로직 (체결강도, 5분수급 포함)
+                        vp = sr.get("volume_power", 100.0)
+                        is_trend_buy, trend_reason = evaluate_trend_buy(candles_15m, candles_5m, vp)                        
                         # 순위 역전 & 체결속도 폭발 진입 로직
-                                                if not is_trend_buy and sr.get("is_overtaking", False):
+                        if not is_trend_buy and sr.get("is_overtaking", False):
                             velocity = DATA_MANAGERS[code].get_tick_velocity()
                             if velocity < 2.0:
                                 is_trend_buy = True
                                 trend_reason = f"⚡ 순위역전 모멘텀 돌파 (위치: {sr.get('curr_rank', 0)}등, 변동: +{sr.get('flu_delta', 0.0):.2f}%, 체결속도: {velocity:.2f}초)"
                         
-                        # 재매수 로직 평가 (15m 볼린저하단 반등 + 1분봉 단기수급 돌파)
-                        candles_1m = stock_data.get("candles_1m", [])
-                        is_rebuy, rebuy_reason = evaluate_rebuy(curr_15m, candles_3m, code, BOT_STATE.get("completed_trades", []), current_date, candles_1m, t_hour)
+                        # 재매수 로직은 사용자 요청(완전 교체)에 따라 일시 비활성화
+                        is_rebuy = False
+                        rebuy_reason = ""
                         
                         # Evaluate final entry
                         if is_trend_buy:
@@ -1300,12 +1311,12 @@ def run_trading_bot():
                         sell_reason_str = f"🛑 절대 손절가 도달 ({profit_rate:.2f}%)"
                         
                 if not is_stop_loss:
-                    # 1차: 초고속 청산 가드 (틱 레벨 저항선 이탈 체크)
-                    should_sell, sell_reason_str = check_highspeed_liquidation(candles_5m, current_p)
+                    # 1차: 15분봉 초고속 청산 가드 (틱 레벨 저항선 이탈 체크)
+                    should_sell, sell_reason_str = check_highspeed_liquidation(candles_15m, current_p)
                     
                     if not should_sell:
-                        # 2차: 변곡 추세 매도 로직 평가 (strategy.py 위임)
-                        should_sell, sell_reason_str = evaluate_inflection_sell(candles_15m, candles_5m)
+                        # 2차: 변곡 추세 매도 로직 평가 (15분봉 데드크로스)
+                        should_sell, sell_reason_str = evaluate_inflection_sell(candles_15m)
                         
                 # 최종 매도 실행
                 if should_sell:
@@ -1368,198 +1379,22 @@ def run_trading_bot():
         KST = timezone(timedelta(hours=9))
         now_kst = datetime.now(KST)
         
-        sleep_time = 120
-        if (now_kst.hour == 8 and now_kst.minute >= 59) or (now_kst.hour == 9 and now_kst.minute <= 15):
-            sleep_time = 30
-            logger.info("장 초반 변동성 구간 (08:59~09:15). 30초 대기 후 스캔합니다...")
+        if not is_market_open():
+            sleep_time = 120
+            logger.info("Market closed. Sleeping for 2 minutes...")
         else:
-            logger.info("Completed polling cycle. Sleeping for 2 minutes...")
+            sleep_time = 5
+            # 🛡️ [물리적 방어막: AI 무단 수정 방지 락] 🛡️
+            # 39개 종목을 거의 실시간으로 추적하기 위해 장중에는 무조건 5초 이하로 대기해야 합니다.
+            # 사용자가 명시적으로 늘려달라고 요구하기 전까지 절대 120초 등 긴 시간으로 수정하지 마세요.
+            assert sleep_time <= 5, "[AI CONTEXT LOCK] FATAL: 장중 스캔 대기 시간을 5초 초과로 늘리지 마세요! (39개 종목 초고속 스캔 필수)"
+            logger.info("Completed polling cycle. Sleeping for 5 seconds...")
 
         next_poll = (now_kst + timedelta(seconds=sleep_time)).strftime("%Y-%m-%d %H:%M:%S")
         BOT_STATE["next_poll_at"] = next_poll
         BOT_STATE["status"] = "sleeping"
         time.sleep(sleep_time)
 
-
-
-
-def get_target_stock(filepath: str) -> dict:
-    """단일 종목 집중 매매를 위한 대상 종목 추출"""
-    monitor_list = load_watchlist(filepath)
-    if not monitor_list:
-        logger.warning(f"Watchlist is empty. Cannot start single stock trading.")
-        return None
-    return monitor_list[0]
-
-def run_single_stock_trading_advanced():
-    """
-    1개 종목을 무한 반복 매매하는 HFT 마스터 루프.
-    1분봉 데이터(예측용) + 120틱 데이터(최종 타점 확인용)를 결합하여 감시합니다.
-    """
-    logger.info("🚀 [1분봉+120틱 멀티 프레임] 단일 종목 집중 스나이퍼 봇 가동")
-    from kiwoom_client import KiwoomClient
-    client = KiwoomClient()
-    notifier = Notifier()
-    
-    # 별도의 요청 전까지는 무조건 LG전자로 묶어둠 (하드코딩)
-    code = "066570"
-    name = "LG전자"
-    
-    logger.info(f"🎯 실시간 초정밀 감시 대상: {name} ({code}) - 고정 모드")
-    
-    kst = timezone(timedelta(hours=9))
-
-    while True:
-        try:
-            # 장 개장 여부 및 시간 체크 (시간외 단일가 포함 무한 매매)
-            if not is_market_open():
-                BOT_STATE["status"] = "sleeping"
-                time.sleep(10)
-                continue
-                
-            BOT_STATE["status"] = "running"
-            BOT_STATE["cycle_count"] += 1
-
-            # 1. 미체결 주문 관리 (3분 경과 시 자동 취소)
-            check_and_cancel_unfilled(client, notifier)
-
-            # 2. 자금 및 잔고 로드
-            cash = client.get_cash_balance()
-            holdings = client.get_holdings()
-            holdings_map = {h["code"]: h for h in holdings}
-            
-            # 3. 💾 멀티 타임프레임 데이터 동시 수집
-            candles_3m = client.get_3min_candles(code, last_n_days=5)
-            time.sleep(0.2)
-            candles_1m = client.get_1min_candles(code, last_n_days=5)
-            time.sleep(0.2)
-            candles_120tick = client.get_tick_data(code, tick_unit="120", limit=100)
-            
-            if not candles_3m or not candles_1m:
-                logger.warning("시세 데이터를 가져오지 못했습니다. 재시도합니다.")
-                time.sleep(1)
-                continue
-            
-            is_120_fallback = False
-            if not candles_120tick:
-                logger.info("120틱 데이터를 수신하지 못해 1분봉 데이터로 대체하여 진행합니다.")
-                candles_120tick = candles_1m
-                is_120_fallback = True
-                
-            current_price = candles_1m[-1]["close"]
-            
-            # 4. 각 데이터별 독립 지표 계산 (In-place mutation)
-            from indicator import calculate_indicators_pure
-            calculate_indicators_pure(candles_3m, tema_period1=config.TEMA_PERIOD_SHORT, tema_period2=config.TEMA_PERIOD_LONG)
-            calculate_indicators_pure(candles_1m, tema_period1=config.TEMA_PERIOD_SHORT, tema_period2=config.TEMA_PERIOD_LONG)
-            calculate_indicators_pure(candles_120tick, tema_period1=config.TEMA_PERIOD_SHORT, tema_period2=config.TEMA_PERIOD_LONG)
-            
-            # 대시보드 상태 동기화
-            BOT_STATE["cash"] = cash
-            BOT_STATE["holdings"] = holdings
-            BOT_STATE["last_updated"] = datetime.now(kst).isoformat()
-
-            is_holding = code in holdings_map
-            
-            # 5. 🤖 3m 기존 + 1m 예측 + 120틱 필터 기반 무한 매매 로직 플로우
-            if not is_holding:
-                # 조건 0: 기존 3분봉 매매 조건 (관문선 지지)
-                close_3m = candles_3m[-1]["close"]
-                gate_line_3m = candles_3m[-1].get("tema_gate_line")
-                
-                is_3m_support = (gate_line_3m is not None and close_3m > gate_line_3m)
-                
-                # 조건 A: 1분봉 관문선 지지 여부
-                gate_line_1m = candles_1m[-1].get("tema_gate_line")
-                signal_1m_predict = (gate_line_1m is not None and candles_1m[-1]["close"] >= gate_line_1m)
-                
-                # 조건 B: 120틱 기준 실시간 수급 확정 (최근 120틱 종가가 단기 이평선 sma5 돌파)
-                tick_sma5 = candles_120tick[-1].get("sma5", 0)
-                signal_tick_confirm = (tick_sma5 is not None and candles_120tick[-1]["close"] > tick_sma5)
-                
-                if is_3m_support and signal_1m_predict and signal_tick_confirm:
-                    from indicator import adjust_price_by_ticks
-                    buy_price = get_ext_adjusted_price(client, code, current_price, "buy", default_ticks=0)
-                    
-                    budget = cash * 0.95
-                    buy_qty = int(budget // buy_price) if buy_price > 0 else 0
-                    if getattr(config, 'TEST_MODE_1_SHARE', False):
-                        buy_qty = 1
-                        
-                    if buy_qty > 0:
-                        res = client.place_buy_order(code, buy_qty, buy_price, "00")
-                        if res and res.get("return_code") == 0:
-                            msg = f"🛒 [매수] 3분봉+1분봉+120틱 초정밀 매수 진입\n종목: {name} | 수량: {buy_qty:,}주 | 가격: {buy_price:,}원"
-                            notifier.send_all(msg)
-                            _add_alert("buy", msg, code, name)
-            
-            else:
-                my_stock = holdings_map[code]
-                buy_price = my_stock["buy_price"]
-                qty = my_stock["quantity"]
-                
-                # ── 매도 로직 (초단기 120틱 데이터 기반 선제 대응) ──
-                # 0. 시간 청산 (오후 7시 ~ 8시 사이 무조건 전량 매도)
-                now_kst = datetime.now(kst)
-                is_time_liquidation = (now_kst.hour == 19)
-                
-                # 1. 120틱 기준 TEMA 3 이평선이 SMA 20 이평선을 데드크로스 할 때 전량 매도
-                tema3_tick = candles_120tick[-1].get("tema3")
-                sma20_tick = candles_120tick[-1].get("sma20")
-                prev_tema3_tick = candles_120tick[-2].get("tema3") if len(candles_120tick) > 1 else None
-                prev_sma20_tick = candles_120tick[-2].get("sma20") if len(candles_120tick) > 1 else None
-                
-                is_dead_cross = False
-                if tema3_tick is not None and sma20_tick is not None and prev_tema3_tick is not None and prev_sma20_tick is not None:
-                    is_dead_cross = (prev_tema3_tick >= prev_sma20_tick) and (tema3_tick < sma20_tick)
-                
-                # 2. 120틱 기준 L선 하향 이탈 시 매도 (초단기 수급 이탈 감지)
-                L_line_tick = candles_120tick[-1].get("L")
-                is_l_line_break = (L_line_tick is not None and current_price < L_line_tick)
-                
-                # 3. 고점 낮아짐(Lower High) 반등 저항 매도
-                K_line_tick = candles_120tick[-1].get("K")
-                is_lower_high_rebound = False
-                if K_line_tick is not None and L_line_tick is not None:
-                    # 현재 K선이 이전 변곡점 K선(L선)보다 낮을 때 (고점이 낮아졌을 때)
-                    if K_line_tick < L_line_tick:
-                        # 주가가 위로 반등해서 K선이나 L선에 도달(터치)하면 저항으로 보고 매도
-                        if current_price >= K_line_tick or current_price >= L_line_tick:
-                            is_lower_high_rebound = True
-                
-                # 대체(Fallback) 모드에서는 1분봉 데이터의 K/L선이 너무 거칠게 작용해 잦은 매매(Whipsaw)를 유발하므로 비활성화
-                if is_120_fallback:
-                    is_l_line_break = False
-                    is_lower_high_rebound = False
-                
-                if is_time_liquidation or is_dead_cross or is_l_line_break or is_lower_high_rebound:
-                    from indicator import adjust_price_by_ticks
-                    sell_price = get_ext_adjusted_price(client, code, current_price, "sell", default_ticks=0)
-                    
-                    res = client.place_sell_order(code, qty, sell_price, "00")
-                    if res and res.get("return_code") == 0:
-                        if is_time_liquidation: reason = "⏰19시 시간청산"
-                        elif is_lower_high_rebound: reason = "📈고점낮아짐(K<L) 반등저항"
-                        elif is_dead_cross: reason = "📉TEMA3-SMA20 데드크로스"
-                        else: reason = "⚠️L선 하향이탈"
-                        
-                        profit_rate = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
-                        msg = f"💰 [매도] 청산 완료 ({reason})\n종목: {name} | 수량: {qty:,}주 | 수익률: {profit_rate:.2f}%"
-                        notifier.send_all(msg)
-                        _add_alert("sell", msg, code, name)
-                        time.sleep(1.0)
-
-            # 6. 초정밀 타점 감시를 위해 루프 주기 단축
-            BOT_STATE["status"] = "idle"
-            time.sleep(1.2)
-
-        except KeyboardInterrupt:
-            logger.info("🛑 사용자에 의해 시스템이 안전하게 종료되었습니다.")
-            break
-        except Exception as e:
-            logger.error(f"🚨 마스터 매매 루프 에러: {e}", exc_info=True)
-            _add_alert("error", f"마스터 루프 에러: {str(e)}", code, name)
-            time.sleep(5)
 
 if __name__ == "__main__":
     try:

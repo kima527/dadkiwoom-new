@@ -1,0 +1,61 @@
+23: from strategy import evaluate_trend_buy, evaluate_rebuy, evaluate_inflection_sell, check_highspeed_liquidation
+66: # 최근 매도 발생 시각 기록 (동일 봉 중복 매수 방지 및 쿨타임)
+68: RECENT_SELLS = {}
+218: # 매수 시 최우선 매도호가 +1틱
+220: elif side == "sell" and hoga["best_bid"] > 0:
+221: # 매도 시 최우선 매수호가 -1틱
+272: "type": alert_type,   # 'buy' | 'sell' | 'buy_prep' | 'info' | 'error'
+548: RECENT_SELLS.clear()
+549: logger.info("장초반 턴어라운드 및 급등 추적을 위한 상태(PREV_VP_STATE, PREV_FLU_RATES, FIRST_3M_HIGH, RECENT_SELLS)가 초기화되었습니다.")
+867: # [신규] 체결강도 변동 추적 (조건 3 및 선제적 매도 감지용)
+920: # 120틱 데이터는 장초반 윈도우이거나, 현재 보유 중인 종목일 경우(선제적 매도 감시) 수집
+1111: "signal_sell": bool(sr["latest"].get("signal_sell")),
+1139: "buy_prep": "", "buy": "", "sell": "",
+1141: "sell_second_line": "",   # 두번째 선 하향 이탈 매도
+1159: # ③ 10:00 이후 : L선 하향 이탈 추가 매도 활성화
+1246: last_sell_time = sent_alerts[code].get("last_sell_time", 0)
+1247: if time.time() - last_sell_time < 60:
+1248: logger.info(f"⏳ [쿨타임] {name}({code}) - 매도 후 60초가 경과하지 않아 신규 진입을 보류합니다.")
+1270: logger.warning(f"⚠️ [진입 취소] {name}({code}) 매도 호가창이 너무 얇습니다. (1~5호가 잔량: {total_ask_volume_amount:,.0f}원 < 안전기준: {budget*3:,.0f}원)")
+1292: # ── 2. 매도 로직 (15분봉 전용 + 5분봉 방어망) ──
+1293: # 즉시 메모리 삭제 가드 (최근 5초 이내 매도된 종목은 보유 상태에서 강제 제외)
+1294: if code in RECENT_SELLS and time.time() - RECENT_SELLS[code] < 5.0:
+1303: should_sell = False
+1304: sell_reason_str = ""
+1310: should_sell = True
+1311: sell_reason_str = f"🛑 절대 손절가 도달 ({profit_rate:.2f}%)"
+1315: should_sell, sell_reason_str = check_highspeed_liquidation(candles_15m, current_p)
+1317: if not should_sell:
+1318: # 2차: 변곡 추세 매도 로직 평가 (15분봉 데드크로스)
+1319: should_sell, sell_reason_str = evaluate_inflection_sell(candles_15m)
+1321: # 최종 매도 실행
+1322: if should_sell:
+1323: if sent_alerts[code].get("sell") != candle_time:
+1324: sent_alerts[code]["sell"] = candle_time
+1325: qty_to_sell = held_info["quantity"]
+1327: logger.info(f"🚨 [매도 감지] {sell_reason_str}: {name} ({code})")
+1330: sell_price = get_ext_adjusted_price(client, code, close_price, "sell", -2)
+1331: order_res = client.place_sell_order(code, qty_to_sell, price=sell_price, order_type="0")
+1334: sent_alerts[code]["sold_qty"] = qty_to_sell
+1336: ret_rate = ((sell_price - pur_price) / pur_price) * 100.0
+1343: "sell_price": sell_price,
+1345: "reason": sell_reason_str
+1352: f"📉 <b>[매도 체결 - {sell_reason_str}]</b>\n"
+1354: f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
+1356: f"매도수량: {qty_to_sell}주\n"
+1361: _add_alert("sell", f"{sell_reason_str} 매도 {qty_to_sell}주 @ {sell_price:,.0f}원 | {ret_rate:+.2f}%", code, name)
+1362: sent_alerts[code]["last_sell_time"] = time.time()
+1363: RECENT_SELLS[code] = time.time()
+1367: # [즉시 수혈 가동] 종목이 매도되어 빈자리가 생기면 다음 루프에서 다이내믹 풀 즉시 리밸런싱
+1372: logger.error(f"❌ [매도 실패] {name} ({code}): {err_msg}")
+1373: _add_alert("error", f"매도 실패: {err_msg}", code, name)
+1516: # ── 매도 로직 (초단기 120틱 데이터 기반 선제 대응) ──
+1517: # 0. 시간 청산 (오후 7시 ~ 8시 사이 무조건 전량 매도)
+1521: # 1. 120틱 기준 TEMA 3 이평선이 SMA 20 이평선을 데드크로스 할 때 전량 매도
+1531: # 2. 120틱 기준 L선 하향 이탈 시 매도 (초단기 수급 이탈 감지)
+1535: # 3. 고점 낮아짐(Lower High) 반등 저항 매도
+1541: # 주가가 위로 반등해서 K선이나 L선에 도달(터치)하면 저항으로 보고 매도
+1552: sell_price = get_ext_adjusted_price(client, code, current_price, "sell", default_ticks=0)
+1554: res = client.place_sell_order(code, qty, sell_price, "00")
+1562: msg = f"💰 [매도] 청산 완료 ({reason})\n종목: {name} | 수량: {qty:,}주 | 수익률: {profit_rate:.2f}%"
+1564: _add_alert("sell", msg, code, name)
