@@ -29,6 +29,8 @@ class HybridDataFeeder:
         self.is_running = False
 
     def _feed_loop(self):
+        import random
+        time.sleep(random.uniform(0.1, min(10.0, self.interval)))
         code = self.data_manager.stock_code
         
         while self.is_running:
