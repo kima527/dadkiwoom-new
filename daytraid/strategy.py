@@ -3,6 +3,62 @@ from scanner import compute_sma
 
 logger = logging.getLogger(__name__)
 
+def get_daily_kl_lines(daily_candles):
+    """
+    일봉 기준 K선, L선을 계산합니다.
+    - 골든크로스(SMA3 > SMA40) 구간에서의 최고 종가를 하나의 '피크(Peak)'로 정의.
+    - K선: 가장 최근에 형성된 피크 (현재 골든크로스 진행 중이면 현재 피크, 아니면 직전 피크)
+    - L선: K선 이전의 피크
+    """
+    n = len(daily_candles)
+    if n < 40:
+        return None, None
+        
+    sma3 = compute_sma(daily_candles, 3)
+    sma40 = compute_sma(daily_candles, 40)
+    
+    peaks = []
+    in_gc = False
+    current_peak = 0
+    
+    for idx in range(n):
+        s3 = sma3[idx]
+        s40 = sma40[idx]
+        
+        if s3 is None or s40 is None:
+            continue
+            
+        if s3 > s40:
+            if not in_gc:
+                # 골든크로스 진입
+                in_gc = True
+                current_peak = daily_candles[idx]['close']
+            else:
+                # 골든크로스 유지 중 고점 갱신
+                current_close = daily_candles[idx]['close']
+                if current_close > current_peak:
+                    current_peak = current_close
+        else:
+            if in_gc:
+                # 데드크로스 발생 (골든크로스 종료) -> 피크 확정
+                in_gc = False
+                peaks.append(current_peak)
+                current_peak = 0
+                
+    # 만약 현재 골든크로스가 진행 중이라면, 지금까지의 고점도 피크 목록에 임시로 포함
+    if in_gc and current_peak > 0:
+        peaks.append(current_peak)
+        
+    k_line = None
+    l_line = None
+    
+    if len(peaks) >= 1:
+        k_line = peaks[-1]
+    if len(peaks) >= 2:
+        l_line = peaks[-2]
+        
+    return k_line, l_line
+
 def check_buy_signal(dm) -> bool:
     """
     매수 조건 검사
@@ -14,70 +70,17 @@ def check_buy_signal(dm) -> bool:
     if len(daily_candles) < 42:
         return False
         
-    # [NEW] 5일 이평선 하락 추세 검사 (매수 금지)
-    sma3 = compute_sma(daily_candles, 3)
-    sma5 = compute_sma(daily_candles, 5)
-    sma20 = compute_sma(daily_candles, 20)
-    sma40 = compute_sma(daily_candles, 40)
-    
-    # 5일 이평선 하락 추세 검사 (매수 금지)
-    if len(sma5) >= 2:
-        curr_sma5 = sma5[-1]
-        prev_sma5 = sma5[-2]
-        if curr_sma5 is not None and prev_sma5 is not None:
-            if curr_sma5 < prev_sma5:
-                return False
-
-    # A: 최근 0~3일(당일 포함) 일봉 SMA3이 SMA40 골든크로스
-    cond_a_valid = False
-    for j in [0, 1, 2, 3]:
-        idx_curr = -(j + 1)
-        idx_prev = -(j + 2)
-        if abs(idx_prev) <= len(sma3):
-            s3_c = sma3[idx_curr]
-            s40_c = sma40[idx_curr]
-            s3_p = sma3[idx_prev]
-            s40_p = sma40[idx_prev]
-            if s3_c is not None and s40_c is not None and s3_p is not None and s40_p is not None:
-                if s3_p <= s40_p and s3_c > s40_c:
-                    cond_a_valid = True
-                    break
-
-    # B: 당일 일봉 SMA3이 SMA20 골든크로스
-    cond_b_valid = False
-    if len(sma3) >= 2:
-        s3_today = sma3[-1]
-        s20_today = sma20[-1]
-        s3_yest = sma3[-2]
-        s20_yest = sma20[-2]
-        if s3_today is not None and s20_today is not None and s3_yest is not None and s20_yest is not None:
-            if s3_yest <= s20_yest and s3_today > s20_today:
-                cond_b_valid = True
-                
-    # A 또는 B 중 하나라도 발생해야 함 (OR 조건)
-    if not (cond_a_valid or cond_b_valid):
-        return False
+    # [NEW] 일봉 K선, L선 동시 돌파 (Breakout) 검사
+    k_line, l_line = get_daily_kl_lines(daily_candles)
+    if k_line is not None and l_line is not None:
+        target_price = max(k_line, l_line)
+        yesterday_close = daily_candles[-2]['close'] if len(daily_candles) >= 2 else 0
         
-    # 오늘 날짜를 제외한 가장 최근 일봉(즉, 전일 일봉)의 고가 찾기
-    from datetime import datetime
-    now_date = datetime.now().strftime("%Y%m%d")
-    yesterday_high = None
-    
-    for c in reversed(daily_candles):
-        c_date = str(c['date']).replace("-", "")
-        if c_date != now_date:
-            yesterday_high = c['high']
-            break
-            
-    if yesterday_high is None:
-        yesterday_high = daily_candles[-2]['high'] # Fallback
-        
-    # 현재가가 전일 고가를 돌파했는지 확인
-    # "전일 고가"라는 중요한 저항선을 뚫어내는 엄청난 매수세에 올라타는 돌파 매매
-    if current_price > yesterday_high:
-        logger.warning(f"🚀 [{dm.stock_code}] 전일 고가 돌파 감지! (현재가: {current_price} > 전일고가: {yesterday_high})")
-        return True
-        
+        # 어제는 저항선(목표가) 이하에서 끝났는데, 오늘 뚫고 올라갔다면 진정한 "돌파 매수"
+        if yesterday_close <= target_price and current_price > target_price:
+            logger.warning(f"🚀 [{dm.stock_code}] 일봉 K/L선 동시 돌파 감지! (어제종가: {yesterday_close} -> 현재가: {current_price} > 저항: {target_price})")
+            return True
+                            
     return False
 
 def check_sell_signal(dm) -> bool:

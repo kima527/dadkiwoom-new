@@ -28,6 +28,11 @@ FEEDERS = {}
 
 # 9시 초반 종목 수집용
 morning_candidates = set()
+
+# 당일 매도 이력 (종목코드 저장)
+sold_today = set()
+sold_loss_today = set() # 손절로 매도한 종목코드 저장
+first_buy_prices_today = {} # [NEW] 종목별 당일 최초 진입가 저장
 morning_evaluated = False
 
 def is_market_open():
@@ -40,11 +45,11 @@ def is_market_open():
     return dt_time(8, 0) <= current_time <= dt_time(20, 0)
 
 def is_trading_prohibited():
-    """전면 매매(매수/매도) 금지 시간 (08:00~08:04, 09:00~09:04)"""
+    """전면 매매(매수/매도) 금지 시간 (09:00 이전 장전 시간, 09:00~09:04 변동성 심한 시간)"""
     now = get_kst_now()
     current_time = now.time()
     from datetime import time as dt_time
-    if dt_time(8, 0) <= current_time <= dt_time(8, 4):
+    if current_time < dt_time(9, 0):
         return True
     if dt_time(9, 0) <= current_time <= dt_time(9, 4):
         return True
@@ -82,7 +87,7 @@ def round_to_tick(price):
 
 async def on_condition_insert(code: str):
     """조건검색 편입(매수) 신호 수신 시 호출되는 콜백"""
-    global held_codes, sold_today, morning_candidates
+    global held_codes, sold_today, sold_loss_today, morning_candidates, first_buy_prices_today
     
     now = get_kst_now()
     current_time = now.time()
@@ -95,32 +100,79 @@ async def on_condition_insert(code: str):
             logger.info(f"[{code}] 장 초반 수집 시간(09:00~09:04) 포착됨. 09:04 일괄 평가 후보군에 추가합니다.")
         return
 
-    if code in sold_today:
-        logger.info(f"[{code}] 당일 이미 매도한 종목이므로 재진입을 금지합니다.")
+    # [수정] 사용자의 요청으로 당일 매도한 종목의 재돌파(재진입) 매수를 허용합니다.
+    # if code in sold_today:
+    #     logger.info(f"[{code}] 당일 이미 매도한 종목이므로 재진입을 금지합니다.")
+    #     return
+        
+    if code in held_codes:
+        logger.info(f"[{code}] 이미 보유 중인 종목이므로 추가 매수(불타기)를 금지합니다.")
         return
         
     if is_buy_prohibited():
         logger.info(f"[{code}] 매수 금지 시간이므로 편입 신호를 무시합니다.")
         return
         
-    if len(held_codes) >= 2:
-        logger.info(f"[{code}] 최대 보유 종목 수(2종목) 초과! 편입 신호를 무시합니다.")
-        return
-        
     logger.warning(f"🚀 [매수 신호 발생] 조건검색 편입 도달! ({code})")
     
     # 동기 함수인 client.get_cash_balance 등을 스레드에서 실행
     client = KiwoomClient()
+    
+    # ---------------------------------------------------------
+    # 🛡️ 유통주식수 필터링 (무거운 주식 거르기: 6천만 주 이상 제외)
+    # ---------------------------------------------------------
+    try:
+        stock_info = await asyncio.to_thread(client.stock_info_api.basic_stock_information_request_ka10001, stock_code=code)
+        if stock_info and stock_info.get("return_code") == 0:
+            dstr_stk_k = int(stock_info.get("dstr_stk", "0")) # API 반환 단위: 천 주(1,000주)
+            if dstr_stk_k >= 60000: # 60,000 * 1,000 = 60,000,000 (6천만 주)
+                logger.warning(f"[{code}] 유통주식수 {dstr_stk_k * 1000:,}주 초과 (무거운 주식) - 파도타기 단타에 부적합하여 편입을 취소합니다.")
+                return
+    except Exception as e:
+        logger.error(f"[{code}] 유통주식수 조회 중 오류 발생: {e}")
+        
     cash = await asyncio.to_thread(client.get_cash_balance)
     buy_amount = min(cash * 0.95, 3000000) # 예수금의 95% 또는 최대 300만원
     
-    # 현재가 조회 (REST API 틱 데이터나 일봉을 가져오는 대신 호가 잔량/틱 사용)
+    # 현재가 조회 (틱 데이터 1차 시도, 실패 시 1분봉 2차 시도)
     ticks = await asyncio.to_thread(client.get_tick_data, code, "120", 1)
-    if not ticks:
-        logger.error(f"[{code}] 현재가를 조회할 수 없어 매수를 취소합니다.")
+    latest_price = 0
+    if ticks:
+        latest_price = ticks[-1]['close']
+    else:
+        logger.warning(f"[{code}] 틱 데이터 조회 실패. 1분봉 데이터로 대체 조회를 시도합니다.")
+        candles_1m = await asyncio.to_thread(client.get_1min_candles, code, 1)
+        if candles_1m:
+            latest_price = candles_1m[-1]['close']
+            
+    if latest_price == 0:
+        logger.error(f"[{code}] 현재가를 틱/1분봉 모두에서 조회할 수 없어 매수를 취소합니다.")
         return
         
-    latest_price = ticks[-1]['close']
+    dm = DATA_MANAGERS.get(code)
+    if not dm:
+        logger.error(f"[{code}] 데이터 매니저를 찾을 수 없어 매수를 취소합니다.")
+        return
+        
+    k_line, l_line = strategy.calculate_k_l_lines(dm)
+    if k_line == 0 or l_line == 0:
+        logger.error(f"[{code}] K/L선 계산 불가로 매수를 취소합니다.")
+        return
+        
+    target_price = max(k_line, l_line)
+    
+    # [수정] 손절 후 재매수 금지, 익절 후 재매수 허용 + 첫 매수가 이하 재진입 금지
+    if code in sold_today:
+        if code in sold_loss_today:
+            logger.info(f"[{code}] 재매수 금지: 당일 손절 이력이 있습니다.")
+            return
+        else:
+            if latest_price <= first_buy_prices_today.get(code, 0):
+                logger.info(f"[{code}] 재매수 금지 (안전방패): 현재가({latest_price:,.0f}원)가 당일 최초 진입가({first_buy_prices_today.get(code):,.0f}원) 이하입니다. (속임수 하락 패턴)")
+                return
+            logger.info(f"[{code}] 재매수 허용: 당일 익절 이력이 있으므로 다시 진입합니다!")
+    
+    logger.info(f"[{code}] 매수 조건 검사 - 예수금: {cash:,.0f}원, 1종목 할당금액: {buy_amount:,.0f}원, 현재가: {latest_price:,.0f}원")
     
     if buy_amount >= latest_price and latest_price > 0:
         # 비율: 1 : 5 : 25 (총합 31)
@@ -150,10 +202,17 @@ async def on_condition_insert(code: str):
             await asyncio.sleep(0.2)
             
         if qty_3rd > 0:
-            logger.info(f"-> [3차] 지정가 매수(-1.0%): {price_3rd}원 x {qty_3rd}주")
+            logger.info(f"-> [3차] 지정가 매수: {price_3rd}원 x {qty_3rd}주")
             await asyncio.to_thread(client.place_buy_order, code, qty_3rd, price=price_3rd, order_type="00")
             
-        logger.info("분할 매수 주문 전송 완료. 매도 감시 목록에 추가 대기...")
+        if code not in first_buy_prices_today:
+            first_buy_prices_today[code] = latest_price
+        
+        # 보유 종목 리스트 갱신 (리스트로 관리 중이므로 리스트 append 사용)
+        if code not in held_codes:
+            held_codes.append(code)
+            
+        logger.info(f"🎉 [{code}] 분할 매수 주문 전송 완료! 매도 감시 목록에 추가 대기...")
 
 async def on_condition_delete(code: str):
     """조건검색 이탈 신호 수신 시 호출되는 콜백"""
@@ -215,40 +274,56 @@ async def check_sell_logic_loop(client: KiwoomClient):
         for code, dm in DATA_MANAGERS.items():
             buy_price = 0
             qty = 0
+            hold_cur_price = 0
             for h in holdings:
                 if h["code"] == code:
                     buy_price = h["buy_price"]
                     qty = h["quantity"]
+                    hold_cur_price = h["current_price"]
                     break
                     
             if is_trading_prohibited():
                 continue
                 
-            # 1. 기계적 하드 손절 (-1.5%)
-            is_hard_stop = (buy_price > 0 and dm.latest_price <= buy_price * 0.985)
+            # 가격 정보 보정 (데이터가 아직 수신되지 않아 latest_price가 0일 경우 잔고의 현재가 사용)
+            current_price = dm.latest_price if dm.latest_price > 0 else hold_cur_price
+            
+            if getattr(dm, 'max_price_since_buy', 0) == 0:
+                dm.max_price_since_buy = buy_price
+                
+            if current_price > dm.max_price_since_buy:
+                dm.max_price_since_buy = current_price
+            
+            if current_price > 0 and getattr(dm, 'max_price_since_buy', 0) > 0:
+                trailing_drop_rate = (current_price - dm.max_price_since_buy) / dm.max_price_since_buy * 100
+                if trailing_drop_rate <= -1.0: # -1.0% 이하일 때 출력 (도배 방지)
+                    logger.info(f"[{code}] 매도 감시 중 - 현재가: {current_price}, 최고가: {dm.max_price_since_buy}, 하락률: {trailing_drop_rate:.2f}% (청산기준: -1.5%)")
+
+            # 1. 트레일링 스탑 (-1.5%)
+            is_trailing_stop = (dm.max_price_since_buy > 0 and current_price > 0 and current_price <= dm.max_price_since_buy * 0.985)
             
             # 2. 15분봉 데드크로스 또는 L선 이탈
-            is_dead_cross = strategy.check_sell_signal(dm)
+            is_dead_cross = strategy.check_sell_signal(dm) if current_price > 0 else False
             
-            # 3. 진입 캔들 내 하락 제한
-            is_entry_candle_stop = False
-            if getattr(dm, 'entry_candle_time', None) is not None:
-                curr_15m = getattr(dm, 'current_15m_candle', None)
-                if curr_15m and curr_15m['time'] == dm.entry_candle_time:
-                    if dm.latest_price <= curr_15m['high'] * 0.985:
-                        is_entry_candle_stop = True
-                        
-            if is_hard_stop or is_dead_cross or is_entry_candle_stop:
-                if is_entry_candle_stop:
-                    reason = "진입 캔들 내 고가대비 -1.5% 하락"
-                else:
-                    reason = "기계적 하드 손절(-1.5%)" if is_hard_stop else "15분봉 데드크로스/L선 이탈"
-                logger.warning(f"🚨 [매도 신호 발생] {dm.name}({code}) - {reason}!")
+            if is_trailing_stop or is_dead_cross:
+                reason = "트레일링 스탑(최고점대비 -1.5%)" if is_trailing_stop else "15분봉 데드크로스/L선 이탈"
+                logger.warning(f"🚨 [매도 신호 발생] {dm.name}({code}) - {reason}! (현재가: {current_price}, 평단가: {buy_price})")
                 
                 if qty > 0:
-                    logger.info(f"-> {qty}주 시장가 매도 주문 실행")
-                    await asyncio.to_thread(client.place_sell_order, code, qty, order_type="03")
+                    sell_price = round_to_tick(current_price * 0.98) if current_price > 0 else None
+                    if sell_price == 0:
+                        sell_price = current_price
+                    logger.info(f"-> {qty}주 시장가 매도 주문 실행 (장전/장후 지정가 전환 대비: {sell_price}원)")
+                    await asyncio.to_thread(client.place_sell_order, code, qty, price=sell_price, order_type="03")
+                    
                     sold_today.add(code)
+                    # 손실 매도인지 확인하여 sold_loss_today에 추가
+                    profit_pct = (current_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
+                    if profit_pct < 0:
+                        sold_loss_today.add(code)
+                        
+                    dm.max_price_since_buy = 0  # 초기화
+                        
                     await asyncio.sleep(1)
 
         await asyncio.sleep(5) # 5초 주기로 매도 감시 

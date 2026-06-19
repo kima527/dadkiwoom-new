@@ -401,15 +401,15 @@ class KiwoomRealClient:
         is_pre_market = (t_0800 <= current_time < t_0850)
         is_after_market = (t_1540 <= current_time < t_2000)
         
-        # 프리마켓, 애프터마켓 거래 시 지정가('0') 강제 전환 및 거래소 구분 'NXT'
+        # 프리마켓, 애프터마켓 거래 시 지정가('00') 강제 전환 및 거래소 구분 'NXT'
         if (is_pre_market or is_after_market):
-            if order_type == "3":
+            if order_type in ("3", "03"):
                 if price is not None:
                     logger.info("Extended trading hours session detected. Converting Market order to Limit order and setting exchange to 'NXT'.")
-                    return "NXT", "0", price
+                    return "NXT", "00", price
                 else:
                     logger.warning("Extended hours detected but no price was provided for conversion. Fallback to limit and 'NXT'.")
-                    return "NXT", order_type, price
+                    return "NXT", "00", price
             else:
                 return "NXT", order_type, price
                 
@@ -426,6 +426,7 @@ class KiwoomRealClient:
         
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
         price_int = int(actual_price) if actual_price is not None else None
+        ord_uv_str = "" if actual_order_type in ("3", "03") else (str(price_int) if price_int is not None else "")
         
         logger.warning(
             f"⚠️ SENDING REAL BUY ORDER: {clean_code} | Qty: {quantity} | Price: {price_int} | "
@@ -437,7 +438,7 @@ class KiwoomRealClient:
                 stk_cd=clean_code,
                 ord_qty=str(quantity),
                 trde_tp=actual_order_type,
-                ord_uv=str(price_int) if price_int is not None else ""
+                ord_uv=ord_uv_str
             )
             return result
         except Exception as e:
@@ -455,6 +456,7 @@ class KiwoomRealClient:
         
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
         price_int = int(actual_price) if actual_price is not None else None
+        ord_uv_str = "" if actual_order_type in ("3", "03") else (str(price_int) if price_int is not None else "")
         
         logger.warning(
             f"⚠️ SENDING REAL SELL ORDER: {clean_code} | Qty: {quantity} | Price: {price_int} | "
@@ -466,7 +468,7 @@ class KiwoomRealClient:
                 stk_cd=clean_code,
                 ord_qty=str(quantity),
                 trde_tp=actual_order_type,
-                ord_uv=str(price_int) if price_int is not None else ""
+                ord_uv=ord_uv_str
             )
             return result
         except Exception as e:
@@ -486,8 +488,12 @@ class KiwoomRealClient:
         return self._fetch_minute_candles(stock_code, tic_scope="5", last_n_days=last_n_days)
 
     def get_15min_candles(self, stock_code: str, last_n_days: int = 15) -> list:
-        """주식 종목의 15분봉 차트 데이터를 조회합니다."""
+        """최근 수 일간의 15분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="15", last_n_days=last_n_days)
+        
+    def get_45min_candles(self, stock_code: str, last_n_days: int = 15) -> list:
+        """최근 수 일간의 45분봉 차트 데이터를 조회합니다."""
+        return self._fetch_minute_candles(stock_code, tic_scope="45", last_n_days=last_n_days)
 
     def get_tick_data(self, stock_code: str, tick_unit: str = "120", limit: int = 100) -> list:
         """
