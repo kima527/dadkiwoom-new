@@ -26,8 +26,8 @@ from websocket_client import KiwoomWebSocketClient
 DATA_MANAGERS = {}
 FEEDERS = {}
 
-# 9시 초반 종목 수집용
-morning_candidates = set()
+# 9시 초반 종목 수집용 (종목코드: 포착횟수)
+morning_candidates = {}
 
 # 당일 매도 이력 (종목코드 저장)
 sold_today = set()
@@ -93,11 +93,10 @@ async def on_condition_insert(code: str):
     current_time = now.time()
     from datetime import time as dt_time
     
-    # 09:00:00 ~ 09:04:00 인 경우 후보군에 넣고 매수 보류
+    # 09:00:00 ~ 09:04:00 인 경우 후보군에 넣고 매수 보류 (횟수 누적)
     if dt_time(9, 0) <= current_time <= dt_time(9, 4):
-        if code not in morning_candidates:
-            morning_candidates.add(code)
-            logger.info(f"[{code}] 장 초반 수집 시간(09:00~09:04) 포착됨. 09:04 일괄 평가 후보군에 추가합니다.")
+        morning_candidates[code] = morning_candidates.get(code, 0) + 1
+        logger.info(f"[{code}] 장 초반 수집 시간(09:00~09:04) 포착됨. 현재 누적 포착 횟수: {morning_candidates[code]}회")
         return
 
     # [수정] 사용자의 요청으로 당일 매도한 종목의 재돌파(재진입) 매수를 허용합니다.
@@ -149,17 +148,7 @@ async def on_condition_insert(code: str):
         logger.error(f"[{code}] 현재가를 틱/1분봉 모두에서 조회할 수 없어 매수를 취소합니다.")
         return
         
-    dm = DATA_MANAGERS.get(code)
-    if not dm:
-        logger.error(f"[{code}] 데이터 매니저를 찾을 수 없어 매수를 취소합니다.")
-        return
-        
-    k_line, l_line = strategy.calculate_k_l_lines(dm)
-    if k_line == 0 or l_line == 0:
-        logger.error(f"[{code}] K/L선 계산 불가로 매수를 취소합니다.")
-        return
-        
-    target_price = max(k_line, l_line)
+    # (HTS 조건검색식에서 이미 돌파 조건을 검증해서 내려주므로, 봇 내부에서 별도의 K선/L선 돌파 재계산은 생략하고 즉시 진입합니다)
     
     # [수정] 손절 후 재매수 금지, 익절 후 재매수 허용 + 첫 매수가 이하 재진입 금지
     if code in sold_today:
@@ -183,8 +172,8 @@ async def on_condition_insert(code: str):
         amt_3rd = buy_amount * (25 / total_ratio)
         
         price_1st = round_to_tick(latest_price)
-        price_2nd = round_to_tick(latest_price * 0.995)
-        price_3rd = round_to_tick(latest_price * 0.990)
+        price_2nd = round_to_tick(latest_price * 0.997) # -0.3% 하락 시
+        price_3rd = round_to_tick(latest_price * 0.994) # -0.6% 하락 시
         
         qty_1st = int(amt_1st // price_1st) if price_1st > 0 else 0
         qty_2nd = int(amt_2nd // price_2nd) if price_2nd > 0 else 0
@@ -197,7 +186,7 @@ async def on_condition_insert(code: str):
             await asyncio.sleep(0.2)
             
         if qty_2nd > 0:
-            logger.info(f"-> [2차] 지정가 매수(-0.5%): {price_2nd}원 x {qty_2nd}주")
+            logger.info(f"-> [2차] 지정가 매수(-0.3%): {price_2nd}원 x {qty_2nd}주")
             await asyncio.to_thread(client.place_buy_order, code, qty_2nd, price=price_2nd, order_type="00")
             await asyncio.sleep(0.2)
             
@@ -329,7 +318,7 @@ async def check_sell_logic_loop(client: KiwoomClient):
         await asyncio.sleep(5) # 5초 주기로 매도 감시 
 
 async def evaluate_morning_candidates_loop(client: KiwoomClient):
-    """9시 4분이 되면 장 초반 수집된 종목들 중 상승률 상위 2종목을 선정하여 매수합니다."""
+    """9시 4분이 되면 장 초반 수집된 종목들 중 포착 횟수 2회 이상인 종목을 모두 선정하여 매수합니다."""
     global morning_candidates, morning_evaluated
     
     while True:
@@ -341,41 +330,48 @@ async def evaluate_morning_candidates_loop(client: KiwoomClient):
         if dt_time(9, 4, 1) <= current_time <= dt_time(9, 4, 30) and not morning_evaluated:
             morning_evaluated = True
             
-            if morning_candidates:
-                logger.info(f"🕒 9시 4분 도달! 장 초반 수집된 {len(morning_candidates)}개 종목 평가 시작...")
-                rates = []
-                for code in list(morning_candidates):
+            # 1회 이하 포착된 종목 제외 (가짜 돌파 필터링)
+            valid_candidates = {code: count for code, count in morning_candidates.items() if count >= 2}
+            
+            if valid_candidates:
+                logger.info(f"🕒 9시 4분 도달! 장 초반 수집 종목 중 2회 이상 포착된 {len(valid_candidates)}개 종목 평가 시작...")
+                eval_results = []
+                for code, count in valid_candidates.items():
                     # 일봉 2일치 조회하여 어제 종가와 오늘 현재가로 등락률 계산
                     candles = await asyncio.to_thread(client.get_daily_candles, code, 2)
+                    rate = 0.0
                     if len(candles) == 2:
                         y_close = candles[0]['close']
                         t_close = candles[1]['close']
                         if y_close > 0:
                             rate = (t_close - y_close) / y_close * 100
-                            rates.append((code, rate))
                     elif len(candles) == 1:
                         t_open = candles[0]['open']
                         t_close = candles[0]['close']
                         if t_open > 0:
                             rate = (t_close - t_open) / t_open * 100
-                            rates.append((code, rate))
-                            
+                    
+                    eval_results.append({'code': code, 'count': count, 'rate': rate})
                     await asyncio.sleep(0.2) # API 호출 제한 방지
                 
-                # 등락률 순으로 내림차순 정렬
-                rates.sort(key=lambda x: x[1], reverse=True)
-                top_2 = rates[:2]
+                # 1순위: 포착횟수 내림차순, 2순위: 등락률 내림차순 정렬
+                eval_results.sort(key=lambda x: (x['count'], x['rate']), reverse=True)
                 
-                logger.info(f"📊 장 초반 수집 종목 상승률 순위: {[(c, f'{r:.2f}%') for c, r in rates]}")
-                logger.info(f"🏆 최종 선정된 상위 2종목: {[(c, f'{r:.2f}%') for c, r in top_2]}")
+                logger.info(f"📊 장 초반 수집 종목 순위 (2회 이상 포착된 모든 종목 매수 진행):")
+                for res in eval_results:
+                    logger.info(f" - [{res['code']}] 포착 {res['count']}회, 상승률 {res['rate']:.2f}%")
                 
-                for code, rate in top_2:
-                    logger.info(f"🚀 [{code}] 상승률 {rate:.2f}% 상위 종목으로 선정되어 매수 진입을 시도합니다.")
-                    # 선정된 종목을 기존 매수 로직에 통과시킴
-                    await on_condition_insert(code)
+                for res in eval_results:
+                    logger.info(f"🚀 [{res['code']}] 검증 통과(포착 {res['count']}회)! 실전 매수 진입을 시도합니다.")
+                    # 선정된 종목을 모두 기존 매수 로직에 통과시킴 (무제한 매수)
+                    await on_condition_insert(res['code'])
                     await asyncio.sleep(0.5)
                 
                 # 평가가 끝난 후보군은 비워서 초기화
+                morning_candidates.clear()
+            else:
+                if morning_candidates:
+                    logger.info(f"🕒 9시 4분 도달! 장 초반 수집 종목이 {len(morning_candidates)}개 있었으나 모두 1회 포착이어서 매수를 패스합니다.")
                 morning_candidates.clear()
             
         # 08:59에 초기화 (다음날을 위해)
