@@ -28,28 +28,29 @@ FEEDERS = {}
 held_codes = []
 sold_today = set()
 first_buy_prices_today = {}
+last_l_lines = {}  # L선 변경 추적용
 
 def is_market_open():
-    """장 운영 시간 확인 (08:00 ~ 20:00)"""
+    """장 운영 시간 확인 (09:00 ~ 20:00)"""
     now = get_kst_now()
     if now.weekday() >= 5: # 주말
         return False
     current_time = now.time()
     from datetime import time as dt_time
-    return dt_time(8, 0) <= current_time <= dt_time(20, 0)
+    return dt_time(9, 0) <= current_time <= dt_time(20, 0)
 
 def is_trading_prohibited():
     """전면 매매 금지 시간 (제한 없음)"""
     return False
 
 def is_buy_prohibited():
-    """매수 금지 시간 (14:00 이후 신규 진입 금지)"""
+    """매수 금지 시간 (09:00 이전 및 14:00 이후 신규 진입 금지)"""
     if is_trading_prohibited():
         return True
     now = get_kst_now()
     current_time = now.time()
     from datetime import time as dt_time
-    if current_time >= dt_time(14, 0):
+    if current_time < dt_time(9, 0) or current_time >= dt_time(14, 0):
         return True
     return False
 
@@ -68,40 +69,8 @@ def round_to_tick(price):
     tick = get_tick_size(price)
     return (int(price) // tick) * tick
 
-async def on_condition_insert(code: str):
-    """조건검색 편입(매수) 신호 수신 시 호출되는 콜백"""
-    global held_codes, sold_today, first_buy_prices_today
-    
-    if code in held_codes:
-        logger.info(f"[{code}] 이미 보유 중인 종목이므로 추가 매수를 금지합니다.")
-        return
-        
-    if is_buy_prohibited():
-        logger.info(f"[{code}] 매수 금지 시간이므로 편입 신호를 무시합니다.")
-        return
-        
-    if code in sold_today:
-        logger.info(f"[{code}] 당일 이미 매도한 종목이므로 재진입을 금지합니다.")
-        return
-        
-    client = KiwoomClient()
-    
-    # 1분봉 데이터 조회 (시가 > 종가 확인용)
-    candles_1m = await asyncio.to_thread(client.get_1min_candles, code, 2)
-    if not candles_1m:
-        logger.warning(f"[{code}] 1분봉 데이터 조회 실패로 매수를 취소합니다.")
-        return
-        
-    latest_candle = candles_1m[-1]
-    latest_price = latest_candle['close']
-    open_price = latest_candle['open']
-    
-    # [조건 확인] 1분봉 종가 >= 시가 (양봉 또는 보합) 확인
-    if latest_price < open_price:
-        logger.info(f"[{code}] 조건 미충족: 1분봉 종가({latest_price}) < 시가({open_price}) (음봉). 매수하지 않습니다.")
-        return
-        
-    logger.warning(f"🚀 [매수 신호 발생] 조건검색 편입 & 1분봉 종가 >= 시가 (양봉/보합) 조건 충족! ({code})")
+async def execute_buy_order(client, code: str, latest_price: float):
+    global held_codes, first_buy_prices_today, DATA_MANAGERS, FEEDERS
     
     cash = await asyncio.to_thread(client.get_cash_balance)
     buy_amount = min(cash * 0.95, 1000000) # 예수금 95% 또는 최대 100만원
@@ -117,11 +86,13 @@ async def on_condition_insert(code: str):
             
             past_3m = await asyncio.to_thread(client.get_3min_candles, code, 2)
             await asyncio.sleep(0.3)
+            past_5m = await asyncio.to_thread(client.get_5min_candles, code, 3)
+            await asyncio.sleep(0.3)
             past_15m = await asyncio.to_thread(client.get_15min_candles, code, 7)
             await asyncio.sleep(0.3)
             past_daily = await asyncio.to_thread(client.get_daily_candles, code, 10)
             
-            dm.seed_initial_data(past_3m, past_15m, past_daily)
+            dm.seed_initial_data(past_3m, past_5m, past_15m, past_daily)
             
             feeder = HybridDataFeeder(client, dm, interval=3.0)
             FEEDERS[code] = feeder
@@ -171,6 +142,43 @@ async def on_condition_insert(code: str):
             
         logger.info(f"🎉 [{code}] 3분할 매수 주문 전송 완료! 매도 감시 목록에 추가 대기...")
 
+async def on_condition_insert(code: str):
+    """조건검색 편입(매수) 신호 수신 시 호출되는 콜백"""
+    global held_codes, sold_today, first_buy_prices_today
+    
+    if code in held_codes:
+        logger.info(f"[{code}] 이미 보유 중인 종목이므로 추가 매수를 금지합니다.")
+        return
+        
+    if is_buy_prohibited():
+        logger.info(f"[{code}] 매수 금지 시간이므로 편입 신호를 무시합니다.")
+        return
+        
+    if code in sold_today:
+        logger.info(f"[{code}] 당일 이미 매도한 종목이므로 재진입을 금지합니다.")
+        return
+        
+    client = KiwoomClient()
+    
+    # 1분봉 데이터 조회 (시가 > 종가 확인용)
+    candles_1m = await asyncio.to_thread(client.get_1min_candles, code, 2)
+    if not candles_1m:
+        logger.warning(f"[{code}] 1분봉 데이터 조회 실패로 매수를 취소합니다.")
+        return
+        
+    latest_candle = candles_1m[-1]
+    latest_price = latest_candle['close']
+    open_price = latest_candle['open']
+    
+    # [조건 확인] 1분봉 종가 >= 시가 (양봉 또는 보합) 확인
+    if latest_price < open_price:
+        logger.info(f"[{code}] 조건 미충족: 1분봉 종가({latest_price}) < 시가({open_price}) (음봉). 매수하지 않습니다.")
+        return
+        
+    logger.warning(f"🚀 [매수 신호 발생] 조건검색 편입 & 1분봉 종가 >= 시가 (양봉/보합) 조건 충족! ({code})")
+    
+    await execute_buy_order(client, code, latest_price)
+
 async def on_condition_delete(code: str):
     """조건검색 이탈 신호 수신 시 콜백"""
     logger.info(f"📉 [이탈 신호] 조건검색 이탈됨 ({code}) - 매도는 기존 손절 로직에 맡깁니다.")
@@ -207,23 +215,25 @@ async def check_sell_logic_loop(client: KiwoomClient):
                 
                 past_3m = await asyncio.to_thread(client.get_3min_candles, code, 2)
                 await asyncio.sleep(0.3)
+                past_5m = await asyncio.to_thread(client.get_5min_candles, code, 3)
+                await asyncio.sleep(0.3)
                 past_15m = await asyncio.to_thread(client.get_15min_candles, code, 7)
                 await asyncio.sleep(0.3)
                 past_daily = await asyncio.to_thread(client.get_daily_candles, code, 10)
                 
-                dm.seed_initial_data(past_3m, past_15m, past_daily)
+                dm.seed_initial_data(past_3m, past_5m, past_15m, past_daily)
                 DATA_MANAGERS[code] = dm
                 
                 feeder = HybridDataFeeder(client, dm, interval=3.0)
                 FEEDERS[code] = feeder
                 feeder.start()
                 
-        # 보유하지 않게 된 종목 정리
+        # 보유하지 않게 된 종목 정리 (재매수 감시를 위해 당일 매도 종목은 삭제하지 않음)
         removed = []
         for code in list(DATA_MANAGERS.keys()):
-            # 당일 매도 완료 종목이거나 더 이상 보유하지 않는 경우 제거
-            if code not in held_codes and code in sold_today:
-                logger.info(f"보유 종목에서 제외됨 [{code}]. 매도 감시 중단.")
+            # 당일 매도 이력이 없는 완전 미보유 종목만 제거 (sold_today가 아닌 경우)
+            if code not in held_codes and code not in sold_today:
+                logger.info(f"완전 미보유 종목 제외됨 [{code}]. 매도 감시 중단.")
                 if code in FEEDERS:
                     FEEDERS[code].stop()
                     del FEEDERS[code]
@@ -231,8 +241,17 @@ async def check_sell_logic_loop(client: KiwoomClient):
         for code in removed:
             del DATA_MANAGERS[code]
             
-        # 매도 감시 실행
+        # 매도 및 재매수 감시 실행
         for code, dm in DATA_MANAGERS.items():
+            if code in sold_today and code not in held_codes:
+                # 재매수 신호 감시
+                if strategy.check_rebuy_signal(dm):
+                    logger.warning(f"🚀 [재매수 진입] 조건 충족! 당일 매도 종목 재매수 ({code})")
+                    # 재매수 진행을 위해 sold_today에서 제거
+                    sold_today.remove(code)
+                    await execute_buy_order(client, code, dm.latest_price)
+                continue
+            
             buy_price = 0
             qty = 0
             hold_cur_price = 0
@@ -248,13 +267,24 @@ async def check_sell_logic_loop(client: KiwoomClient):
                 
             current_price = dm.latest_price if dm.latest_price > 0 else hold_cur_price
             
+            # 보유 중일 경우 L선 변곡(변경) 감지 및 로그 출력
+            if qty > 0:
+                current_l = strategy.get_current_l_line(list(dm.candles_15m))
+                prev_l = last_l_lines.get(code)
+                if current_l is not None and current_l != prev_l:
+                    logger.info(f"💡 [{dm.name}] 현재 15분봉 L선 변곡점 확인! (L선 목표 매도라인: {current_l:,.0f}원)")
+                    last_l_lines[code] = current_l
+                    
             # 1. 기계적 하드 손절 (-1.5%)
             is_hard_stop = (buy_price > 0 and current_price <= buy_price * 0.985)
             
             # 2. 15분봉 데드크로스 또는 L선 이탈
             is_dead_cross = strategy.check_sell_signal(dm) if current_price > 0 else False
             
-            # 3. 진입 캔들 특수 룰: 진입한 15분봉 내에서 최고가 대비 -1.5% 하락
+            # 3. 5분봉 L선 이탈 (선제 방어)
+            is_5m_early_sell = strategy.check_5m_early_sell_signal(dm) if current_price > 0 else False
+            
+            # 4. 진입 캔들 특수 룰: 진입한 15분봉 내에서 최고가 대비 -1.5% 하락
             is_entry_candle_stop = False
             if getattr(dm, 'entry_candle_time', None) is not None:
                 curr_15m = dm.current_15m_candle
@@ -262,9 +292,11 @@ async def check_sell_logic_loop(client: KiwoomClient):
                     if current_price <= curr_15m['high'] * 0.985:
                         is_entry_candle_stop = True
 
-            if is_hard_stop or is_dead_cross or is_entry_candle_stop:
+            if is_hard_stop or is_dead_cross or is_5m_early_sell or is_entry_candle_stop:
                 if is_entry_candle_stop:
                     reason = "진입 캔들 내 고가대비 -1.5% 하락"
+                elif is_5m_early_sell:
+                    reason = "5분봉 L선 하향 이탈 (선제 방어)"
                 else:
                     reason = "기계적 하드 손절(-1.5%)" if is_hard_stop else "15분봉 데드크로스/L선 이탈"
                 logger.warning(f"🚨 [매도 신호 발생] {dm.name}({code}) - {reason}! (현재가: {current_price}, 평단가: {buy_price})")

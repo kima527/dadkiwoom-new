@@ -1,5 +1,6 @@
 import logging
 from scanner import compute_sma
+from indicator import calculate_tema
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,20 @@ def check_buy_signal(dm) -> bool:
         
     return False
 
+def check_5m_early_sell_signal(dm) -> bool:
+    """
+    5분봉 기준 L선을 활용하여, 15분봉 변곡 전에 선제 이탈(매도)을 감지합니다.
+    """
+    completed_candles_5m = list(dm.candles_5m)
+    if len(completed_candles_5m) < 60:
+        return False
+        
+    current_5m_l = get_current_l_line(completed_candles_5m)
+    if current_5m_l is not None and dm.latest_price < current_5m_l:
+        return True
+        
+    return False
+
 def check_sell_signal(dm) -> bool:
     """
     매도 조건 검사 (15분봉 실시간 데드크로스)
@@ -106,56 +121,84 @@ def check_sell_signal(dm) -> bool:
         logger.warning(f"📉 [{dm.stock_code}] 15분봉 실시간 데드크로스 발생! (SMA3: {curr_sma3:.2f} < SMA40: {curr_sma40:.2f})")
         return True
         
-    # 새로운 로직: L선 매도 조건
-    current_l = get_current_l_line(candles)
+    # 새로운 로직: L선 매도 조건 (가짜 변곡점 방지를 위해 '완성된 15분봉'만 사용)
+    completed_candles = list(dm.candles_15m)
+    current_l = get_current_l_line(completed_candles)
     if current_l is not None and dm.latest_price < current_l:
-        logger.warning(f"📉 [{dm.stock_code}] 15분봉 L선 하회(돌파 실패) 발생! (현재가: {dm.latest_price} < L선: {current_l})")
+        logger.warning(f"📉 [{dm.stock_code}] 15분봉 확정 L선 하회 발생! (현재가: {dm.latest_price} < L선: {current_l})")
         return True
         
     return False
 
-def get_current_l_line(candles_15m):
+def get_current_l_line(candles):
     """
-    15분봉 기준 L선을 계산하여 현재 L선 값을 반환
+    주어진 캔들 배열(5분봉, 15분봉 등) 기준 L선을 계산하여 현재 L선 값을 반환
+    키움 수식:
+    a=avg(c,5); b=avg(c,20); d=avg(c,60);
+    K=valuewhen(1,a>b&&b>d&&a>d,C);
+    valuewhen(1,K(2)<K(1)&&K(1)>K,K(1))
     """
-    n = len(candles_15m)
-    if n < 40:
+    n = len(candles)
+    if n < 60:
         return None
         
-    sma3 = compute_sma(candles_15m, 3)
-    sma40 = compute_sma(candles_15m, 40)
+    closes = [c['close'] for c in candles]
+    tema5 = calculate_tema(closes, 5)
+    tema20 = calculate_tema(closes, 20)
+    tema60 = calculate_tema(closes, 60)
     
-    k_line = [None] * n
-    last_k = None
-    for idx in range(n):
-        s3 = sma3[idx]
-        s40 = sma40[idx]
-        if s3 is not None and s40 is not None:
-            if s3 > s40:
-                current_close = candles_15m[idx]['close']
-                if last_k is None or current_close > last_k:
-                    last_k = current_close
-        k_line[idx] = last_k
+    K = [None] * n
+    for i in range(n):
+        a = tema5[i]
+        b = tema20[i]
+        d = tema60[i]
+        if a is not None and b is not None and d is not None:
+            if a > b and b > d:
+                K[i] = candles[i]['close']
+            else:
+                K[i] = K[i-1] if i > 0 else None
+        else:
+            K[i] = K[i-1] if i > 0 else None
+            
+    L = [None] * n
+    for i in range(2, n):
+        k0 = K[i]
+        k1 = K[i-1]
+        k2 = K[i-2]
         
-    compressed_k = []
-    for idx in range(n):
-        k_val = k_line[idx]
-        if k_val is not None:
-            if not compressed_k or compressed_k[-1][1] != k_val:
-                compressed_k.append((idx, k_val))
-                
-    peaks = {}
-    for idx in range(2, len(compressed_k)):
-        k_2 = compressed_k[idx-2][1]
-        k_1 = compressed_k[idx-1][1]
-        k_0 = compressed_k[idx][1]
-        if k_2 < k_1 and k_1 > k_0:
-            confirm_idx = compressed_k[idx][0]
-            peaks[confirm_idx] = k_1
+        if k0 is not None and k1 is not None and k2 is not None:
+            if k2 < k1 and k1 > k0:
+                L[i] = k1
+            else:
+                L[i] = L[i-1]
+        else:
+            L[i] = L[i-1] if i > 0 else None
             
-    current_l = None
-    for idx in range(n):
-        if idx in peaks:
-            current_l = peaks[idx]
-            
-    return current_l
+    return L[-1]
+
+def check_rebuy_signal(dm) -> bool:
+    """
+    3분봉 기준 SMA3이 SMA60을 상향 돌파(골든크로스) 시 재매수 신호
+    """
+    candles = dm.get_completed_and_current_3m_candles()
+    if len(candles) < 60:
+        return False
+        
+    sma3 = compute_sma(candles, 3)
+    sma60 = compute_sma(candles, 60)
+    
+    curr_sma3 = sma3[-1]
+    curr_sma60 = sma60[-1]
+    
+    prev_sma3 = sma3[-2]
+    prev_sma60 = sma60[-2]
+    
+    if curr_sma3 is None or curr_sma60 is None or prev_sma3 is None or prev_sma60 is None:
+        return False
+        
+    # 골든크로스 판단
+    if prev_sma3 <= prev_sma60 and curr_sma3 > curr_sma60:
+        logger.warning(f"🚀 [{dm.stock_code}] 3분봉 SMA3x60 골든크로스 발생! (재매수 신호) (SMA3: {curr_sma3:.2f} > SMA60: {curr_sma60:.2f})")
+        return True
+        
+    return False
