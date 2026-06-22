@@ -12,6 +12,7 @@ KIWOOM_APP_KEY = os.getenv("KIWOOM_REAL_APP_KEY", "")
 KIWOOM_REAL_APP_SECRET = os.getenv("KIWOOM_REAL_APP_SECRET", "")
 KIWOOM_IS_MOCK = False # 실전매매용으로 False 고정
 KIWOOM_ACCOUNT_NUM = os.getenv("KIWOOM_REAL_ACCOUNT_NUM", "")
+KIWOOM_ACCOUNT_PWD = os.getenv("KIWOOM_REAL_ACCOUNT_PWD", "")
 
 # Telegram Settings
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")

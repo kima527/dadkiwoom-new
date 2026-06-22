@@ -57,6 +57,9 @@ class KiwoomRealClient:
             def patched_execute(method: str, resource_url: str = None, **kwargs):
                 if "json" in kwargs and kwargs["json"] is not None:
                     kwargs["json"]["acnt_no"] = config.KIWOOM_ACCOUNT_NUM
+                    if hasattr(config, 'KIWOOM_ACCOUNT_PWD') and config.KIWOOM_ACCOUNT_PWD:
+                        kwargs["json"]["pwd"] = config.KIWOOM_ACCOUNT_PWD
+                        kwargs["json"]["pwd_tp"] = "00"  # 비밀번호 타입
                 return original_execute(method, resource_url, **kwargs)
             api_instance._execute_request = patched_execute
 
@@ -131,7 +134,7 @@ class KiwoomRealClient:
         """
         # 야간장 시간에는 자동으로 _NX가 붙은 코드로 전환하여 실시간 데이터를 수신합니다.
         data_code = self._get_data_code(stock_code)
-        logger.info(f"Fetching {tic_scope}-minute candles for stock code {data_code}...")
+        logger.debug(f"Fetching {tic_scope}-minute candles for stock code {data_code}...")
         try:
             result = self.chart_api.stock_minute_chart_request_ka10080(
                 stk_cd=data_code,
@@ -202,7 +205,7 @@ class KiwoomRealClient:
         """
         실전 계좌의 보유 주식 현황을 조회합니다.
         """
-        logger.info("Fetching real account holdings...")
+        logger.debug(f"Fetching real account holdings...")
         try:
             result = self.account_api.account_evaluation_balance_detail_request_kt00018(
                 query_type="1",
@@ -245,12 +248,13 @@ class KiwoomRealClient:
         """
         실전 계좌의 매수 가능 예수금을 조회합니다.
         """
-        logger.info("Fetching real cash balance...")
+        logger.debug(f"Fetching real cash balance...")
         try:
             result = self.account_api.account_evaluation_balance_detail_request_kt00018(
                 query_type="2",
                 domestic_exchange_type="KRX"
             )
+            logger.info(f"Raw cash balance result: {result}")
             if not result:
                 return 0.0
             
