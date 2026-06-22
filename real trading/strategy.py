@@ -174,31 +174,33 @@ def determine_entry_zone(lines, entry_price):
 # 매도 신호 판단 (진입 위치별 이원화 로직)
 # ============================================================
 
-def check_sell_signal_by_lines(dm, entry_zone=None):
+def check_sell_signal_by_lines(dm, entry_zone=None, lines=None):
     """
     5분봉 K, L, M, N선 기반의 지능형 매도 신호를 판단합니다.
     
     Args:
         dm: RealtimeDataManager (5분봉 데이터 보유)
         entry_zone: 'UPPER' (돌파 구간 진입) 또는 'LOWER' (눌림목 구간 진입)
+        lines: (선택) 이미 계산된 K, L, M, N선 딕셔너리
     
     Returns:
         tuple: (is_sell: bool, reason: str)
     """
-    candles = dm.get_completed_and_current_5m_candles()
-    if len(candles) < 60:
-        return False, ""
-    
-    lines = compute_all_lines_5m(candles)
+    if lines is None:
+        candles = dm.get_completed_and_current_5m_candles()
+        if len(candles) < 60:
+            return False, ""
+        
+        lines = compute_all_lines_5m(candles)
     current_price = dm.latest_price
     
     if current_price <= 0:
         return False, ""
     
-    K = lines['K']
-    L = lines['L']
-    M = lines['M']
-    N = lines['N']
+    K = lines.get('K')
+    L = lines.get('L')
+    M = lines.get('M')
+    N = lines.get('N')
     
     if entry_zone == 'UPPER':
         # === Case A: 돌파 구간에서 매수 -> K선이 절대 방어선 ===

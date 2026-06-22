@@ -12,6 +12,62 @@ def get_kst_now():
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+import pandas as pd
+
+def load_my_pick_codes():
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "나의픽.csv")
+    if not os.path.exists(file_path):
+        logger.warning(f"나의픽 파일이 없습니다: {file_path}")
+        return []
+    try:
+        df = pd.read_csv(file_path, encoding='cp949')
+        if not df.empty:
+            last_col = df.columns[-1]
+            codes = []
+            for val in df[last_col].dropna():
+                val_str = str(val).strip()
+                if val_str.startswith("'"):
+                    val_str = val_str[1:]
+                if val_str.isdigit():
+                    codes.append(val_str.zfill(6))
+            return codes
+    except Exception as e:
+        logger.error(f"나의픽 파싱 에러: {e}")
+    return []
+
+async def preload_seed_data(client):
+    global DATA_MANAGERS
+    codes = load_my_pick_codes()
+    if not codes:
+        logger.info("프리로드할 나의픽 종목이 없습니다.")
+        return
+
+    logger.info(f"총 {len(codes)}개 나의픽 종목에 대한 장전 시드 데이터 프리로드를 시작합니다...")
+    for idx, code in enumerate(codes):
+        if code in DATA_MANAGERS:
+            continue
+            
+        name = client.get_stock_name(code) or code
+        logger.info(f"[{idx+1}/{len(codes)}] [{name}] 프리패치 중...")
+        from data_manager import RealtimeDataManager
+        dm = RealtimeDataManager(code, name, reference_price=0.0)
+        
+        try:
+            # 5분봉, 일봉 장전(어제까지의) 데이터 로드
+            past_5m = await asyncio.to_thread(client.get_5min_candles, code, 3)
+            await asyncio.sleep(0.3)
+            past_daily = await asyncio.to_thread(client.get_daily_candles, code, 10)
+            await asyncio.sleep(0.3)
+            
+            dm.seed_initial_data([], past_5m, [], past_daily)
+            
+            DATA_MANAGERS[code] = dm
+        except Exception as e:
+            logger.error(f"[{name}] 프리패치 실패: {e}")
+            
+    logger.info("모든 나의픽 타겟 종목의 프리로드가 완료되었습니다.")
+
+
 # Add local path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -99,6 +155,18 @@ async def execute_buy_order(client, code: str, latest_price: float):
             FEEDERS[code] = feeder
             feeder.start()
             DATA_MANAGERS[code] = dm
+        else:
+            dm = DATA_MANAGERS[code]
+            if code not in FEEDERS or not getattr(FEEDERS[code], 'is_running', False):
+                logger.info(f"[{dm.name}] 프리로드 종목 포착! 당일 갭 데이터(Fast-fetch) 병합 수행...")
+                past_5m_today = await asyncio.to_thread(client.get_5min_candles, code, 1)
+                dm.seed_initial_data([], past_5m_today, [], [])
+                
+                if code not in FEEDERS:
+                    feeder = HybridDataFeeder(client, dm, interval=3.0)
+                    FEEDERS[code] = feeder
+                if not getattr(FEEDERS[code], 'is_running', False):
+                    FEEDERS[code].start()
             
         dm = DATA_MANAGERS[code]
         
@@ -276,28 +344,47 @@ async def check_sell_logic_loop(client: KiwoomClient):
                 
             current_price = dm.latest_price if dm.latest_price > 0 else hold_cur_price
             
-            # 현재 5분봉 K/L/M/N선 값 로그 (변경 시에만)
+            # === 5분봉 K/L/M/N선 계산 및 매도 판단 통합 로직 ===
+            lines = None
             if qty > 0:
                 try:
+                    # 1. 5분봉 선 계산 (단 한 번만 수행)
                     lines = strategy.compute_all_lines_5m(dm.get_completed_and_current_5m_candles())
-                    lines_key = (lines.get('K'), lines.get('L'), lines.get('M'), lines.get('N'))
+                    
+                    k_val = lines.get('K')
+                    l_val = lines.get('L')
+                    m_val = lines.get('M')
+                    n_val = lines.get('N')
+                    
+                    # 변경 여부 체크를 위한 키 생성
+                    lines_key = (k_val, l_val, m_val, n_val)
                     prev_lines_key = getattr(dm, '_prev_lines_key', None)
+                    
+                    # 값이 변경되었을 때만 로그 출력
                     if lines_key != prev_lines_key:
                         zone = entry_zones.get(code, 'UNKNOWN')
-                        k_str = f"{lines['K']:,.0f}" if lines['K'] else "-"
-                        l_str = f"{lines['L']:,.0f}" if lines['L'] else "-"
-                        m_str = f"{lines['M']:,.0f}" if lines['M'] else "-"
-                        n_str = f"{lines['N']:,.0f}" if lines['N'] else "-"
+                        
+                        k_str = f"{k_val:,.0f}" if k_val is not None else "-"
+                        l_str = f"{l_val:,.0f}" if l_val is not None else "-"
+                        m_str = f"{m_val:,.0f}" if m_val is not None else "-"
+                        n_str = f"{n_val:,.0f}" if n_val is not None else "-"
+                        
                         logger.info(
                             f"📊 [{dm.name}] 5분봉 선 현황 | K:{k_str} L:{l_str} M:{m_str} N:{n_str} | 진입구간:{zone}"
                         )
                         dm._prev_lines_key = lines_key
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"[{dm.name}] 5분봉 선 계산 중 오류 발생: {e}", exc_info=True)
             
             # === 5분봉 K/L/M/N선 기반 지능형 매도 판단 ===
-            zone = entry_zones.get(code)  # UPPER 또는 LOWER
-            is_line_sell, sell_reason = strategy.check_sell_signal_by_lines(dm, entry_zone=zone)
+            zone = entry_zones.get(code, 'UNKNOWN')  # UPPER 또는 LOWER
+            
+            # 이미 위에서 계산된 lines가 있다면 인자로 넘겨주고, 없으면 내부에서 계산하도록 유연하게 대처
+            is_line_sell, sell_reason = strategy.check_sell_signal_by_lines(
+                dm, 
+                entry_zone=zone, 
+                lines=lines
+            )
             
             # 최소 보험: 진입가 대비 -3% 하락 시 강제 청산 (선 계산 오류 등 극단적 상황 방어)
             is_emergency_stop = (buy_price > 0 and current_price <= buy_price * 0.97)
@@ -369,6 +456,31 @@ async def cancel_unfilled_buy_orders_loop(client: KiwoomClient):
             
         await asyncio.sleep(10)
 
+async def schedule_preload(client):
+    """8시 50분에 프리로드를 자동으로 실행하는 스케줄러"""
+    while True:
+        now = get_kst_now()
+        current_time = now.time()
+        from datetime import time as dt_time
+        
+        if getattr(schedule_preload, "done_today", None) == now.date():
+            await asyncio.sleep(60)
+            continue
+            
+        target_start = dt_time(8, 50)
+        target_end = dt_time(9, 0)
+        
+        if target_start <= current_time < target_end:
+            logger.info("🕒 [스케줄러] 지정된 시간(8:50~9:00)입니다. 시드 데이터 프리로드를 시작합니다.")
+            await preload_seed_data(client)
+            schedule_preload.done_today = now.date()
+        elif current_time < target_start:
+            await asyncio.sleep(10)
+        else:
+            # 9시 이후면 당일은 스킵
+            schedule_preload.done_today = now.date()
+            await asyncio.sleep(60)
+
 async def async_main():
     logger.info("=========================================")
     logger.info("Daytraid Bot Started (WebSocket HTS Condition Search & 3-Split Buy)")
@@ -397,11 +509,12 @@ async def async_main():
     sell_logic_task = asyncio.create_task(check_sell_logic_loop(client))
     cancel_task = asyncio.create_task(cancel_unfilled_buy_orders_loop(client))
     telegram_task = asyncio.create_task(telegram_bot.poll_telegram_updates())
+    preload_task = asyncio.create_task(schedule_preload(client))
 
     # 시작 알림 전송
     await telegram_bot.send_message("🤖 주식 자동매매 봇이 컴퓨터에서 실행되었습니다.\n\n제어 권한을 얻으려면 <b>/auth hani1302</b> 를 입력해주세요.")
 
-    await asyncio.gather(ws_task, sell_logic_task, cancel_task, telegram_task)
+    await asyncio.gather(ws_task, sell_logic_task, cancel_task, telegram_task, preload_task)
 
 def main():
     asyncio.run(async_main())
