@@ -75,7 +75,7 @@ class RealtimeDataManager:
             current_candle['volume'] += volume
             return current_candle
 
-    def process_realtime_tick(self, current_price: float, volume: int, time_str: str, date_str: str = None):
+    def process_realtime_tick(self, current_price: float, volume: int, volume_power: float, time_str: str, date_str: str = None):
         """실시간 틱(또는 폴링된 데이터)을 수신하여 분봉과 일봉을 업데이트합니다."""
         self.latest_price = current_price
         

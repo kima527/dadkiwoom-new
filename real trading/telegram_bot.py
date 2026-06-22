@@ -2,6 +2,7 @@ import logging
 import asyncio
 import requests
 import traceback
+import os
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
@@ -10,7 +11,7 @@ logger = logging.getLogger(__name__)
 IS_BOT_ACTIVE = True
 
 # 비밀번호 및 공제율 설정
-BOT_PASSWORD = "hani1302"
+BOT_PASSWORD = os.getenv("TELEGRAM_BOT_PASSWORD", "hani1302")
 DEDUCTION_RATE = 0.00265  # 0.265%
 
 # 인증된 Chat ID 목록 (config의 기본 Chat ID는 인증된 것으로 간주할 수 있으나,

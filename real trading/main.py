@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 import pandas as pd
 
 def load_my_pick_codes():
-    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "나의픽.csv")
+    file_path = config.WATCHLIST_FILE
     if not os.path.exists(file_path):
         logger.warning(f"나의픽 파일이 없습니다: {file_path}")
         return []
@@ -54,7 +54,7 @@ async def preload_seed_data(client):
         
         try:
             # 5분봉, 일봉 장전(어제까지의) 데이터 로드
-            past_5m = await asyncio.to_thread(client.get_5min_candles, code, 3)
+            past_5m = await asyncio.to_thread(client.get_5min_candles, code, 5)
             await asyncio.sleep(0.3)
             past_daily = await asyncio.to_thread(client.get_daily_candles, code, 10)
             await asyncio.sleep(0.3)
@@ -143,7 +143,7 @@ async def execute_buy_order(client, code: str, latest_price: float):
             
             past_3m = await asyncio.to_thread(client.get_3min_candles, code, 2)
             await asyncio.sleep(0.3)
-            past_5m = await asyncio.to_thread(client.get_5min_candles, code, 3)
+            past_5m = await asyncio.to_thread(client.get_5min_candles, code, 5)
             await asyncio.sleep(0.3)
             past_15m = await asyncio.to_thread(client.get_15min_candles, code, 7)
             await asyncio.sleep(0.3)
@@ -159,7 +159,7 @@ async def execute_buy_order(client, code: str, latest_price: float):
             dm = DATA_MANAGERS[code]
             if code not in FEEDERS or not getattr(FEEDERS[code], 'is_running', False):
                 logger.info(f"[{dm.name}] 프리로드 종목 포착! 당일 갭 데이터(Fast-fetch) 병합 수행...")
-                past_5m_today = await asyncio.to_thread(client.get_5min_candles, code, 1)
+                past_5m_today = await asyncio.to_thread(client.get_5min_candles, code, 5)
                 dm.seed_initial_data([], past_5m_today, [], [])
                 
                 if code not in FEEDERS:
@@ -187,6 +187,8 @@ async def execute_buy_order(client, code: str, latest_price: float):
         price_3rd = round_to_tick(latest_price * 0.994) # -0.6%
         
         qty_1st = int(amt_1st // price_1st) if price_1st > 0 else 0
+        if qty_1st == 0 and buy_amount >= price_1st and price_1st > 0:
+            qty_1st = 1
         qty_2nd = int(amt_2nd // price_2nd) if price_2nd > 0 else 0
         qty_3rd = int(amt_3rd // price_3rd) if price_3rd > 0 else 0
         
@@ -496,6 +498,14 @@ async def async_main():
     global held_codes
     held_codes = [h["code"] for h in holdings]
     logger.info(f"시작 시점 보유 종목 수: {len(held_codes)}개")
+
+    # 당일 매도 완료 종목 재매수 방지 설정
+    global sold_today
+    filled_orders = client.get_today_filled_orders()
+    for order in filled_orders:
+        if "매도" in order.get("side", ""):
+            sold_today.add(order["code"])
+    logger.info(f"당일 매도 완료 종목 초기화: {len(sold_today)}개 종목 재매수 방지")
 
     # 웹소켓 클라이언트 생성 (타겟 조건식: Real_traiding)
     ws_client = KiwoomWebSocketClient(

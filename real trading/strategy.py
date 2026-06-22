@@ -258,52 +258,6 @@ def check_entry_filter_by_lines(dm):
 # 기존 호환 함수 (기존 코드에서 호출되는 함수 유지)
 # ============================================================
 
-def get_current_l_line(candles):
-    """
-    주어진 캔들 배열(5분봉, 15분봉 등) 기준 L선을 계산하여 현재 L선 값을 반환
-    키움 수식:
-    a=avg(c,5); b=avg(c,20); d=avg(c,60);
-    K=valuewhen(1,a>b&&b>d&&a>d,C);
-    valuewhen(1,K(2)<K(1)&&K(1)>K,K(1))
-    """
-    n = len(candles)
-    if n < 60:
-        return None
-        
-    closes = [c['close'] for c in candles]
-    tema5 = calculate_tema(closes, 5)
-    tema20 = calculate_tema(closes, 20)
-    tema60 = calculate_tema(closes, 60)
-    
-    K = [None] * n
-    for i in range(n):
-        a = tema5[i]
-        b = tema20[i]
-        d = tema60[i]
-        if a is not None and b is not None and d is not None:
-            if a > b and b > d:
-                K[i] = candles[i]['close']
-            else:
-                K[i] = K[i-1] if i > 0 else None
-        else:
-            K[i] = K[i-1] if i > 0 else None
-            
-    L = [None] * n
-    for i in range(2, n):
-        k0 = K[i]
-        k1 = K[i-1]
-        k2 = K[i-2]
-        
-        if k0 is not None and k1 is not None and k2 is not None:
-            if k2 < k1 and k1 > k0:
-                L[i] = k1
-            else:
-                L[i] = L[i-1]
-        else:
-            L[i] = L[i-1] if i > 0 else None
-            
-    return L[-1]
-
 
 def check_buy_signal(dm) -> bool:
     """

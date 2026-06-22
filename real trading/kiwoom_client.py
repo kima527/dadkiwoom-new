@@ -403,12 +403,12 @@ class KiwoomRealClient:
         is_pre_market = (t_0800 <= current_time < t_0850)
         is_after_market = (t_1540 <= current_time < t_2000)
         
-        # 프리마켓, 애프터마켓 거래 시 지정가('0') 강제 전환 및 거래소 구분 'NXT'
+        # 프리마켓, 애프터마켓 거래 시 지정가('00') 강제 전환 및 거래소 구분 'NXT'
         if (is_pre_market or is_after_market):
-            if order_type == "3":
+            if order_type in ("3", "03"):
                 if price is not None:
                     logger.info("Extended trading hours session detected. Converting Market order to Limit order and setting exchange to 'NXT'.")
-                    return "NXT", "0", price
+                    return "NXT", "00", price
                 else:
                     logger.warning("Extended hours detected but no price was provided for conversion. Fallback to limit and 'NXT'.")
                     return "NXT", order_type, price
@@ -439,7 +439,7 @@ class KiwoomRealClient:
                 stk_cd=clean_code,
                 ord_qty=str(quantity),
                 trde_tp=actual_order_type,
-                ord_uv=str(price_int) if price_int is not None else ""
+                ord_uv=str(price_int) if price_int is not None and actual_order_type not in ["3", "03"] else ""
             )
             return result
         except Exception as e:
@@ -468,7 +468,7 @@ class KiwoomRealClient:
                 stk_cd=clean_code,
                 ord_qty=str(quantity),
                 trde_tp=actual_order_type,
-                ord_uv=str(price_int) if price_int is not None else ""
+                ord_uv=str(price_int) if price_int is not None and actual_order_type not in ["3", "03"] else ""
             )
             return result
         except Exception as e:
