@@ -104,25 +104,10 @@ class KiwoomRealClient:
             assert "_AL" in code, "[AI CONTEXT LOCK] FATAL: Do not strip '_AL' in _get_data_code! NXT alternative market data requires the '_AL' suffix for chart/tick data. Stripping it will fetch garbage KRX data!"
         # =========================================================================
             
-        import datetime
-        from datetime import timezone, timedelta
-        kst = timezone(timedelta(hours=9))
-        current_time = datetime.datetime.now(kst).time()
-        
-        t_0800 = datetime.time(8, 0, 0)
-        t_0850 = datetime.time(8, 50, 0)
-        t_1540 = datetime.time(15, 40, 0)
-        t_2000 = datetime.time(20, 0, 0)
-        
-        is_pre_market = (t_0800 <= current_time < t_0850)
-        is_after_market = (t_1540 <= current_time < t_2000)
-        
-        # 야간장 시간에는 _NX를 붙이되, 만약 이미 _AL이 있다면 교체하거나 덧붙임 (보통 _NX 우선)
-        if is_pre_market or is_after_market:
-            clean = code.replace("_AL", "").replace("_NX", "")
-            return clean + "_NX"
-            
-        return code
+        # 야간장/주간장 시간에 구애받지 않고 항상 NXT(ATS) 시장 데이터까지 포함하여 가져오도록 강제합니다.
+        # (기존 코드는 09:00~15:30 정규장 시간대에는 _NX를 붙이지 않아 과거 15:40~20:00 데이터가 누락되는 문제가 있었습니다)
+        clean = code.replace("_AL", "").replace("_NX", "")
+        return clean + "_AL"
 
     def _fetch_minute_candles(self, stock_code: str, tic_scope: str, last_n_days: int) -> list:
         """분봉 차트 데이터의 공통 조회/파싱 메서드.
