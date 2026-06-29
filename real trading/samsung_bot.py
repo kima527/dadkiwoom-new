@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from kiwoom_client import KiwoomClient
 from data_manager import RealtimeDataManager
 from data_feeder import HybridDataFeeder
-from indicator import calculate_sma
+from indicator import calculate_sma, calculate_bollinger_bands
 from strategy import compute_all_lines_5m
 import telegram_bot
 
@@ -131,10 +131,11 @@ async def main_trading_loop(client: KiwoomClient):
                 await asyncio.sleep(3)
                 continue
 
-            # SMA 3, 8, 60 계산
+            # SMA 3, 8, 60 및 볼린저 밴드 계산
             sma3_list = calculate_sma(closes, 3)
             sma8_list = calculate_sma(closes, 8)
             sma60_list = calculate_sma(closes, 60)
+            bb20_upper, bb20_mid, bb20_lower = calculate_bollinger_bands(closes, 20, 2.0)
             
             curr_sma3 = sma3_list[-1]
             curr_sma8 = sma8_list[-1]
@@ -143,9 +144,19 @@ async def main_trading_loop(client: KiwoomClient):
             prev_sma8 = sma8_list[-2]
             prev_sma60 = sma60_list[-2]
             
-            if curr_sma3 is None or curr_sma8 is None or curr_sma60 is None or prev_sma3 is None or prev_sma8 is None or prev_sma60 is None:
+            curr_bb_upper = bb20_upper[-1]
+            curr_bb_lower = bb20_lower[-1]
+            curr_bb_mid = bb20_mid[-1]
+            
+            if (curr_sma3 is None or curr_sma8 is None or curr_sma60 is None or 
+                prev_sma3 is None or prev_sma8 is None or prev_sma60 is None or
+                curr_bb_upper is None or curr_bb_lower is None or curr_bb_mid is None):
                 await asyncio.sleep(3)
                 continue
+                
+            # 볼린저 밴드 대역폭(Bandwidth) 계산
+            bandwidth = (curr_bb_upper - curr_bb_lower) / curr_bb_mid * 100.0
+            is_sideways = bandwidth < 0.5  # 밴드폭이 0.5% 미만이면 횡보장으로 간주
                 
             # 현재 보유 수량 확인 (TR 조회 한도 1000회/시간 방지를 위해 30초마다 갱신)
             import time as time_module
@@ -176,10 +187,19 @@ async def main_trading_loop(client: KiwoomClient):
                     active_stop_price = 0
                     active_stop_name = ""
                     
-            # == 매수 신호 판별 (기존 SMA 골든크로스) ==
-            is_golden_cross_8 = prev_sma3 <= prev_sma8 and curr_sma3 > curr_sma8
-            is_golden_cross_60 = prev_sma3 <= prev_sma60 and curr_sma3 > curr_sma60
+            # == 이격도(간격) 필터 설정 ==
+            # 횡보장 잦은 교차 방지를 위해 최소 2호가(삼성전자 기준 보통 200원) 이상의 격차가 벌어져야 교차로 인정
+            gap_threshold = get_tick_size(current_price) * 2
             
+            # == 매수 신호 판별 (SMA 골든크로스 + 이격도) ==
+            is_golden_cross_8 = prev_sma3 <= prev_sma8 and (curr_sma3 - curr_sma8) >= gap_threshold
+            is_golden_cross_60 = prev_sma3 <= prev_sma60 and (curr_sma3 - curr_sma60) >= gap_threshold
+            
+            # 횡보장 필터 (볼린저 밴드 대역폭이 너무 좁으면 거짓 신호로 판단하여 크로스 무시)
+            if is_sideways:
+                is_golden_cross_8 = False
+                is_golden_cross_60 = False
+                
             is_sma60_falling = curr_sma60 < prev_sma60
             
             buy_signal = False
@@ -227,48 +247,17 @@ async def main_trading_loop(client: KiwoomClient):
                         await asyncio.sleep(15)
                         continue
 
-            # == 매도 로직 (트레일링 스탑) ==
+            # == 매도 로직 ==
             elif qty > 0: # 보유 상태일 때만 매도 고려
                 sell_signal = False
                 signal_msg = ""
                 
-                # 수익 중이고 수익률(변동폭)이 1% 미만인지 확인 (보조 참고용)
-                profit_rate = (current_price - buy_price) / buy_price if buy_price > 0 else 0
+                # SMA3 이평선이 SMA8 이평선을 하향 돌파(데드크로스)할 때 매도 (이격도 필터 적용)
+                is_dead_cross_8 = prev_sma3 >= prev_sma8 and (curr_sma8 - curr_sma3) >= gap_threshold
                 
-                # strategy 모듈의 L선/K선 계산
-                lines = compute_all_lines_5m(candles)
-                K = lines.get('K')
-                L = lines.get('L')
-
-                # 트레일링 스탑 기준선 갱신 로직
-                if K is not None and current_price >= K:
-                    if active_stop_name != "K선" or K > active_stop_price:
-                        active_stop_price = K
-                        active_stop_name = "K선"
-                        logger.info(f"📈 [방어선 갱신] K선 돌파! 매도 방어선을 K선({K:,.0f}원)으로 상향합니다.")
-                elif L is not None and current_price >= L:
-                    if active_stop_name != "K선": # 이미 K선으로 올라간 방어선은 낮추지 않음
-                        if active_stop_name != "L선" or L > active_stop_price:
-                            active_stop_price = L
-                            active_stop_name = "L선"
-                            logger.info(f"📈 [방어선 갱신] L선 확보! 매도 방어선을 L선({L:,.0f}원)으로 설정합니다.")
-                
-                # 방어선 설정 전, 매수 직후의 안전장치 (아직 돌파 전)
-                if active_stop_price == 0 and L is not None:
-                    if current_price >= L:
-                        active_stop_price = L
-                        active_stop_name = "L선"
-                    else:
-                        # 주가가 아직 L선 아래에 있는 경우. 돌파 시도 중으로 간주하고 관망.
-                        # (단, 1% 이상 큰 손실이 날 경우를 대비한 최후의 보루)
-                        if profit_rate < -0.03:
-                            sell_signal = True
-                            signal_msg = f"매수 후 L선 돌파 실패 및 -3% 손절 도달"
-
-                # 하향 이탈 감지 (설정된 방어선 아래로 떨어질 때)
-                if active_stop_price > 0 and current_price < active_stop_price:
+                if is_dead_cross_8:
                     sell_signal = True
-                    signal_msg = f"{active_stop_name} 하향 이탈 (트레일링 스탑) [현재가:{current_price:,.0f} < 방어선:{active_stop_price:,.0f}]"
+                    signal_msg = f"SMA3({curr_sma3:.2f})이 SMA8({curr_sma8:.2f}) 하향 돌파 (SMA8 데드크로스)"
                 
                 if sell_signal:
                     logger.warning(f"🚨 [매도 신호] {signal_msg}!")
