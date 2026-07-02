@@ -256,14 +256,14 @@ async def main_trading_loop(client: KiwoomClient):
                 sell_signal = False
                 signal_msg = ""
                 
-                # 1순위 매도 조건: 24이평이 60이평을 데드크로스 (하향 돌파)
-                is_dead_cross_24_60 = False
-                if prev_sma24 is not None and prev_sma60 is not None and curr_sma24 is not None and curr_sma60 is not None:
-                    is_dead_cross_24_60 = (prev_sma24 >= prev_sma60) and (curr_sma24 < curr_sma60)
+                # 1순위 매도 조건: 3이평이 24이평을 데드크로스 (하향 돌파)
+                is_dead_cross_3_24 = False
+                if prev_sma3 is not None and prev_sma24 is not None and curr_sma3 is not None and curr_sma24 is not None:
+                    is_dead_cross_3_24 = (prev_sma3 >= prev_sma24) and (curr_sma3 < curr_sma24)
                 
-                if is_dead_cross_24_60:
+                if is_dead_cross_3_24:
                     sell_signal = True
-                    signal_msg = f"24이평-60이평 데드크로스 (무조건 매도 최우선)"
+                    signal_msg = f"3이평-24이평 데드크로스 (무조건 매도 최우선)"
                 else:
                     # RSI(14) 70 하향 돌파 (과매수 구간 진입 후 70선 이탈) 시 매도
                     prev_rsi = rsi14_list[-2]
