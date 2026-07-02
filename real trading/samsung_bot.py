@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from kiwoom_client import KiwoomClient
 from data_manager import RealtimeDataManager
 from data_feeder import HybridDataFeeder
-from indicator import calculate_sma, calculate_bollinger_bands
+from indicator import calculate_sma, calculate_bollinger_bands, calculate_rsi
 from strategy import compute_all_lines_5m
 import telegram_bot
 
@@ -102,6 +102,13 @@ async def main_trading_loop(client: KiwoomClient):
     feeder = HybridDataFeeder(client, dm, interval=3.0)
     feeder.start()
     
+    # 봇 시작 시 예수금을 한 번 강제로 조회해서 화면에 확실히 띄워줍니다!
+    try:
+        startup_cash = await asyncio.to_thread(client.get_cash_balance)
+        logger.info(f"💰 [계좌 상태 점검] 봇 구동 완료! 현재 예수금: {startup_cash:,.0f}원")
+    except Exception as e:
+        logger.error(f"예수금 초기 조회 실패: {e}")
+    
     logger.info(f"[{TARGET_NAME}] 실시간 감시 돌입 (08:00 ~ 20:00)")
     
     target_trading_qty = 0 # 매수/매도 사이클에서 기준이 될 보유 수량 기억 변수
@@ -134,22 +141,27 @@ async def main_trading_loop(client: KiwoomClient):
             # SMA 3, 8, 60 및 볼린저 밴드 계산
             sma3_list = calculate_sma(closes, 3)
             sma8_list = calculate_sma(closes, 8)
+            sma24_list = calculate_sma(closes, 24)
             sma60_list = calculate_sma(closes, 60)
             bb20_upper, bb20_mid, bb20_lower = calculate_bollinger_bands(closes, 20, 2.0)
+            bb5_upper, bb5_mid, bb5_lower = calculate_bollinger_bands(closes, 5, 2.0)
+            rsi14_list = calculate_rsi(closes, 14)
             
             curr_sma3 = sma3_list[-1]
             curr_sma8 = sma8_list[-1]
+            curr_sma24 = sma24_list[-1]
             curr_sma60 = sma60_list[-1]
             prev_sma3 = sma3_list[-2]
             prev_sma8 = sma8_list[-2]
+            prev_sma24 = sma24_list[-2]
             prev_sma60 = sma60_list[-2]
             
             curr_bb_upper = bb20_upper[-1]
             curr_bb_lower = bb20_lower[-1]
             curr_bb_mid = bb20_mid[-1]
             
-            if (curr_sma3 is None or curr_sma8 is None or curr_sma60 is None or 
-                prev_sma3 is None or prev_sma8 is None or prev_sma60 is None or
+            if (curr_sma3 is None or curr_sma8 is None or curr_sma24 is None or curr_sma60 is None or 
+                prev_sma3 is None or prev_sma8 is None or prev_sma24 is None or prev_sma60 is None or
                 curr_bb_upper is None or curr_bb_lower is None or curr_bb_mid is None):
                 await asyncio.sleep(3)
                 continue
@@ -174,6 +186,10 @@ async def main_trading_loop(client: KiwoomClient):
                         break
                 cached_qty = temp_qty
                 cached_buy_price = temp_buy_price
+                
+                if cached_qty > 0:
+                    curr_rsi = rsi14_list[-1] if rsi14_list and rsi14_list[-1] is not None else 0.0
+                    logger.info(f"👀 [매도 감시 중] 현재 RSI(14): {curr_rsi:.2f} (목표: 70 상향 돌파 시 전량 매도)")
             
             qty = cached_qty
             buy_price = cached_buy_price
@@ -191,31 +207,19 @@ async def main_trading_loop(client: KiwoomClient):
             # 횡보장 잦은 교차 방지를 위해 최소 2호가(삼성전자 기준 보통 200원) 이상의 격차가 벌어져야 교차로 인정
             gap_threshold = get_tick_size(current_price) * 2
             
-            # == 매수 신호 판별 (SMA 골든크로스 + 이격도) ==
-            is_golden_cross_8 = prev_sma3 <= prev_sma8 and (curr_sma3 - curr_sma8) >= gap_threshold
-            is_golden_cross_60 = prev_sma3 <= prev_sma60 and (curr_sma3 - curr_sma60) >= gap_threshold
-            
-            # 횡보장 필터 (볼린저 밴드 대역폭이 너무 좁으면 거짓 신호로 판단하여 크로스 무시)
-            if is_sideways:
-                is_golden_cross_8 = False
-                is_golden_cross_60 = False
-                
-            is_sma60_falling = curr_sma60 < prev_sma60
-            
+            # == 매수 신호 판별 (3이평-24이평 골든크로스) ==
             buy_signal = False
             signal_msg = ""
             telegram_msg = ""
             
-            if is_sma60_falling:
-                if is_golden_cross_60:
-                    buy_signal = True
-                    signal_msg = f"SMA3({curr_sma3:.2f})이 SMA60({curr_sma60:.2f}) 상향 돌파 (SMA60 하락장 골든크로스)"
-                    telegram_msg = "SMA3/60 골든크로스 (SMA60 하락중)"
-            else:
-                if is_golden_cross_8:
-                    buy_signal = True
-                    signal_msg = f"SMA3({curr_sma3:.2f})이 SMA8({curr_sma8:.2f}) 상향 돌파 (SMA8 골든크로스)"
-                    telegram_msg = "SMA3/8 골든크로스"
+            is_golden_cross_3_24 = False
+            if prev_sma3 is not None and prev_sma24 is not None and curr_sma3 is not None and curr_sma24 is not None:
+                is_golden_cross_3_24 = (prev_sma3 <= prev_sma24) and (curr_sma3 > curr_sma24)
+            
+            if is_golden_cross_3_24:
+                buy_signal = True
+                signal_msg = f"3이평이 24이평 골든크로스 (상향 돌파)"
+                telegram_msg = "3이평-24이평 골든크로스 매수"
 
             # == 매수 로직 ==
             if buy_signal:
@@ -252,12 +256,26 @@ async def main_trading_loop(client: KiwoomClient):
                 sell_signal = False
                 signal_msg = ""
                 
-                # SMA3 이평선이 SMA8 이평선을 하향 돌파(데드크로스)할 때 매도 (이격도 필터 적용)
-                is_dead_cross_8 = prev_sma3 >= prev_sma8 and (curr_sma8 - curr_sma3) >= gap_threshold
+                # 1순위 매도 조건: 24이평이 60이평을 데드크로스 (하향 돌파)
+                is_dead_cross_24_60 = False
+                if prev_sma24 is not None and prev_sma60 is not None and curr_sma24 is not None and curr_sma60 is not None:
+                    is_dead_cross_24_60 = (prev_sma24 >= prev_sma60) and (curr_sma24 < curr_sma60)
                 
-                if is_dead_cross_8:
+                if is_dead_cross_24_60:
                     sell_signal = True
-                    signal_msg = f"SMA3({curr_sma3:.2f})이 SMA8({curr_sma8:.2f}) 하향 돌파 (SMA8 데드크로스)"
+                    signal_msg = f"24이평-60이평 데드크로스 (무조건 매도 최우선)"
+                else:
+                    # RSI(14) 70 하향 돌파 (과매수 구간 진입 후 70선 이탈) 시 매도
+                    prev_rsi = rsi14_list[-2]
+                    curr_rsi = rsi14_list[-1]
+                    
+                    is_rsi_crossdown = False
+                    if prev_rsi is not None and curr_rsi is not None:
+                        is_rsi_crossdown = (prev_rsi >= 70) and (curr_rsi < 70)
+                    
+                    if is_rsi_crossdown:
+                        sell_signal = True
+                        signal_msg = f"RSI(14) 70 하향 돌파 (과매수 이탈: {prev_rsi:.2f} -> {curr_rsi:.2f})"
                 
                 if sell_signal:
                     logger.warning(f"🚨 [매도 신호] {signal_msg}!")
