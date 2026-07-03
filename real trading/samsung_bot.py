@@ -106,8 +106,21 @@ async def main_trading_loop(client: KiwoomClient):
     try:
         startup_cash = await asyncio.to_thread(client.get_cash_balance)
         logger.info(f"💰 [계좌 상태 점검] 봇 구동 완료! 현재 예수금: {startup_cash:,.0f}원")
+        
+        # 보유 수량도 명시적으로 한 번 조회해서 띄워줍니다.
+        startup_holdings = await asyncio.to_thread(client.get_holdings)
+        found_target = False
+        if startup_holdings:
+            for h in startup_holdings:
+                if h["code"] == TARGET_CODE:
+                    logger.info(f"💼 [계좌 상태 점검] 삼성전자 현재 보유 수량: {h['quantity']}주")
+                    found_target = True
+        
+        if not found_target:
+            logger.info("💼 [계좌 상태 점검] 삼성전자 현재 보유 수량: 0주 (미보유)")
+            
     except Exception as e:
-        logger.error(f"예수금 초기 조회 실패: {e}")
+        logger.error(f"예수금/보유수량 초기 조회 실패: {e}")
     
     logger.info(f"[{TARGET_NAME}] 실시간 감시 돌입 (08:00 ~ 20:00)")
     
@@ -177,15 +190,20 @@ async def main_trading_loop(client: KiwoomClient):
                 holdings = await asyncio.to_thread(client.get_holdings)
                 last_holdings_check = now_ts
                 
-                temp_qty = 0
-                temp_buy_price = 0
-                for h in holdings:
-                    if h["code"] == TARGET_CODE:
-                        temp_qty = h["quantity"]
-                        temp_buy_price = h.get("buy_price", 0)
-                        break
-                cached_qty = temp_qty
-                cached_buy_price = temp_buy_price
+                if holdings is not None:
+                    temp_qty = 0
+                    temp_buy_price = 0
+                    for h in holdings:
+                        if h["code"] == TARGET_CODE:
+                            temp_qty = h["quantity"]
+                            temp_buy_price = h.get("buy_price", 0)
+                            break
+                    cached_qty = temp_qty
+                    cached_buy_price = temp_buy_price
+                else:
+                    # API 에러 등으로 None이 반환된 경우 기존 수량을 유지합니다.
+                    pass
+                
                 
                 if cached_qty > 0:
                     curr_rsi = rsi14_list[-1] if rsi14_list and rsi14_list[-1] is not None else 0.0
@@ -212,14 +230,17 @@ async def main_trading_loop(client: KiwoomClient):
             signal_msg = ""
             telegram_msg = ""
             
-            is_golden_cross_3_24 = False
+            is_golden_cross_sma3_sma24 = False
             if prev_sma3 is not None and prev_sma24 is not None and curr_sma3 is not None and curr_sma24 is not None:
-                is_golden_cross_3_24 = (prev_sma3 <= prev_sma24) and (curr_sma3 > curr_sma24)
+                is_golden_cross_sma3_sma24 = (prev_sma3 <= prev_sma24) and (curr_sma3 - curr_sma24 >= gap_threshold)
             
-            if is_golden_cross_3_24:
-                buy_signal = True
-                signal_msg = f"3이평이 24이평 골든크로스 (상향 돌파)"
-                telegram_msg = "3이평-24이평 골든크로스 매수"
+            if is_golden_cross_sma3_sma24:
+                if is_sideways:
+                    logger.info("횡보장(Bandwidth < 0.5%) 감지 - 잦은 교차 방지를 위해 매수 신호 무시")
+                else:
+                    buy_signal = True
+                    signal_msg = f"SMA3이 SMA24 골든크로스 (상향 돌파, 이격도 통과)"
+                    telegram_msg = "SMA3-SMA24 골든크로스 매수"
 
             # == 매수 로직 ==
             if buy_signal:
@@ -256,14 +277,14 @@ async def main_trading_loop(client: KiwoomClient):
                 sell_signal = False
                 signal_msg = ""
                 
-                # 1순위 매도 조건: 3이평이 24이평을 데드크로스 (하향 돌파)
-                is_dead_cross_3_24 = False
+                # 1순위 매도 조건: SMA3이 SMA24를 데드크로스 (하향 돌파)
+                is_dead_cross_sma3_sma24 = False
                 if prev_sma3 is not None and prev_sma24 is not None and curr_sma3 is not None and curr_sma24 is not None:
-                    is_dead_cross_3_24 = (prev_sma3 >= prev_sma24) and (curr_sma3 < curr_sma24)
+                    is_dead_cross_sma3_sma24 = (prev_sma3 >= prev_sma24) and (curr_sma24 - curr_sma3 >= gap_threshold)
                 
-                if is_dead_cross_3_24:
+                if is_dead_cross_sma3_sma24:
                     sell_signal = True
-                    signal_msg = f"3이평-24이평 데드크로스 (무조건 매도 최우선)"
+                    signal_msg = f"SMA3-SMA24 데드크로스 (이격도 하향 이탈 최우선 매도)"
                 else:
                     # RSI(14) 70 하향 돌파 (과매수 구간 진입 후 70선 이탈) 시 매도
                     prev_rsi = rsi14_list[-2]
