@@ -60,6 +60,17 @@ class KiwoomRealClient:
                     if hasattr(config, 'KIWOOM_ACCOUNT_PWD') and config.KIWOOM_ACCOUNT_PWD:
                         kwargs["json"]["pwd"] = config.KIWOOM_ACCOUNT_PWD
                         kwargs["json"]["pwd_tp"] = "00"  # 비밀번호 타입
+                elif "params" in kwargs and kwargs["params"] is not None:
+                    kwargs["params"]["acnt_no"] = config.KIWOOM_ACCOUNT_NUM
+                    if hasattr(config, 'KIWOOM_ACCOUNT_PWD') and config.KIWOOM_ACCOUNT_PWD:
+                        kwargs["params"]["pwd"] = config.KIWOOM_ACCOUNT_PWD
+                        kwargs["params"]["pwd_tp"] = "00"
+                elif method.upper() == "GET":
+                    kwargs["params"] = {"acnt_no": config.KIWOOM_ACCOUNT_NUM}
+                    if hasattr(config, 'KIWOOM_ACCOUNT_PWD') and config.KIWOOM_ACCOUNT_PWD:
+                        kwargs["params"]["pwd"] = config.KIWOOM_ACCOUNT_PWD
+                        kwargs["params"]["pwd_tp"] = "00"
+                        
                 return original_execute(method, resource_url, **kwargs)
             api_instance._execute_request = patched_execute
 
@@ -196,8 +207,10 @@ class KiwoomRealClient:
                 query_type="1",
                 domestic_exchange_type="KRX"
             )
-            if not result:
-                return []
+            if not result or result.get("return_code", 0) != 0:
+                err_msg = result.get("return_msg", "Unknown API Error") if result else "No Response"
+                logger.error(f"Error in get_holdings API: {err_msg}")
+                return None
                 
             positions_raw = result.get("acnt_evlt_remn_indv_tot", [])
             holdings = []

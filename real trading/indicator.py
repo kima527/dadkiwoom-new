@@ -9,6 +9,47 @@ def calculate_sma(prices, period):
             sma.append(None)
     return sma
 
+def calculate_rsi(prices, period=14):
+    """Calculates Relative Strength Index (RSI)."""
+    n = len(prices)
+    rsi = [None] * n
+    if n <= period:
+        return rsi
+
+    gains = []
+    losses = []
+    for i in range(1, n):
+        if prices[i] is None or prices[i-1] is None:
+            gains.append(0)
+            losses.append(0)
+            continue
+        change = prices[i] - prices[i - 1]
+        gains.append(max(change, 0))
+        losses.append(abs(min(change, 0)))
+
+    # Initial average gain/loss
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    if avg_loss == 0:
+        rsi[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi[period] = 100.0 - (100.0 / (1.0 + rs))
+
+    # Smoothed Moving Average
+    for i in range(period + 1, n):
+        avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
+        
+        if avg_loss == 0:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return rsi
+
 def calculate_wma(prices, period):
     """Calculates Linear Weighted Moving Average."""
     wma = []
@@ -721,5 +762,66 @@ def adjust_price_by_ticks(price: float, ticks: int) -> int:
     return current_price
 
 
-
-
+def calculate_ichimoku_target_line(candles, short_p=9, mid_p=26, long_p=52):
+    """
+    일목균형표 선행스팬1(s1)과 선행스팬2(s2) 교차 시점의 min(L, L(1)) 값을 추적하는 선.
+    s1 = shift((highest(high,short_p) + lowest(low,short_p) + highest(high,mid_p) + lowest(low,mid_p))/4, mid_p-1)
+    s2 = shift((highest(high,long_p) + lowest(low,long_p))/2, mid_p-1)
+    Target = valuewhen(1, crossup(s1,s2) or crossdown(s1,s2), min(L, L(1)))
+    """
+    n = len(candles)
+    target_line = [None] * n
+    
+    if n < long_p + mid_p:
+        return target_line
+        
+    highs = [c['high'] for c in candles]
+    lows = [c['low'] for c in candles]
+    
+    s1 = [None] * n
+    s2 = [None] * n
+    
+    # Calculate base s1, s2 without shift
+    for i in range(n):
+        if i >= max(short_p, mid_p) - 1:
+            h9 = max(highs[i-short_p+1:i+1])
+            l9 = min(lows[i-short_p+1:i+1])
+            h26 = max(highs[i-mid_p+1:i+1])
+            l26 = min(lows[i-mid_p+1:i+1])
+            s1[i] = (h9 + l9 + h26 + l26) / 4.0
+            
+        if i >= long_p - 1:
+            h52 = max(highs[i-long_p+1:i+1])
+            l52 = min(lows[i-long_p+1:i+1])
+            s2[i] = (h52 + l52) / 2.0
+            
+    # Shift forward by mid_p - 1 (25 periods)
+    shift_n = mid_p - 1
+    shifted_s1 = [None] * n
+    shifted_s2 = [None] * n
+    for i in range(n - shift_n):
+        shifted_s1[i + shift_n] = s1[i]
+        shifted_s2[i + shift_n] = s2[i]
+        
+    last_target = None
+    for i in range(1, n):
+        s1_curr = shifted_s1[i]
+        s1_prev = shifted_s1[i-1]
+        s2_curr = shifted_s2[i]
+        s2_prev = shifted_s2[i-1]
+        
+        is_cross = False
+        if s1_curr is not None and s2_curr is not None and s1_prev is not None and s2_prev is not None:
+            if s1_prev <= s2_prev and s1_curr > s2_curr: # CrossUp
+                is_cross = True
+            elif s1_prev >= s2_prev and s1_curr < s2_curr: # CrossDown
+                is_cross = True
+                
+        if is_cross:
+            curr_l = lows[i]
+            prev_l = lows[i-1]
+            last_target = min(curr_l, prev_l)
+            
+        target_line[i] = last_target
+        
+    return target_line

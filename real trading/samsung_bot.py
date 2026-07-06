@@ -11,8 +11,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from kiwoom_client import KiwoomClient
 from data_manager import RealtimeDataManager
 from data_feeder import HybridDataFeeder
-from indicator import calculate_sma, calculate_bollinger_bands, calculate_rsi
-from strategy import compute_all_lines_5m
+from indicator import calculate_sma
 import telegram_bot
 
 # Configure logging
@@ -125,8 +124,6 @@ async def main_trading_loop(client: KiwoomClient):
     logger.info(f"[{TARGET_NAME}] 실시간 감시 돌입 (08:00 ~ 20:00)")
     
     target_trading_qty = 0 # 매수/매도 사이클에서 기준이 될 보유 수량 기억 변수
-    active_stop_price = 0  # 트레일링 스탑 방어선 가격
-    active_stop_name = ""  # 현재 활성화된 방어선 이름 (L선, K선)
     
     last_holdings_check = 0 # TR 조회 횟수 제한 방지용 타이머
     cached_qty = 0
@@ -140,7 +137,7 @@ async def main_trading_loop(client: KiwoomClient):
         try:
             # 5분봉 데이터 가져오기
             candles = dm.get_completed_and_current_5m_candles()
-            if len(candles) < 60:
+            if len(candles) < 25:
                 await asyncio.sleep(3)
                 continue
                 
@@ -151,37 +148,18 @@ async def main_trading_loop(client: KiwoomClient):
                 await asyncio.sleep(3)
                 continue
 
-            # SMA 3, 8, 60 및 볼린저 밴드 계산
+            # SMA 3, 24 계산
             sma3_list = calculate_sma(closes, 3)
-            sma8_list = calculate_sma(closes, 8)
             sma24_list = calculate_sma(closes, 24)
-            sma60_list = calculate_sma(closes, 60)
-            bb20_upper, bb20_mid, bb20_lower = calculate_bollinger_bands(closes, 20, 2.0)
-            bb5_upper, bb5_mid, bb5_lower = calculate_bollinger_bands(closes, 5, 2.0)
-            rsi14_list = calculate_rsi(closes, 14)
             
             curr_sma3 = sma3_list[-1]
-            curr_sma8 = sma8_list[-1]
             curr_sma24 = sma24_list[-1]
-            curr_sma60 = sma60_list[-1]
             prev_sma3 = sma3_list[-2]
-            prev_sma8 = sma8_list[-2]
             prev_sma24 = sma24_list[-2]
-            prev_sma60 = sma60_list[-2]
             
-            curr_bb_upper = bb20_upper[-1]
-            curr_bb_lower = bb20_lower[-1]
-            curr_bb_mid = bb20_mid[-1]
-            
-            if (curr_sma3 is None or curr_sma8 is None or curr_sma24 is None or curr_sma60 is None or 
-                prev_sma3 is None or prev_sma8 is None or prev_sma24 is None or prev_sma60 is None or
-                curr_bb_upper is None or curr_bb_lower is None or curr_bb_mid is None):
+            if (curr_sma3 is None or curr_sma24 is None or prev_sma3 is None or prev_sma24 is None):
                 await asyncio.sleep(3)
                 continue
-                
-            # 볼린저 밴드 대역폭(Bandwidth) 계산
-            bandwidth = (curr_bb_upper - curr_bb_lower) / curr_bb_mid * 100.0
-            is_sideways = bandwidth < 0.5  # 밴드폭이 0.5% 미만이면 횡보장으로 간주
                 
             # 현재 보유 수량 확인 (TR 조회 한도 1000회/시간 방지를 위해 30초마다 갱신)
             import time as time_module
@@ -201,13 +179,7 @@ async def main_trading_loop(client: KiwoomClient):
                     cached_qty = temp_qty
                     cached_buy_price = temp_buy_price
                 else:
-                    # API 에러 등으로 None이 반환된 경우 기존 수량을 유지합니다.
                     pass
-                
-                
-                if cached_qty > 0:
-                    curr_rsi = rsi14_list[-1] if rsi14_list and rsi14_list[-1] is not None else 0.0
-                    logger.info(f"👀 [매도 감시 중] 현재 RSI(14): {curr_rsi:.2f} (목표: 70 상향 돌파 시 전량 매도)")
             
             qty = cached_qty
             buy_price = cached_buy_price
@@ -216,15 +188,7 @@ async def main_trading_loop(client: KiwoomClient):
                 if target_trading_qty != qty:
                     logger.info(f"✅ [초기 인식 완료] 삼성전자 현재 보유 수량: {qty}주 (해당 수량으로 매매 사이클이 진행됩니다)")
                 target_trading_qty = qty # 현재 보유 수량을 기억 (매도 후 다시 매수할 때 사용)
-                # 매수 후 첫 루프거나 수량이 리셋되었을 때 트레일링 스탑 초기화
-                if active_stop_price == 0:
-                    active_stop_price = 0
-                    active_stop_name = ""
                     
-            # == 이격도(간격) 필터 설정 ==
-            # 횡보장 잦은 교차 방지를 위해 최소 2호가(삼성전자 기준 보통 200원) 이상의 격차가 벌어져야 교차로 인정
-            gap_threshold = get_tick_size(current_price) * 2
-            
             # == 매수 신호 판별 (3이평-24이평 골든크로스) ==
             buy_signal = False
             signal_msg = ""
@@ -232,15 +196,12 @@ async def main_trading_loop(client: KiwoomClient):
             
             is_golden_cross_sma3_sma24 = False
             if prev_sma3 is not None and prev_sma24 is not None and curr_sma3 is not None and curr_sma24 is not None:
-                is_golden_cross_sma3_sma24 = (prev_sma3 <= prev_sma24) and (curr_sma3 - curr_sma24 >= gap_threshold)
+                is_golden_cross_sma3_sma24 = (prev_sma3 <= prev_sma24) and (curr_sma3 > curr_sma24)
             
             if is_golden_cross_sma3_sma24:
-                if is_sideways:
-                    logger.info("횡보장(Bandwidth < 0.5%) 감지 - 잦은 교차 방지를 위해 매수 신호 무시")
-                else:
-                    buy_signal = True
-                    signal_msg = f"SMA3이 SMA24 골든크로스 (상향 돌파, 이격도 통과)"
-                    telegram_msg = "SMA3-SMA24 골든크로스 매수"
+                buy_signal = True
+                signal_msg = f"SMA3이 SMA24 골든크로스 (즉시 매수)"
+                telegram_msg = "SMA3-SMA24 골든크로스 매수"
 
             # == 매수 로직 ==
             if buy_signal:
@@ -280,23 +241,11 @@ async def main_trading_loop(client: KiwoomClient):
                 # 1순위 매도 조건: SMA3이 SMA24를 데드크로스 (하향 돌파)
                 is_dead_cross_sma3_sma24 = False
                 if prev_sma3 is not None and prev_sma24 is not None and curr_sma3 is not None and curr_sma24 is not None:
-                    is_dead_cross_sma3_sma24 = (prev_sma3 >= prev_sma24) and (curr_sma24 - curr_sma3 >= gap_threshold)
+                    is_dead_cross_sma3_sma24 = (prev_sma3 >= prev_sma24) and (curr_sma3 < curr_sma24)
                 
                 if is_dead_cross_sma3_sma24:
                     sell_signal = True
-                    signal_msg = f"SMA3-SMA24 데드크로스 (이격도 하향 이탈 최우선 매도)"
-                else:
-                    # RSI(14) 70 하향 돌파 (과매수 구간 진입 후 70선 이탈) 시 매도
-                    prev_rsi = rsi14_list[-2]
-                    curr_rsi = rsi14_list[-1]
-                    
-                    is_rsi_crossdown = False
-                    if prev_rsi is not None and curr_rsi is not None:
-                        is_rsi_crossdown = (prev_rsi >= 70) and (curr_rsi < 70)
-                    
-                    if is_rsi_crossdown:
-                        sell_signal = True
-                        signal_msg = f"RSI(14) 70 하향 돌파 (과매수 이탈: {prev_rsi:.2f} -> {curr_rsi:.2f})"
+                    signal_msg = f"SMA3-SMA24 데드크로스 (즉시 매도)"
                 
                 if sell_signal:
                     logger.warning(f"🚨 [매도 신호] {signal_msg}!")
@@ -320,10 +269,6 @@ async def main_trading_loop(client: KiwoomClient):
                     # 매도 후 빠른 수량 갱신을 위해 타이머 리셋
                     last_holdings_check = 0
                     
-                    # 매도 후 방어선 초기화
-                    active_stop_price = 0
-                    active_stop_name = ""
-                    
                     # 중복 주문 방지를 위해 15초 대기
                     await asyncio.sleep(15)
                     continue
@@ -336,7 +281,7 @@ async def main_trading_loop(client: KiwoomClient):
 async def async_main():
     logger.info("=========================================")
     logger.info("Samsung Electronics Dedicated Bot Started")
-    logger.info("Strategy: 5-min SMA 3/8/60 Golden Cross & L/K Trailing Stop")
+    logger.info("Strategy: 5-min SMA 3/24 Golden/Dead Cross")
     logger.info("=========================================")
 
     client = KiwoomClient()
@@ -345,7 +290,7 @@ async def async_main():
         return
 
     # 시작 알림 전송
-    await telegram_bot.send_message("🤖 삼성전자 전용 스윙/단타 봇이 컴퓨터에서 단독 실행되었습니다.\n(조건검색식 연동 없음, SMA 3/8 및 3/60 교차 매매 전용)")
+    await telegram_bot.send_message("🤖 삼성전자 전용 봇이 컴퓨터에서 단독 실행되었습니다.\n(SMA 3/24 교차 매매 전용)")
 
     # 태스크 병렬 실행
     trading_task = asyncio.create_task(main_trading_loop(client))
