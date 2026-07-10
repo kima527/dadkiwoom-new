@@ -14,18 +14,20 @@ class RealtimeDataManager:
         self.candles_3m = deque(maxlen=10)
         self.candles_5m = deque(maxlen=200)
         self.candles_15m = deque(maxlen=200)
+        self.candles_30m = deque(maxlen=200)
         self.candles_daily = deque(maxlen=20)  # 일봉 (SMA3, SMA5 계산용)
         
         # 현재 진행 중인 캔들 상태
         self.current_3m_candle = None
         self.current_5m_candle = None
         self.current_15m_candle = None
+        self.current_30m_candle = None
         self.current_daily_candle = None
         
         # 현재가
         self.latest_price = 0.0
 
-    def seed_initial_data(self, past_3m: list, past_5m: list, past_15m: list, past_daily: list = None):
+    def seed_initial_data(self, past_3m: list, past_5m: list, past_15m: list, past_daily: list = None, past_30m: list = None):
         """프로그램 시작 시 과거 분봉/일봉 데이터를 적재합니다."""
         if past_3m:
             for c in past_3m:
@@ -36,6 +38,9 @@ class RealtimeDataManager:
         if past_15m:
             for c in past_15m:
                 self.candles_15m.append(c)
+        if past_30m:
+            for c in past_30m:
+                self.candles_30m.append(c)
         if past_daily:
             for c in past_daily:
                 self.candles_daily.append(c)
@@ -102,6 +107,14 @@ class RealtimeDataManager:
             self.current_15m_candle = None
             
         self.current_15m_candle = self._update_candle(self.current_15m_candle, current_price, volume, time_15m)
+
+        # 30분봉 업데이트
+        time_30m = self._get_candle_time_str(time_str, 30)
+        if self.current_30m_candle and self.current_30m_candle['time'] != time_30m:
+            self.candles_30m.append(self.current_30m_candle)
+            self.current_30m_candle = None
+            
+        self.current_30m_candle = self._update_candle(self.current_30m_candle, current_price, volume, time_30m)
         
         # 일봉 업데이트 (date_str가 제공되면 활용, 아니면 오늘 날짜)
         if not date_str:
@@ -137,6 +150,15 @@ class RealtimeDataManager:
         c_list = list(self.candles_5m)
         if self.current_5m_candle:
             c_list.append(self.current_5m_candle)
+        return c_list
+
+    def get_completed_and_current_30m_candles(self):
+        """
+        지표 계산용 30분봉 캔들 세트를 반환합니다. (완성된 캔들 + 실시간 변동 중인 현재 캔들)
+        """
+        c_list = list(self.candles_30m)
+        if self.current_30m_candle:
+            c_list.append(self.current_30m_candle)
         return c_list
         
     def get_completed_and_current_daily_candles(self) -> list:

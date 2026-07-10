@@ -485,6 +485,14 @@ class KiwoomRealClient:
         """주식 종목의 5분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="5", last_n_days=last_n_days)
 
+    def get_15min_candles(self, stock_code: str, last_n_days: int = 7) -> list:
+        """주식 종목의 15분봉 차트 데이터를 조회합니다."""
+        return self._fetch_minute_candles(stock_code, tic_scope="15", last_n_days=last_n_days)
+
+    def get_30min_candles(self, stock_code: str, last_n_days: int = 14) -> list:
+        """주식 종목의 30분봉 차트 데이터를 조회합니다."""
+        return self._fetch_minute_candles(stock_code, tic_scope="30", last_n_days=last_n_days)
+
     def get_tick_data(self, stock_code: str, tick_unit: str = "120", limit: int = 100) -> list:
         """
         주식 종목의 틱 차트 데이터를 조회합니다. (TR: opt10079 호환 REST API 엔드포인트 사용)
