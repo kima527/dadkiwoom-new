@@ -20,7 +20,11 @@ def load_my_pick_codes():
         logger.warning(f"나의픽 파일이 없습니다: {file_path}")
         return []
     try:
-        df = pd.read_csv(file_path, encoding='cp949')
+        if file_path.endswith('.xlsx'):
+            df = pd.read_excel(file_path)
+        else:
+            df = pd.read_csv(file_path, encoding='cp949')
+            
         if not df.empty:
             last_col = df.columns[-1]
             codes = []

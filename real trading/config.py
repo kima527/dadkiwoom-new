@@ -23,15 +23,15 @@ KAKAO_APP_KEY = os.getenv("KAKAO_APP_KEY", "")
 KAKAO_REFRESH_TOKEN = os.getenv("KAKAO_REFRESH_TOKEN", "")
 
 # ── 🔒 [CRITICAL LOGIC LOCK - DO NOT MODIFY] ──
-# Watchlist Excel File Name (종목 선정은 반드시 이 파일에 있는 종목으로만 한정합니다)
-WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_pick.xlsx")
+# Watchlist File Name (종목 선정은 반드시 이 파일에 있는 종목으로만 한정합니다)
+WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "target_pick.csv")
 
 # TEMA Gate Line Settings
 TEMA_PERIOD_SHORT = int(os.getenv("TEMA_PERIOD_SHORT", "5"))
 TEMA_PERIOD_LONG = int(os.getenv("TEMA_PERIOD_LONG", "20"))
 
 # Budget Settings
-BUDGET_PER_STOCK = int(os.getenv("BUDGET_PER_STOCK", "1000000"))
+BUDGET_PER_STOCK = int(os.getenv("BUDGET_PER_STOCK", "3000000"))
 TEST_MODE_1_SHARE = False
 SINGLE_STOCK_BUDGET = int(os.getenv("SINGLE_STOCK_BUDGET", "10000000"))
 TARGET_SINGLE_STOCK_CODE = os.getenv("TARGET_SINGLE_STOCK_CODE", "AUTO")

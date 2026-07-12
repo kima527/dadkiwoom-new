@@ -20,7 +20,7 @@ authorized_chat_ids = set()
 if TELEGRAM_CHAT_ID:
     authorized_chat_ids.add(str(TELEGRAM_CHAT_ID))
 
-def send_message_sync(text: str):
+def send_message_sync(text: str, reply_markup: dict = None):
     """동기식으로 텔레그램 메시지를 발송합니다."""
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("텔레그램 토큰이 설정되지 않아 메시지를 보낼 수 없습니다.")
@@ -39,15 +39,17 @@ def send_message_sync(text: str):
                 "text": text,
                 "parse_mode": "HTML"
             }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
             response = requests.post(url, json=payload, timeout=5)
             if response.status_code != 200:
                 logger.error(f"텔레그램 메시지 발송 실패 ({response.status_code}): {response.text}")
         except Exception as e:
             logger.error(f"텔레그램 메시지 발송 중 오류: {e}")
 
-async def send_message(text: str):
+async def send_message(text: str, reply_markup: dict = None):
     """비동기 환경에서 텔레그램 메시지를 발송합니다."""
-    await asyncio.to_thread(send_message_sync, text)
+    await asyncio.to_thread(send_message_sync, text, reply_markup)
 
 async def poll_telegram_updates():
     """텔레그램에서 명령어를 수신하는 백그라운드 루프"""
@@ -80,27 +82,36 @@ async def poll_telegram_updates():
                         if not text or not chat_id:
                             continue
                             
+                        # 키보드 버튼 템플릿
+                        keyboard = {
+                            "keyboard": [
+                                [{"text": "🟢 봇 켜기"}, {"text": "🔴 봇 끄기"}],
+                                [{"text": "📊 상태 확인"}]
+                            ],
+                            "resize_keyboard": True
+                        }
+
                         # 명령어 처리
                         if text.startswith("/auth"):
                             parts = text.split()
                             if len(parts) >= 2 and parts[1] == BOT_PASSWORD:
                                 authorized_chat_ids.add(chat_id)
-                                await send_message("✅ 인증 성공! 봇 제어 권한이 부여되었습니다.\n\n사용 가능 명령어:\n/start_bot - 매수 감시 켜기\n/stop_bot - 신규 매수 차단(기존 종목 매도는 유지)")
+                                await send_message("✅ 인증 성공! 아래 버튼을 눌러 봇을 제어하세요.", reply_markup=keyboard)
                             else:
                                 await asyncio.to_thread(requests.post, f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "❌ 비밀번호가 틀렸습니다."})
                         
                         elif chat_id in authorized_chat_ids:
-                            if text == "/start_bot":
+                            if text in ["/start_bot", "🟢 봇 켜기"]:
                                 IS_BOT_ACTIVE = True
-                                await send_message("🟢 봇이 [시작] 되었습니다. 신규 매수 로직이 활성화됩니다.")
+                                await send_message("🟢 봇이 [시작] 되었습니다. 신규 매수 로직이 활성화됩니다.", reply_markup=keyboard)
                                 logger.info(f"[텔레그램] 봇 시작 명령 수신 - 매수 활성화됨")
-                            elif text == "/stop_bot":
+                            elif text in ["/stop_bot", "🔴 봇 끄기"]:
                                 IS_BOT_ACTIVE = False
-                                await send_message("🔴 봇이 [중지] 되었습니다. 신규 매수가 차단됩니다.\n(※ 보유 중인 종목의 감시 및 자동 매도는 계속 정상 작동합니다)")
+                                await send_message("🔴 봇이 [중지] 되었습니다. 신규 매수가 차단됩니다.\n(※ 보유 중인 종목의 감시 및 자동 매도는 계속 정상 작동합니다)", reply_markup=keyboard)
                                 logger.info(f"[텔레그램] 봇 중지 명령 수신 - 신규 매수 차단됨")
-                            elif text == "/status":
+                            elif text in ["/status", "📊 상태 확인"]:
                                 status = "🟢 실행 중" if IS_BOT_ACTIVE else "🔴 중지됨 (신규매수 차단)"
-                                await send_message(f"현재 봇 상태: {status}\n인증된 사용자 수: {len(authorized_chat_ids)}명")
+                                await send_message(f"현재 봇 상태: {status}\n인증된 사용자 수: {len(authorized_chat_ids)}명", reply_markup=keyboard)
                 else:
                     logger.warning(f"텔레그램 업데이트 실패: {data}")
             else:

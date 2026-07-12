@@ -128,11 +128,12 @@ async def main_trading_loop(client: KiwoomClient):
     logger.info(f"[{TARGET_NAME}] 실시간 감시 돌입 (08:00 ~ 20:00)")
     
     target_trading_qty = 0 # 매수/매도 사이클에서 기준이 될 보유 수량 기억 변수
-    highest_price_since_buy = 0 # 트레일링 스탑용 고점 기억 변수
     
     last_holdings_check = 0 # TR 조회 횟수 제한 방지용 타이머
     cached_qty = 0
     cached_buy_price = 0
+    
+    last_sell_date_str = "" # 1일 1매매 제한 (당일 재진입 방지)
     
     while True:
         if not is_market_open():
@@ -140,56 +141,38 @@ async def main_trading_loop(client: KiwoomClient):
             continue
             
         try:
-            # 30분봉 데이터 가져오기
-            candles = dm.get_completed_and_current_30m_candles()
-            if len(candles) < 50:
+            # 15분봉 데이터 가져오기 (마지막 요소는 실시간 현재가 포함)
+            candles = dm.get_completed_and_current_15m_candles()
+            if len(candles) < 65: # SMA 60 계산을 위해 넉넉히 대기
                 await asyncio.sleep(3)
                 continue
                 
             closes = [c['close'] for c in candles]
-            highs = [c['high'] for c in candles]
-            lows = [c['low'] for c in candles]
             current_price = dm.latest_price
             
             if current_price <= 0:
                 await asyncio.sleep(3)
                 continue
 
-            # Pandas를 이용한 지표 계산 (BB10, RSI14, MACD, ATR14)
-            df = pd.DataFrame({'Close': closes, 'High': highs, 'Low': lows})
+            # Pandas를 이용한 이동평균 지표 계산 (SMA 5, 20, 40, 60)
+            df = pd.DataFrame({'Close': closes})
             
-            exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-            exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-            macd = exp1 - exp2
-            macd_signal = macd.ewm(span=9, adjust=False).mean()
+            df['SMA5'] = df['Close'].rolling(window=5).mean()
+            df['SMA20'] = df['Close'].rolling(window=20).mean()
+            df['SMA40'] = df['Close'].rolling(window=40).mean()
+            df['SMA60'] = df['Close'].rolling(window=60).mean()
             
-            bb_mid = df['Close'].rolling(window=10).mean()
-            bb_std_val = df['Close'].rolling(window=10).std()
-            bb_up = bb_mid + (bb_std_val * 1.5)
-            bb_low = bb_mid - (bb_std_val * 1.5)
+            p_sma20 = df['SMA20'].iloc[-2]
+            p_sma40 = df['SMA40'].iloc[-2]
             
-            delta = df['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
+            sma20 = df['SMA20'].iloc[-1]
+            sma40 = df['SMA40'].iloc[-1]
             
-            high_low = df['High'] - df['Low']
-            high_close = np.abs(df['High'] - df['Close'].shift())
-            low_close = np.abs(df['Low'] - df['Close'].shift())
-            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            atr = tr.rolling(window=14).mean()
-            
-            p_macd = macd.iloc[-2]
-            p_signal = macd_signal.iloc[-2]
-            p_bb_low = bb_low.iloc[-2]
-            p_bb_up = bb_up.iloc[-2]
-            p_rsi = rsi.iloc[-2]
-            p_atr = atr.iloc[-2]
-            
-            if pd.isna(p_macd) or pd.isna(p_bb_low) or pd.isna(p_rsi):
+            if pd.isna(df['SMA60'].iloc[-1]):
                 await asyncio.sleep(3)
                 continue
+                
+            current_date_str = get_kst_now().strftime("%Y-%m-%d")
                 
             # 현재 보유 수량 확인 (TR 조회 한도 1000회/시간 방지를 위해 30초마다 갱신)
             import time as time_module
@@ -219,37 +202,29 @@ async def main_trading_loop(client: KiwoomClient):
                     logger.info(f"✅ [초기 인식 완료] 삼성전자 현재 보유 수량: {qty}주 (해당 수량으로 매매 사이클이 진행됩니다)")
                 target_trading_qty = qty # 현재 보유 수량을 기억 (매도 후 다시 매수할 때 사용)
                     
-            # 최고가 기록 갱신 (트레일링 스탑용)
-            if qty > 0:
-                if current_price > highest_price_since_buy:
-                    highest_price_since_buy = current_price
-            else:
-                highest_price_since_buy = 0
-                    
-            # == 매수 신호 판별 (AI 복합조건) ==
+            # == 매수 신호 판별 (SMA 20/40 크로스 + 1일 1매매) ==
             buy_signal = False
             signal_msg = ""
             telegram_msg = ""
             
-            if (p_macd > p_signal) and (current_price <= p_bb_low * 1.02) and (p_rsi < 40):
-                buy_signal = True
-                signal_msg = f"AI복합조건 만족(RSI:{p_rsi:.1f}, BB하단근접)"
-                telegram_msg = "AI 30분봉 스윙 복합조건 매수"
+            # 이전 캔들에서는 데드크로스/역배열 상태이다가, 현재 캔들에서 20선이 40선을 돌파할 때
+            if (p_sma20 <= p_sma40) and (sma20 > sma40):
+                if current_date_str != last_sell_date_str:
+                    buy_signal = True
+                    signal_msg = "SMA 20/40 골든크로스 발생 (추세 초입)"
+                    telegram_msg = "AI 15분봉 SMA 추세초입 매수"
 
             # == 매수 로직 ==
             if buy_signal:
                 if qty == 0: # 미보유 상태일 때만 매수
-                    logger.warning(f"🚀 [매수 신호] 5분봉 {signal_msg}!")
+                    logger.warning(f"🚀 [매수 신호] 15분봉 {signal_msg}!")
                     
                     price_1st = round_to_tick(current_price)
-                    
-                    # 직전 매도시 기억해둔 수량을 그대로 매수
                     buy_qty = target_trading_qty
                     
                     if buy_qty == 0:
-                        # 프로그램 시작 후 한 번도 보유/매도한 적이 없어 수량을 모르는 경우 예수금 기반으로 기본 계산
                         cash = await asyncio.to_thread(client.get_cash_balance)
-                        buy_amount = min(cash * 0.95, 1000000)
+                        buy_amount = min(cash * 0.95, 10000000) # 최대 천만원 기본 설정
                         buy_qty = int(buy_amount // price_1st) if price_1st > 0 else 0
                         if buy_qty == 0 and buy_amount >= price_1st and price_1st > 0:
                             buy_qty = 1
@@ -257,55 +232,48 @@ async def main_trading_loop(client: KiwoomClient):
                     if buy_qty > 0:
                         logger.info(f"-> 전량 지정가 매수 실행: {price_1st}원 x {buy_qty}주")
                         await asyncio.to_thread(client.place_buy_order, TARGET_CODE, buy_qty, price=price_1st, order_type="00")
-                        await telegram_bot.send_message(f"🤖 [삼성전자 매수 알림]\n- {telegram_msg} 발생\n- 매수가: {price_1st:,}원\n- 수량: {buy_qty}주")
+                        await telegram_bot.send_message(f"🤖 [삼성전자 매수 알림]\n- {telegram_msg}\n- 매수가: {price_1st:,}원\n- 수량: {buy_qty}주")
                         
-                        # 매수 후 빠른 수량 갱신을 위해 타이머 리셋
                         last_holdings_check = 0
-                        
-                        # 중복 주문 방지를 위해 15초 대기
                         await asyncio.sleep(15)
                         continue
 
             # == 매도 로직 ==
-            if qty > 0: # 보유 상태일 때만 매도 고려
+            if qty > 0:
                 sell_signal = False
                 signal_msg = ""
                 is_panic_sell_stop_loss = False
-                is_stuck_in_downtrend = False
                 
-                # 1순위: 볼린저 밴드 상단 도달 (익절)
-                if current_price >= p_bb_up:
+                # 1순위: 비상 손절 (-2%)
+                if buy_price > 0 and current_price <= buy_price * 0.98:
                     sell_signal = True
-                    signal_msg = "볼린저 밴드 상단 도달 (익절)"
-                    
-                # 1.5순위: RSI 과매수 (70 이상) 도달 시 익절 (사용자 지정 조건)
-                if p_rsi >= 70:
-                    sell_signal = True
-                    signal_msg = f"RSI 과매수 도달 (RSI {p_rsi:.1f} >= 70) 익절"
-                
-                # 2순위: ATR 트레일링 스탑 (고점 대비)
-                current_stop_loss = highest_price_since_buy - (2.5 * p_atr)
-                if current_price <= current_stop_loss:
-                    sell_signal = True
-                    signal_msg = f"ATR 트레일링 스탑 발동 (최고가 {highest_price_since_buy} 대비 하락)"
-                    is_panic_sell_stop_loss = True # 지정가 5% 할인으로 즉시 체결 유도
-                    
-                # 3순위: 기본 하드 스탑로스 (매수가 대비 3% 급락시 무조건 탈출)
-                if buy_price > 0 and current_price <= buy_price * 0.97:
-                    sell_signal = True
-                    signal_msg = f"기본 하드 스탑로스: 매수가({buy_price}원) 대비 3% 이상 하락"
+                    signal_msg = f"비상 스탑로스: 매수가({buy_price:,}원) 대비 2% 하락"
                     is_panic_sell_stop_loss = True
+                
+                # 2순위: 정배열 변곡 익절 (K-Peak)
+                if not sell_signal:
+                    # 최근 SMA20 > SMA40 크로스 시점 탐색
+                    cross_ups = (df['SMA20'] > df['SMA40']) & (df['SMA20'].shift(1) <= df['SMA40'].shift(1))
+                    if len(cross_ups[cross_ups]) > 0:
+                        last_cross_idx = cross_ups[cross_ups].index[-1]
+                        recent_df = df.iloc[last_cross_idx:]
+                        
+                        # 정배열 (5 > 20 > 60) 구간의 종가들 추출 (현재 틱 포함)
+                        is_bull = (recent_df['SMA5'] > recent_df['SMA20']) & (recent_df['SMA20'] > recent_df['SMA60'])
+                        k_history = recent_df['Close'][is_bull].tolist()
+                        
+                        if len(k_history) >= 3:
+                            if k_history[-3] < k_history[-2] and k_history[-2] > k_history[-1]:
+                                sell_signal = True
+                                signal_msg = "정배열 변곡 익절 (K-Peak 완성)"
                 
                 if sell_signal:
                     logger.warning(f"🚨 [매도 신호] {signal_msg}!")
                     
-                    # NXT 시장(야간 세션) 대응: 시장가("03") 금지, 무조건 지정가("00") 사용
-                    if is_panic_sell_stop_loss or is_stuck_in_downtrend:
-                        # 급락장/손절 매도: 현재가 대비 -5% 가격으로 지정가 주문하여 즉시 체결 유도
+                    if is_panic_sell_stop_loss:
                         sell_price = round_to_tick(current_price * 0.95) if current_price > 0 else current_price
                         logger.info(f"-> [패닉셀 방어] 즉시 체결 유도 지정가 매도 (현재가 -5%: {sell_price}원) x {qty}주")
                     else:
-                        # 평소 매도 (데드크로스): 현재가 기준 -2호가로 지정가 매도
                         tick_size = get_tick_size(current_price)
                         sell_price = current_price - (tick_size * 2) if current_price > 0 else current_price
                         logger.info(f"-> [일반 매도] 지정가 매도 주문 실행 (현재가 -2호가: {sell_price}원) x {qty}주")
@@ -323,6 +291,8 @@ async def main_trading_loop(client: KiwoomClient):
                             logger.info("매도 발생에 따른 기존 미체결 매수 주문 취소")
                             await asyncio.to_thread(client.cancel_order, order["order_no"], TARGET_CODE, order["unfilled_qty"])
                             
+                    last_sell_date_str = current_date_str # 당일 재진입 방지 락다운
+                    
                     # 매도 후 빠른 수량 갱신을 위해 타이머 리셋
                     last_holdings_check = 0
                     
@@ -338,7 +308,7 @@ async def main_trading_loop(client: KiwoomClient):
 async def async_main():
     logger.info("=========================================")
     logger.info("Samsung Electronics Dedicated Bot Started")
-    logger.info("Strategy: AI Multi-factor (30m BB + RSI + MACD + ATR)")
+    logger.info("Strategy: 15m SMA Cross & K-Peak Exit (1 trade/day)")
     logger.info("=========================================")
 
     client = KiwoomClient()
@@ -347,7 +317,7 @@ async def async_main():
         return
 
     # 시작 알림 전송
-    await telegram_bot.send_message("🤖 삼성전자 전용 봇이 컴퓨터에서 단독 실행되었습니다.\n(AI 30분봉 스윙 복합매매 전략 가동 중)")
+    await telegram_bot.send_message("🤖 삼성전자 전용 봇이 컴퓨터에서 단독 실행되었습니다.\n(15분봉 정배열 변곡 K-Peak 전략 가동 중)")
 
     # 태스크 병렬 실행
     trading_task = asyncio.create_task(main_trading_loop(client))

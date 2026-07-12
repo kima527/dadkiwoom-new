@@ -247,6 +247,20 @@ class KiwoomRealClient:
         """
         logger.info("Fetching real cash balance...")
         try:
+            # 1. API 가이드 원칙: kt00001 (예수금상세현황) 사용 우선
+            # 라이브러리에 해당 메서드가 구현되어 있다면 우선 호출합니다.
+            if hasattr(self.account_api, "deposit_detail_request_kt00001"):
+                result = self.account_api.deposit_detail_request_kt00001()
+                if result:
+                    cash_str = result.get("ord_psbl_amt", result.get("d2_prsm_dpst_aset_amt", "0"))
+                    return float(cash_str)
+            elif hasattr(self.account_api, "deposit_detail_status_request_kt00001"):
+                result = self.account_api.deposit_detail_status_request_kt00001()
+                if result:
+                    cash_str = result.get("ord_psbl_amt", result.get("d2_prsm_dpst_aset_amt", "0"))
+                    return float(cash_str)
+
+            # 2. 기존 kt00018 (계좌평가잔고내역) 폴백 사용
             result = self.account_api.account_evaluation_balance_detail_request_kt00018(
                 query_type="2",
                 domestic_exchange_type="KRX"
@@ -254,7 +268,15 @@ class KiwoomRealClient:
             if not result:
                 return 0.0
             
-            cash_str = result.get("prsm_dpst_aset_amt", "0")
+            # [CRITICAL FIX] prsm_dpst_aset_amt(추정예탁자산)는 주식을 포함한 총 자산입니다.
+            # 매수에 사용할 수 있는 순수 예수금을 구하려면 ord_psbl_amt(주문가능금액) 또는
+            # d2_prsm_dpst_aset_amt(D+2 추정예수금)을 사용해야 증거금 부족 에러를 방지할 수 있습니다.
+            cash_str = result.get("ord_psbl_amt", result.get("d2_prsm_dpst_aset_amt", "0"))
+            
+            # 위 필드가 없을 경우 최후의 수단으로 예탁자산 폴백
+            if float(cash_str) == 0.0:
+                cash_str = result.get("prsm_dpst_aset_amt", "0")
+                
             return float(cash_str)
         except Exception as e:
             logger.error(f"Error fetching cash balance: {e}")

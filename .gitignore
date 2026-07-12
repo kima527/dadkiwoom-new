@@ -18,3 +18,4 @@ my_pick.xlsx
 .vscode/
 .idea/
 .gemini/
+*.log

@@ -1263,11 +1263,14 @@ def run_trading_bot():
                                 order_res = client.place_buy_order(code, qty, price=buy_price, order_type="0")
                                 if order_res and order_res.get("return_code") == 0:
                                     sent_alerts[code]["sold_qty"] = 0
+                                    buy_amount = buy_price * qty
                                     msg = (
                                         f"🚀 <b>[매수 체결 - {cond_type}]</b>\n"
                                         f"종목: {name} ({code})\n"
-                                        f"체결단가: {buy_price:,.0f}원 (+1호가 지정가)\n"
+                                        f"매수단가: {buy_price:,.0f}원 (+1호가 지정가)\n"
                                         f"수량: {qty}주\n"
+                                        f"매수금액: {buy_amount:,.0f}원\n"
+                                        f"주문전예수금: {cash:,.0f}원\n"
                                         f"시간: {candle_time}\n"
                                         f"주문번호: {order_res.get('ord_no')}"
                                     )
@@ -1337,13 +1340,16 @@ def run_trading_bot():
                                 if len(BOT_STATE["completed_trades"]) > 50:
                                     BOT_STATE["completed_trades"].pop()
                                     
+                                sell_amount = sell_price * qty_to_sell
                                 msg = (
                                     f"📉 <b>[매도 체결 - {sell_reason_str}]</b>\n"
                                     f"종목: {name} ({code})\n"
                                     f"매도단가: {sell_price:,.0f}원 (지정가 -2호가)\n"
+                                    f"수량: {qty_to_sell}주\n"
+                                    f"매도금액: {sell_amount:,.0f}원\n"
                                     f"매수단가: {pur_price:,.0f}원\n"
-                                    f"매도수량: {qty_to_sell}주\n"
-                                    f"<b>실현수익률: {ret_rate:+.2f}%</b>\n"
+                                    f"<b>평균수익률: {ret_rate:+.2f}%</b>\n"
+                                    f"주문전예수금: {cash:,.0f}원\n"
                                     f"시간: {candle_time}"
                                 )
                                 notifier.send_all(msg)
@@ -1489,7 +1495,8 @@ def run_single_stock_trading_advanced():
                     if buy_qty > 0:
                         res = client.place_buy_order(code, buy_qty, buy_price, "00")
                         if res and res.get("return_code") == 0:
-                            msg = f"🛒 [매수] 3분봉+1분봉+120틱 초정밀 매수 진입\n종목: {name} | 수량: {buy_qty:,}주 | 가격: {buy_price:,}원"
+                            buy_amount = buy_price * buy_qty
+                            msg = f"🛒 [매수] 3분봉+1분봉+120틱 초정밀 매수 진입\n종목: {name} | 매수단가: {buy_price:,}원\n수량: {buy_qty:,}주 | 매수금액: {buy_amount:,}원\n주문전예수금: {cash:,}원"
                             notifier.send_all(msg)
                             _add_alert("buy", msg, code, name)
             
@@ -1544,7 +1551,8 @@ def run_single_stock_trading_advanced():
                         else: reason = "⚠️L선 하향이탈"
                         
                         profit_rate = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
-                        msg = f"💰 [매도] 청산 완료 ({reason})\n종목: {name} | 수량: {qty:,}주 | 수익률: {profit_rate:.2f}%"
+                        sell_amount = sell_price * qty
+                        msg = f"💰 [매도] 청산 완료 ({reason})\n종목: {name} | 매도단가: {sell_price:,}원\n수량: {qty:,}주 | 매도금액: {sell_amount:,}원\n매수단가: {buy_price:,}원 | 평균수익률: {profit_rate:.2f}%\n주문전예수금: {cash:,}원"
                         notifier.send_all(msg)
                         _add_alert("sell", msg, code, name)
                         time.sleep(1.0)
