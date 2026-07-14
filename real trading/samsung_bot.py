@@ -135,6 +135,17 @@ async def main_trading_loop(client: KiwoomClient):
     
     last_sell_date_str = "" # 1일 1매매 제한 (당일 재진입 방지)
     
+    # 봇 재시작 시 당일 이미 매도한 이력이 있는지 확인하여 상태 복구
+    try:
+        today_orders = await asyncio.to_thread(client.get_today_filled_orders)
+        for order in today_orders:
+            if order["code"] == TARGET_CODE and "매도" in order.get("side", ""):
+                last_sell_date_str = get_kst_now().strftime("%Y-%m-%d")
+                logger.info(f"💡 [상태 복구] 당일 매도 이력이 확인되어 오늘({last_sell_date_str})은 더 이상 매수하지 않습니다.")
+                break
+    except Exception as e:
+        logger.error(f"당일 체결 내역 조회 실패: {e}")
+        
     while True:
         if not is_market_open():
             await asyncio.sleep(60)

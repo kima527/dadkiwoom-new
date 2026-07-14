@@ -1,9 +1,9 @@
 @echo off
-title Daytraid Auto Trading Bot (15분봉 눌림목 전략)
+title Real_Traiding 1-Min SMA Cross Strategy
 cd /d "%~dp0"
 echo =======================================================
-echo 키움증권 실시간 자동매매 봇을 시작합니다.
-echo 전략: 15분봉 SMA3/40 + K선 -3%% 눌림목 매수
+echo Auto Trading Bot Started.
+echo Strategy: Real_Traiding + 1-Min SMA 20/40 Cross
 echo =======================================================
 "C:\Users\zoela\AppData\Local\Programs\Python\Python312\python.exe" main.py
 pause
