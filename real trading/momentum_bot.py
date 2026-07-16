@@ -50,61 +50,84 @@ def round_to_tick(price):
 
 async def find_todays_target_stock(client: KiwoomClient):
     global TARGET_CODE, TARGET_NAME
-    logger.info("🔍 [주도주 자동 검색] 09:03까지 대기합니다...")
+    
+    # 1. watchlist.txt 읽기
+    watchlist_path = os.path.join(os.path.dirname(__file__), "watchlist.txt")
+    watchlist = []
+    if os.path.exists(watchlist_path):
+        with open(watchlist_path, "r", encoding="utf-8") as f:
+            for line in f:
+                code = line.strip()
+                if code:
+                    watchlist.append(code)
+                    
+    if not watchlist:
+        logger.warning("watchlist.txt가 없거나 비어 있어 삼성전자로 임시 셋팅합니다.")
+        TARGET_CODE = "005930"
+        TARGET_NAME = "삼성전자"
+        return
+        
+    names_dict = await asyncio.to_thread(client.get_stock_names, watchlist)
+    logger.info(f"🔍 [아침 시초가 저격 대기] 감시 종목 {len(watchlist)}개 장전 완료: {[names_dict.get(c, c) for c in watchlist]}")
+    logger.info("09:00:00 까지 대기합니다...")
+    
     while True:
         now = get_kst_now()
         from datetime import time as dt_time
         # 장중이 아니면 주말 등 예외처리
         if not is_market_open() and now.time() > dt_time(15, 20):
-            logger.info("장이 열려있지 않아 임시로 005930 셋팅")
-            TARGET_CODE = "005930"
-            TARGET_NAME = "삼성전자"
+            logger.info("장이 열려있지 않아 임시로 첫 번째 종목 셋팅")
+            TARGET_CODE = watchlist[0]
+            TARGET_NAME = names_dict.get(TARGET_CODE, TARGET_CODE)
             return
             
-        if now.time() >= dt_time(9, 3) and now.time() <= dt_time(15, 20):
+        if now.time() >= dt_time(9, 0) and now.time() <= dt_time(15, 20):
             break
         await asyncio.sleep(1)
         
-    logger.info("🔍 [주도주 자동 검색] 조건검색 시작 (거래대금 상위 + 등락률 상위)")
+    logger.info("🔥 [시초가 저격 시작] 락온(Lock-on) 감시 가동 (시가 대비 +1.5% 돌파 타겟팅)")
     
-    top_value_codes = await asyncio.to_thread(client.get_top_trading_value_stocks, "000", 50)
-    top_fluct_dict = await asyncio.to_thread(client.get_top_fluctuation_stocks_with_rates, "000", 50)
-    
-    if not top_value_codes or not top_fluct_dict:
-        logger.error("API 호출 실패로 대안 종목 설정")
-        TARGET_CODE = "005930"
-        TARGET_NAME = "삼성전자"
-        return
-        
-    blacklist = ["005930", "000660", "373220", "207940"]
-    
+    # 다중 종목 감시 루프
     best_code = None
     best_name = None
     
-    for code in top_value_codes:
-        if code in blacklist: continue
-        if code in top_fluct_dict:
-            info = top_fluct_dict[code]
-            if 5.0 <= info["rate"] <= 20.0:
-                name = info["name"]
-                # ETF, ETN, 스팩, 우선주 등 제외 필터
-                exclude_keywords = ["KODEX", "TIGER", "KBSTAR", "KINDEX", "ARIRANG", "KOSEF", "HANARO", "ACE", "ETN", "스팩"]
-                if any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
+    while best_code is None:
+        if not is_market_open():
+            await asyncio.sleep(1)
+            continue
+            
+        for code in watchlist:
+            try:
+                # TR 과부하 방지 (초당 3회 이하로 조절)
+                await asyncio.sleep(0.3)
+                
+                info = await asyncio.to_thread(client.stock_info_api.basic_stock_information_request_ka10001, code)
+                if not info or "cur_prc" not in info or "open_pric" not in info:
                     continue
                     
-                best_code = code
-                best_name = name
-                break
+                cur_prc = abs(float(info["cur_prc"]))
+                open_prc = abs(float(info["open_pric"]))
                 
-    if best_code:
-        TARGET_CODE = best_code
-        TARGET_NAME = best_name
-        logger.info(f"🎯 [오늘의 타겟 확정] {TARGET_NAME} ({TARGET_CODE}) - 거래대금 상위 & 등락률 {top_fluct_dict[best_code]['rate']}%")
-        await telegram_bot.send_message(f"🎯 [오늘의 주도주 타겟 확정]\n- 종목명: {TARGET_NAME} ({TARGET_CODE})\n- 지금부터 120틱 스캘핑 감시를 시작합니다!")
-    else:
-        logger.error("조건에 맞는 종목이 없어 기본 종목으로 시작")
-        TARGET_CODE = "005930"
-        TARGET_NAME = "삼성전자"
+                if open_prc > 0 and cur_prc > 0:
+                    change_from_open = (cur_prc - open_prc) / open_prc * 100
+                    
+                    if change_from_open >= 1.5:
+                        best_code = code
+                        best_name = names_dict.get(code, code)
+                        break
+                        
+            except Exception as e:
+                logger.error(f"감시 중 오류 발생 ({code}): {e}")
+                
+        # 매 순회마다 잠시 대기
+        await asyncio.sleep(0.5)
+        
+    TARGET_CODE = best_code
+    TARGET_NAME = best_name
+    logger.info(f"🎯 [락온 확정!] {TARGET_NAME} ({TARGET_CODE}) - 시가 대비 +1.5% 상승 포착!")
+    await telegram_bot.send_message(f"🎯 [락온 확정! 오늘의 사냥감]
+- 종목명: {TARGET_NAME} ({TARGET_CODE})
+- 시가 대비 +1.5% 상승을 포착하여 120틱 스캘핑으로 즉시 진입합니다!")
 
 async def cancel_unfilled_buy_orders_loop(client: KiwoomClient):
     """미체결된 건을 주기적으로 확인하여 취소 (1분 경과 시)"""
@@ -283,7 +306,9 @@ async def main_trading_loop(client: KiwoomClient):
                     if buy_qty == 0:
                         cash = await asyncio.to_thread(client.get_cash_balance)
                         buy_amount = min(cash * 0.95, 10000000) # 최대 천만원 기본 설정
-                        buy_qty = int(buy_amount // price_1st) if price_1st > 0 else 0
+                                                # 🧪 [TEST MODE] 1주 테스트 모드 가동
+                        buy_qty = 1 # 테스트를 위해 무조건 1주로 고정
+                        # 원래 로직: buy_qty = int(buy_amount // price_1st) if price_1st > 0 else 0
                         if buy_qty == 0 and buy_amount >= price_1st and price_1st > 0:
                             buy_qty = 1
                         
