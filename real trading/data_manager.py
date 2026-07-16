@@ -11,6 +11,7 @@ class RealtimeDataManager:
         self.reference_price = reference_price
         
         # 보조 지표 계산용 버퍼
+        self.candles_120t = deque(maxlen=400) # 120틱 캔들 버퍼 (충분한 길이 유지)
         self.candles_1m = deque(maxlen=200)
         self.candles_3m = deque(maxlen=10)
         self.candles_5m = deque(maxlen=200)
@@ -26,11 +27,16 @@ class RealtimeDataManager:
         self.current_30m_candle = None
         self.current_daily_candle = None
         
+        self.current_120t_buffer = [] # 120틱을 세기 위한 임시 버퍼
+        
         # 현재가
         self.latest_price = 0.0
 
-    def seed_initial_data(self, past_1m: list, past_3m: list, past_5m: list, past_15m: list, past_daily: list = None, past_30m: list = None):
-        """프로그램 시작 시 과거 분봉/일봉 데이터를 적재합니다."""
+    def seed_initial_data(self, past_1m: list, past_3m: list, past_5m: list, past_15m: list, past_daily: list = None, past_30m: list = None, past_120t: list = None):
+        """프로그램 시작 시 과거 분봉/일봉/틱 데이터를 적재합니다."""
+        if past_120t:
+            for c in past_120t:
+                self.candles_120t.append(c)
         if past_1m:
             for c in past_1m:
                 self.candles_1m.append(c)
@@ -99,6 +105,37 @@ class RealtimeDataManager:
             
         formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
         
+        # --- 120틱 캔들 업데이트 로직 ---
+        if len(time_str) >= 6:
+            full_time_str = f"{formatted_date} {time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+        else:
+            full_time_str = f"{formatted_date} 00:00:00"
+            
+        self.current_120t_buffer.append({
+            'price': current_price,
+            'volume': volume,
+            'time': full_time_str
+        })
+        
+        if len(self.current_120t_buffer) >= 120:
+            prices = [t['price'] for t in self.current_120t_buffer]
+            volumes = [t['volume'] for t in self.current_120t_buffer]
+            # 마지막 틱의 시간으로 캔들 시간 설정
+            candle_time = self.current_120t_buffer[-1]['time']
+            
+            new_120t_candle = {
+                'time': candle_time,
+                'open': prices[0],
+                'high': max(prices),
+                'low': min(prices),
+                'close': prices[-1],
+                'volume': sum(volumes)
+            }
+            self.candles_120t.append(new_120t_candle)
+            self.current_120t_buffer.clear()
+            
+        # --- 분봉 및 일봉 업데이트 로직 ---
+        
         # 1분봉 업데이트
         time_1m = self._get_candle_time_str(time_str, 1, formatted_date)
         if self.current_1m_candle is None and len(self.candles_1m) > 0 and self.candles_1m[-1]['time'] == time_1m:
@@ -165,6 +202,24 @@ class RealtimeDataManager:
             self.current_daily_candle = None
             
         self.current_daily_candle = self._update_candle(self.current_daily_candle, current_price, volume, daily_time_str)
+
+    def get_completed_and_current_120t_candles(self) -> list:
+        """완성된 120틱 리스트와 현재 진행중인 120틱 버퍼를 캔들 형태로 합쳐서 반환합니다."""
+        lst = list(self.candles_120t)
+        if self.current_120t_buffer:
+            prices = [t['price'] for t in self.current_120t_buffer]
+            volumes = [t['volume'] for t in self.current_120t_buffer]
+            candle_time = self.current_120t_buffer[-1]['time']
+            current_candle = {
+                'time': candle_time,
+                'open': prices[0],
+                'high': max(prices),
+                'low': min(prices),
+                'close': prices[-1],
+                'volume': sum(volumes)
+            }
+            lst.append(current_candle)
+        return lst
 
     def get_completed_and_current_1m_candles(self) -> list:
         """완성된 1분봉 리스트와 현재 진행중인 1분봉을 합쳐서 반환합니다."""

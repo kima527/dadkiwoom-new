@@ -17,8 +17,8 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-TARGET_CODE = "005930"
-TARGET_NAME = "삼성전자"
+TARGET_CODE = None
+TARGET_NAME = None
 
 def get_kst_now():
     return datetime.now(timezone(timedelta(hours=9)))
@@ -47,10 +47,63 @@ def round_to_tick(price):
     tick = get_tick_size(price)
     return (int(price) // tick) * tick
 
+
+async def find_todays_target_stock(client: KiwoomClient):
+    global TARGET_CODE, TARGET_NAME
+    logger.info("🔍 [주도주 자동 검색] 09:03까지 대기합니다...")
+    while True:
+        now = get_kst_now()
+        from datetime import time as dt_time
+        # 장중이 아니면 주말 등 예외처리
+        if not is_market_open() and now.time() > dt_time(15, 20):
+            logger.info("장이 열려있지 않아 임시로 005930 셋팅")
+            TARGET_CODE = "005930"
+            TARGET_NAME = "삼성전자"
+            return
+            
+        if now.time() >= dt_time(9, 3) and now.time() <= dt_time(15, 20):
+            break
+        await asyncio.sleep(1)
+        
+    logger.info("🔍 [주도주 자동 검색] 조건검색 시작 (거래대금 상위 + 등락률 상위)")
+    
+    top_value_codes = await asyncio.to_thread(client.get_top_trading_value_stocks, "000", 50)
+    top_fluct_dict = await asyncio.to_thread(client.get_top_fluctuation_stocks_with_rates, "000", 50)
+    
+    if not top_value_codes or not top_fluct_dict:
+        logger.error("API 호출 실패로 대안 종목 설정")
+        TARGET_CODE = "005930"
+        TARGET_NAME = "삼성전자"
+        return
+        
+    blacklist = ["005930", "000660", "373220", "207940"]
+    
+    best_code = None
+    best_name = None
+    
+    for code in top_value_codes:
+        if code in blacklist: continue
+        if code in top_fluct_dict:
+            info = top_fluct_dict[code]
+            if 5.0 <= info["rate"] <= 20.0:
+                best_code = code
+                best_name = info["name"]
+                break
+                
+    if best_code:
+        TARGET_CODE = best_code
+        TARGET_NAME = best_name
+        logger.info(f"🎯 [오늘의 타겟 확정] {TARGET_NAME} ({TARGET_CODE}) - 거래대금 상위 & 등락률 {top_fluct_dict[best_code]['rate']}%")
+        await telegram_bot.send_message(f"🎯 [오늘의 주도주 타겟 확정]\n- 종목명: {TARGET_NAME} ({TARGET_CODE})\n- 지금부터 120틱 스캘핑 감시를 시작합니다!")
+    else:
+        logger.error("조건에 맞는 종목이 없어 기본 종목으로 시작")
+        TARGET_CODE = "005930"
+        TARGET_NAME = "삼성전자"
+
 async def cancel_unfilled_buy_orders_loop(client: KiwoomClient):
     """미체결된 건을 주기적으로 확인하여 취소 (1분 경과 시)"""
     while True:
-        if not is_market_open():
+        if TARGET_CODE is None or not is_market_open():
             await asyncio.sleep(60)
             continue
             
@@ -80,6 +133,10 @@ async def cancel_unfilled_buy_orders_loop(client: KiwoomClient):
         await asyncio.sleep(20) # TR 제한 방지를 위해 20초 주기로 변경
 
 async def main_trading_loop(client: KiwoomClient):
+    global TARGET_CODE, TARGET_NAME
+    if TARGET_CODE is None:
+        await find_todays_target_stock(client)
+        
     logger.info(f"🤖 [{TARGET_NAME} 전용 로직] 데이터 초기화 및 모니터링 시작...")
     
     logger.info(f"[{TARGET_NAME}] 120틱 데이터 감시 전 계좌 상태 점검 중...")
@@ -95,11 +152,11 @@ async def main_trading_loop(client: KiwoomClient):
         if startup_holdings:
             for h in startup_holdings:
                 if h["code"] == TARGET_CODE:
-                    logger.info(f"💼 [계좌 상태 점검] 삼성전자 현재 보유 수량: {h['quantity']}주")
+                    logger.info(f"💼 [계좌 상태 점검] {TARGET_NAME} 현재 보유 수량: {h['quantity']}주")
                     found_target = True
         
         if not found_target:
-            logger.info("💼 [계좌 상태 점검] 삼성전자 현재 보유 수량: 0주 (미보유)")
+            logger.info("💼 [계좌 상태 점검] {TARGET_NAME} 현재 보유 수량: 0주 (미보유)")
             
     except Exception as e:
         logger.error(f"예수금/보유수량 초기 조회 실패: {e}")
@@ -115,7 +172,7 @@ async def main_trading_loop(client: KiwoomClient):
     # 당일 매도 이력 확인 부분 제거 (120틱 스캘핑은 다중 매매를 허용하므로 락다운 필요 없음)
         
     while True:
-        if not is_market_open():
+        if TARGET_CODE is None or not is_market_open():
             await asyncio.sleep(60)
             continue
             
@@ -183,7 +240,7 @@ async def main_trading_loop(client: KiwoomClient):
             
             if qty > 0:
                 if target_trading_qty != qty:
-                    logger.info(f"✅ [초기 인식 완료] 삼성전자 현재 보유 수량: {qty}주 (해당 수량으로 매매 사이클이 진행됩니다)")
+                    logger.info(f"✅ [초기 인식 완료] {TARGET_NAME} 현재 보유 수량: {qty}주 (해당 수량으로 매매 사이클이 진행됩니다)")
                 target_trading_qty = qty # 현재 보유 수량을 기억 (매도 후 다시 매수할 때 사용)
                     
             # == 매수 신호 판별 (SMA 40/60 크로스 + 횡보장 필터, 다중매매 허용) ==
@@ -227,7 +284,7 @@ async def main_trading_loop(client: KiwoomClient):
                     if buy_qty > 0:
                         logger.info(f"-> 전량 지정가 매수 실행: {price_1st}원 x {buy_qty}주")
                         await asyncio.to_thread(client.place_buy_order, TARGET_CODE, buy_qty, price=price_1st, order_type="00")
-                        await telegram_bot.send_message(f"🤖 [삼성전자 매수 알림]\n- {telegram_msg}\n- 매수가: {price_1st:,}원\n- 수량: {buy_qty}주")
+                        await telegram_bot.send_message(f"🤖 [{TARGET_NAME} 매수 알림]\n- {telegram_msg}\n- 매수가: {price_1st:,}원\n- 수량: {buy_qty}주")
                         
                         last_holdings_check = 0
                         await asyncio.sleep(15)
@@ -266,7 +323,7 @@ async def main_trading_loop(client: KiwoomClient):
                     
                     # 텔레그램 매도 알림 전송
                     msg = telegram_bot.format_trade_message(TARGET_NAME, buy_price, current_price)
-                    await telegram_bot.send_message(f"🤖 [삼성전자 매도 알림]\n- 사유: {signal_msg}\n{msg}")
+                    await telegram_bot.send_message(f"🤖 [{TARGET_NAME} 매도 알림]\n- 사유: {signal_msg}\n{msg}")
                     
                     # 미체결 매수 주문 일괄 취소
                     unfilled = await asyncio.to_thread(client.get_unfilled_orders)
@@ -293,7 +350,7 @@ async def main_trading_loop(client: KiwoomClient):
 
 async def async_main():
     logger.info("=========================================")
-    logger.info("Samsung Electronics Dedicated Bot Started")
+    logger.info("Auto Momentum Scalper Bot Started")
     logger.info("Strategy: 120-tick SMA 40/60 Scalping (Multiple trades/day)")
     logger.info("=========================================")
 
@@ -303,7 +360,7 @@ async def async_main():
         return
 
     # 시작 알림 전송
-    await telegram_bot.send_message("🤖 삼성전자 전용 봇이 컴퓨터에서 단독 실행되었습니다.\n(120틱 스캘핑 모드 가동 중: 다중매매 허용, 손절 -0.5%)")
+    await telegram_bot.send_message("🤖 자동 주도주 사냥 스캘핑 봇이 시작되었습니다.\n(120틱 스캘핑 모드 가동 중: 다중매매 허용, 손절 -0.5%)")
 
     # 태스크 병렬 실행
     trading_task = asyncio.create_task(main_trading_loop(client))

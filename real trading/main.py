@@ -77,7 +77,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from kiwoom_client import KiwoomClient
-from data_feeder import HybridDataFeeder
+from data_feeder import HybridDataFeeder, GlobalDataFeeder
 from data_manager import RealtimeDataManager
 import strategy
 from websocket_client import KiwoomWebSocketClient
@@ -86,6 +86,7 @@ import telegram_bot  # 신규 텔레그램 봇 모듈
 # 전역 상태 관리
 DATA_MANAGERS = {}
 FEEDERS = {}
+TR_LOCK = None
 held_codes = []
 sold_today = set()
 first_buy_prices_today = {}
@@ -147,29 +148,55 @@ async def execute_buy_order(client, code: str, latest_price: float):
     logger.info(f"[{code}] 매수 준비 - 예수금: {cash:,.0f}원, 할당금액: {buy_amount:,.0f}원, 현재가: {latest_price:,.0f}원")
     
     if buy_amount >= latest_price and latest_price > 0:
-        price_1st = round_to_tick(latest_price)
-        qty_1st = int(buy_amount // price_1st) if price_1st > 0 else 0
+        # 비율: 1 : 5 : 25 (총합 31)
+        total_ratio = 31
         
+        amt_1st = buy_amount * (1 / total_ratio)
+        amt_2nd = buy_amount * (5 / total_ratio)
+        amt_3rd = buy_amount * (25 / total_ratio)
+        
+        price_1st = round_to_tick(latest_price)
+        price_2nd = round_to_tick(latest_price * 0.997) # -0.3% 하락 시
+        price_3rd = round_to_tick(latest_price * 0.994) # -0.6% 하락 시
+        
+        qty_1st = int(amt_1st // price_1st) if price_1st > 0 else 0
+        qty_2nd = int(amt_2nd // price_2nd) if price_2nd > 0 else 0
+        qty_3rd = int(amt_3rd // price_3rd) if price_3rd > 0 else 0
+        
+        # 1차 매수 비중이 너무 작아서 비싼 주식의 경우 0주가 되는 것 방지 (최소 1주 보장)
         if qty_1st == 0 and buy_amount >= price_1st and price_1st > 0:
             qty_1st = 1
             
+        # 급등하는 종목을 확실하게 잡기 위해 1차 진입은 시장가(03) 매수 발송
         if qty_1st > 0:
-            logger.info(f"-> [돌파 매수] 전량 지정가 매수: {price_1st}원 x {qty_1st}주")
-            await asyncio.to_thread(client.place_buy_order, code, qty_1st, price=price_1st, order_type="00")
+            logger.info(f"-> [1차] 시장가 매수: 예상체결가 약 {price_1st}원 x {qty_1st}주")
+            await asyncio.to_thread(client.place_buy_order, code, qty_1st, price=None, order_type="03")
+            await asyncio.sleep(0.2)
             
-            if code not in first_buy_prices_today:
-                first_buy_prices_today[code] = latest_price
-                
-            if code not in held_codes:
-                held_codes.append(code)
-                
-            if code in watchlist_codes:
-                watchlist_codes.remove(code)
-                
-            name = await asyncio.to_thread(client.get_stock_name, code)
-            logger.info(f"🎉 [{name}({code})] 전량 매수 주문 전송 완료! 보유 종목으로 전환됩니다.")
-            msg = f"✅ [매수 주문 완료]\n종목명: {name}({code})\n주문단가: {price_1st:,.0f}원\n수량: {qty_1st}주\n금액: {price_1st * qty_1st:,.0f}원"
-            await telegram_bot.send_message(msg)
+        if qty_2nd > 0:
+            logger.info(f"-> [2차] 지정가 매수(-0.3%): {price_2nd}원 x {qty_2nd}주")
+            await asyncio.to_thread(client.place_buy_order, code, qty_2nd, price=price_2nd, order_type="00")
+            await asyncio.sleep(0.2)
+            
+        if qty_3rd > 0:
+            logger.info(f"-> [3차] 지정가 매수(-0.6%): {price_3rd}원 x {qty_3rd}주")
+            await asyncio.to_thread(client.place_buy_order, code, qty_3rd, price=price_3rd, order_type="00")
+            
+        if code not in first_buy_prices_today:
+            first_buy_prices_today[code] = latest_price
+            
+        if code not in held_codes:
+            held_codes.append(code)
+            
+        if code in watchlist_codes:
+            watchlist_codes.remove(code)
+            
+        name = await asyncio.to_thread(client.get_stock_name, code)
+        logger.info(f"🎉 [{name}({code})] 분할 매수 주문 전송 완료! 보유 종목으로 전환됩니다.")
+        
+        total_qty = qty_1st + qty_2nd + qty_3rd
+        msg = f"✅ [분할 매수 주문 완료]\n종목명: {name}({code})\n1차: {price_1st:,.0f}원 ({qty_1st}주)\n2차: {price_2nd:,.0f}원 ({qty_2nd}주)\n3차: {price_3rd:,.0f}원 ({qty_3rd}주)\n총수량: {total_qty}주"
+        await telegram_bot.send_message(msg)
 
 async def on_condition_insert(code: str):
     """조건검색 편입 신호 수신 시 콜백"""
@@ -200,29 +227,28 @@ async def on_condition_insert(code: str):
         dm = RealtimeDataManager(code, name, reference_price=0.0)
         
         # 1분봉 데이터 로드 (넉넉히 2페이지)
-        past_1m = await asyncio.to_thread(client.get_1min_candles, code, 2)
-        await asyncio.sleep(0.3)
+        # 동시에 몰리는 조회를 방지하기 위해 락(Lock)을 걸어 차례대로 1종목씩 조회
+        async with TR_LOCK:
+            past_1m = await asyncio.to_thread(client.get_1min_candles, code, 2)
+            await asyncio.sleep(0.5)
+            
         dm.seed_initial_data(past_1m, [], [], [])
-        
         DATA_MANAGERS[code] = dm
-        feeder = HybridDataFeeder(client, dm, interval=3.0)
-        FEEDERS[code] = feeder
-        feeder.start()
 
 async def on_condition_delete(code: str):
     """조건검색 이탈 신호 수신 시 콜백"""
-    global watchlist_codes, DATA_MANAGERS, FEEDERS
+    global held_codes, sold_today, watchlist_codes, DATA_MANAGERS
     
+    # [옵션 1 하이브리드 개편]
+    # 이전에는 조건검색에서 이탈하면 즉시 감시망에서 삭제했으나,
+    # 이제는 한 번 포착된 종목은 골든크로스가 나올 때까지 계속 감시해야 하므로 삭제하지 않습니다.
     if code in watchlist_codes:
-        logger.info(f"🗑️ [조건검색 이탈] {code} - 매수 전 조건 이탈로 감시망에서 삭제 및 자원 회수")
-        watchlist_codes.remove(code)
-        if code in FEEDERS:
-            FEEDERS[code].stop()
-            del FEEDERS[code]
-        if code in DATA_MANAGERS:
-            del DATA_MANAGERS[code]
+        logger.info(f"👀 [조건검색 이탈] {code} - 이탈했으나 SMA 20/40 골든크로스 대기를 위해 감시 유지")
+        # watchlist_codes.remove(code)
+        # if code in DATA_MANAGERS:
+        #     del DATA_MANAGERS[code]
     else:
-        logger.info(f"📉 [이탈 신호] 이미 보유/매도된 종목 이탈됨 ({code})")
+        logger.debug(f"조건검색 이탈 무시 (감시 대상 아님): {code}")
 
 last_holdings_sync_time = 0
 
@@ -258,9 +284,6 @@ async def monitor_logic_loop(client: KiwoomClient):
         for code in list(DATA_MANAGERS.keys()):
             # 감시망(watchlist)에도 없고 보유(held) 중도 아닌 종목 제거
             if code not in held_codes and code not in watchlist_codes:
-                if code in FEEDERS:
-                    FEEDERS[code].stop()
-                    del FEEDERS[code]
                 removed.append(code)
         for code in removed:
             del DATA_MANAGERS[code]
@@ -435,6 +458,9 @@ async def market_crash_monitor_loop(client):
         await asyncio.sleep(60)
 
 async def async_main():
+    global TR_LOCK
+    TR_LOCK = asyncio.Lock()
+    
     logger.info("=========================================")
     logger.info("Daytraid Bot Started (WebSocket HTS Condition Search & 1-Min SMA Cross)")
     logger.info("=========================================")
@@ -443,6 +469,10 @@ async def async_main():
     if not client.test_connection():
         logger.error("API 연결 실패. 프로그램을 종료합니다.")
         return
+        
+    # 글로벌 통합 데이터 피더 시작
+    global_feeder = GlobalDataFeeder(client, DATA_MANAGERS)
+    global_feeder.start()
 
     # 기존 보유 종목 초기화
     holdings = client.get_holdings()
