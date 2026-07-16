@@ -86,8 +86,14 @@ async def find_todays_target_stock(client: KiwoomClient):
         if code in top_fluct_dict:
             info = top_fluct_dict[code]
             if 5.0 <= info["rate"] <= 20.0:
+                name = info["name"]
+                # ETF, ETN, 스팩, 우선주 등 제외 필터
+                exclude_keywords = ["KODEX", "TIGER", "KBSTAR", "KINDEX", "ARIRANG", "KOSEF", "HANARO", "ACE", "ETN", "스팩"]
+                if any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
+                    continue
+                    
                 best_code = code
-                best_name = info["name"]
+                best_name = name
                 break
                 
     if best_code:
