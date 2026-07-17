@@ -7,3 +7,4 @@ requests
 schedule
 pandas-ta
 flask
+google-generativeai
