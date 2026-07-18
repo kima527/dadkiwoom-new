@@ -114,6 +114,16 @@ class ThemeEODBot:
         except Exception as e:
             logger.error(f"미체결 취소 실패: {e}")
 
+    def job_daily_report(self):
+        """14:40: 매일 2시 40분에 블로그/텔레그램 리서치 리포트 발송"""
+        logger.info("🕒 [리포트 전송] 오후장 주도주 리서치 리포트 생성을 시작합니다.")
+        try:
+            # blog_generator.py에서 실행 함수 가져오기
+            from blog_generator import run_blog_generator
+            asyncio.run(run_blog_generator())
+        except Exception as e:
+            logger.error(f"리포트 생성 중 오류 발생: {e}")
+
     def job_morning_exit(self):
         """09:05: 전일 잡힌 대장주 +4% 익절 또는 본절/손절 탈출"""
         logger.info("🕒 [오전장 탈출] 오버나잇 종목 수익 실현 프로세스 가동")
@@ -157,6 +167,7 @@ class ThemeEODBot:
         asyncio.run(telegram_bot.send_message("🤖 주도주 종가매매 봇(Theme EOD Bot)이 실행되었습니다.\n지정된 시간에만 매매를 수행합니다."))
         
         # 시간표 세팅
+        schedule.every().day.at("14:40").do(self.job_daily_report)  # 2시 40분 블로그 리포트 전송
         schedule.every().day.at("14:45").do(self.job_afternoon_pickup)
         schedule.every().day.at("15:20").do(self.job_cancel_unfilled)
         schedule.every().day.at("09:05").do(self.job_morning_exit)

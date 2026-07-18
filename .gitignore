@@ -19,3 +19,6 @@ my_pick.xlsx
 .idea/
 .gemini/
 *.log
+
+# Output Files
+blog_post_*
