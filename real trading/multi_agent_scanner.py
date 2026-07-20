@@ -54,7 +54,7 @@ class VolumeAgent:
             candidates = []
             for code in candidates_raw:
                 name = names.get(code, "")
-                if any(etf_kw in name for etf_kw in ["KODEX", "TIGER", "KBSTAR", "ACE", "ARIRANG", "PLUS", "KOSEF", "HANARO", "SOL", "TIMEFOLIO", "스팩", "인버스", "레버리지", "선물"]):
+                if any(etf_kw in name for etf_kw in ["KODEX", "TIGER", "KBSTAR", "RISE", "ACE", "ARIRANG", "PLUS", "KOSEF", "KIWOOM", "HANARO", "SOL", "TIMEFOLIO", "1Q", "WON", "스팩", "인버스", "레버리지", "선물"]):
                     logger.info(f"🚫 [VolumeAgent] ETF/스팩 제외됨: {name}")
                     continue
                 candidates.append(code)

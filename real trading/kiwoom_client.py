@@ -668,6 +668,29 @@ class KiwoomRealClient:
             logger.error(f"Error in get_stock_name for {stock_code}: {e}")
             return None
 
+    def get_stock_basic_info(self, stock_code: str) -> dict:
+        """
+        주식 종목의 기본 정보(유통주식수 등)를 조회합니다.
+        """
+        try:
+            code = stock_code
+            result = self.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
+            if result and result.get("return_code") == 0:
+                dstr_stk_str = str(result.get("dstr_stk", "")).strip()
+                dstr_rt_str = str(result.get("dstr_rt", "")).strip()
+                flo_stk_str = str(result.get("flo_stk", "")).strip()
+                
+                return {
+                    "name": result.get("stk_nm", "").strip(),
+                    "dstr_stk": int(dstr_stk_str) if dstr_stk_str else 0,
+                    "dstr_rt": float(dstr_rt_str) if dstr_rt_str else 0.0,
+                    "flo_stk": int(flo_stk_str) if flo_stk_str else 0
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error in get_stock_basic_info for {stock_code}: {e}")
+            return None
+
     def get_stock_names(self, stock_codes: list) -> dict:
         """
         여러 주식 종목의 이름을 일괄 조회합니다.

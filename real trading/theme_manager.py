@@ -13,6 +13,7 @@ class ThemeManager:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         self.theme_cache = {}  # { "stock_code": ["테마명1", "테마명2"] }
+        self.hot_theme_codes = set() # O(1) 판별을 위한 6자리 종목코드 set
         
     def _fetch_page(self, url):
         try:
@@ -27,6 +28,11 @@ class ThemeManager:
     def load_top_themes(self, limit=30):
         """당일 가장 핫한 테마 상위 N개를 불러와 종목별 매핑 캐시를 생성합니다."""
         logger.info(f"[테마담당자] 인포스탁 제공 테마 상위 {limit}개 크롤링 시작...")
+        
+        # [보완 #3] 재호출 시 기존 캐시를 초기화하여 전일자 데이터 잔재 방지
+        self.theme_cache.clear()
+        self.hot_theme_codes.clear()
+        
         soup = self._fetch_page(self.base_url)
         if not soup:
             logger.error("[테마담당자] 테마 메인 페이지에 접근할 수 없습니다.")
@@ -52,12 +58,18 @@ class ThemeManager:
                     # 중복 테마 등록 방지
                     if theme_name not in self.theme_cache[code]:
                         self.theme_cache[code].append(theme_name)
+                    # O(1) set에 6자리 코드 등록
+                    self.hot_theme_codes.add(code)
                         
         logger.info(f"[테마담당자] 주도 테마 매핑 완료! (총 {len(self.theme_cache)}개 종목의 테마 정보 수집 완료)")
 
     def get_stock_themes(self, stock_code: str) -> list:
         """특정 종목의 주도 테마 리스트를 반환합니다."""
         return self.theme_cache.get(stock_code, [])
+        
+    def has_hot_theme(self, stock_code: str) -> bool:
+        """[HFT 최적화] 6자리 종목코드가 상위 테마에 속하는지 O(1) 속도로 즉각 판별합니다."""
+        return stock_code in self.hot_theme_codes
 
 if __name__ == "__main__":
     tm = ThemeManager()

@@ -16,7 +16,7 @@ os.environ["KIWOOM_USE_SANDBOX"] = "false"
 SOCKET_URL = 'wss://api.kiwoom.com:10000/api/dostk/websocket'
 
 class KiwoomWebSocketClient:
-    def __init__(self, target_condition_name: str, on_insert: Callable, on_delete: Callable):
+    def __init__(self, target_condition_name: str, on_insert: Callable, on_delete: Callable, on_real_tick: Callable = None):
         self.uri = SOCKET_URL
         self.websocket = None
         self.connected = False
@@ -29,6 +29,7 @@ class KiwoomWebSocketClient:
         
         self.on_insert = on_insert
         self.on_delete = on_delete
+        self.on_real_tick = on_real_tick
 
     async def connect(self):
         try:
@@ -61,6 +62,20 @@ class KiwoomWebSocketClient:
             if not isinstance(message, str):
                 message = json.dumps(message)
             await self.websocket.send(message)
+
+    async def subscribe_real_tick(self, code: str):
+        """
+        주식체결 실시간 데이터를 요청합니다 (SetRealReg 대체).
+        키움 REST OpenAPI 웹소켓 사양에 따라 REALREQ(또는 SYSREQ) 포맷으로 전송합니다.
+        """
+        req = {
+            "trnm": "REALREQ",
+            "type": "1", # 1: 등록, 0: 해제
+            "realType": "주식체결",
+            "code": code
+        }
+        logger.info(f"실시간 주식체결 구독 요청 전송: {code}")
+        await self.send_message(req)
 
     async def receive_messages(self):
         while self.keep_running:
@@ -133,8 +148,10 @@ class KiwoomWebSocketClient:
                     # 실시간 데이터
                     data_list = response.get('data') or []
                     for data_item in data_list:
-                        if data_item.get('name') == '조건검색':
-                            values = data_item.get('values', {})
+                        name = data_item.get('name')
+                        values = data_item.get('values', {})
+                        
+                        if name == '조건검색':
                             code = values.get('9001', '').replace('A', '')
                             evt_tp = values.get('843', '') # I: 편입, D: 이탈
                             cond_idx = values.get('841', '')
@@ -146,11 +163,36 @@ class KiwoomWebSocketClient:
                                         asyncio.create_task(self.on_insert(code))
                                     else:
                                         self.on_insert(code)
+                                    # 편입 시 자동으로 실시간 체결 데이터 구독
+                                    asyncio.create_task(self.subscribe_real_tick(code))
+                                        
                                 elif evt_tp == 'D':
                                     if asyncio.iscoroutinefunction(self.on_delete):
                                         asyncio.create_task(self.on_delete(code))
                                     else:
                                         self.on_delete(code)
+                                        
+                        elif name == '주식체결':
+                            code = values.get('9001', '').replace('A', '') # 종목코드
+                            # FID 10: 현재가, FID 15: 거래량, FID 13: 누적거래량
+                            try:
+                                current_price = abs(float(values.get('10', 0)))
+                                accum_volume = int(values.get('13', 0))
+                                tick_time = values.get('20', '') # 체결시간
+                                
+                                if current_price > 0 and self.on_real_tick:
+                                    tick_data = {
+                                        'code': code,
+                                        'price': current_price,
+                                        'accum_volume': accum_volume,
+                                        'time': tick_time
+                                    }
+                                    if asyncio.iscoroutinefunction(self.on_real_tick):
+                                        asyncio.create_task(self.on_real_tick(tick_data))
+                                    else:
+                                        self.on_real_tick(tick_data)
+                            except Exception as e:
+                                logger.error(f"주식체결 파싱 에러: {e}")
 
             except websockets.ConnectionClosed:
                 logger.error("웹소켓 연결이 끊어졌습니다. 3초 후 재연결을 시도합니다.")
