@@ -8,10 +8,11 @@ import config
 from kiwoom_client import KiwoomClient
 from websocket_client import KiwoomWebSocketClient
 from theme_manager import ThemeManager
-from decision_agent import ScalpingDecisionAgent
+from core_trade_manager import CoreTradeManager
+from trend_manager import TrendManager
 from tick_acceleration_agent import TickAccelerationEngine
 from data_manager import RealtimeDataManager
-import strategy_3m
+import strategy_1m_morning
 import telegram_bot
 
 # ------------------------------------------
@@ -31,7 +32,7 @@ TELEGRAM_QUEUE = asyncio.Queue()
 g_client = None
 g_accel_engine = None
 g_ws_client = None
-g_decision_agent = None
+g_core_manager = None
 
 watchlist_codes = set()
 DATA_MANAGERS = {}
@@ -108,7 +109,7 @@ async def chart_trading_agent():
     3분봉 차트를 주기적으로 확인하여 SMA 크로스를 검사하고, 
     가속도 랭킹과 테마를 팩터로 활용하여 매매를 결정합니다.
     """
-    global watchlist_codes, DATA_MANAGERS, PORTFOLIO_STATE, g_accel_engine, g_decision_agent
+    global watchlist_codes, DATA_MANAGERS, PORTFOLIO_STATE, g_accel_engine, g_core_manager
     
     while True:
         try:
@@ -119,7 +120,9 @@ async def chart_trading_agent():
                     
                 if code in DATA_MANAGERS:
                     dm = DATA_MANAGERS[code]
-                    is_sell, reason = strategy_3m.check_3m_sell_signal(dm, state["buy_price"])
+                    candles_1m = dm.get_completed_and_current_1m_candles()
+                    candles_15m = dm.get_completed_and_current_15m_candles()
+                    is_sell, reason = g_core_manager.check_sell_condition(code, state["buy_price"], dm.latest_price, candles_1m, candles_15m)
                     
                     if is_sell:
                         await execute_sell_order(code, state["qty"], reason)
@@ -134,8 +137,8 @@ async def chart_trading_agent():
                     
                 dm = DATA_MANAGERS[code]
                 
-                # [팩터 1] 3분봉 골든크로스 매수 신호 검증
-                is_buy_candidate, msg = strategy_3m.check_3m_buy_signal(dm)
+                # [팩터 1] 1분봉 오전장 매수 신호 검증 (눌림목)
+                is_buy_candidate, msg = strategy_1m_morning.check_1m_buy_signal(dm)
                 
                 if is_buy_candidate:
                     # [팩터 2] 가속도 랭킹 확인 (Tick Frequency)
@@ -146,15 +149,14 @@ async def chart_trading_agent():
                     MIN_BUY_TICK_COUNT = 10 
                     
                     if accel_ratio >= MIN_BUY_TICK_COUNT or code == g_accel_engine.top_code:
-                        # [팩터 3] 주도 테마 검증
-                        if g_decision_agent.theme_manager.has_hot_theme(code):
-                            themes = g_decision_agent.theme_manager.get_stock_themes(code)
-                            theme_str = ', '.join(themes[:2])
-                            
-                            final_reason = f"3/5 골든크로스 + 수급 폭발 + 테마({theme_str})"
+                        # [팩터 3] 서포터 마스터(CoreTradeManager) 최종 승인 검증
+                        base_reasons = [f"1분봉 눌림목 + 수급폭발({accel_ratio:.0f}회)"]
+                        approved, final_reason = g_core_manager.evaluate_buy_candidate(code, dm.latest_price, base_reasons, name=dm.name)
+                        
+                        if approved:
                             await execute_buy_order(code, dm.latest_price, accel_ratio, final_reason)
                         else:
-                            logger.info(f"🛑 [{code}] 이평선/가속도 통과했으나 주도 테마 아님 (매수 패스)")
+                            logger.info(f"🛑 [{code}] 서포터 합의 실패 (매수 패스)")
                     else:
                         logger.info(f"🛑 [{code}] 이평선 통과했으나 현재 수급 부족 (체결빈도 {accel_ratio}회 < {MIN_BUY_TICK_COUNT})")
                         
@@ -223,7 +225,10 @@ async def on_condition_insert(code: str):
         dm.seed_initial_data(past_1m, past_3m, [], [])
         DATA_MANAGERS[code] = dm
         
-        logger.info(f"✅ [{name}] 실시간 틱 구독 및 캔들 매니저 세팅 완료")
+        # 추세 서포터 사전 학습 (비동기 스레드로 실행하여 블로킹 방지)
+        await asyncio.to_thread(g_core_manager.trend_manager.pre_learn, [code])
+        
+        logger.info(f"✅ [{name}] 실시간 틱 구독, 캔들 및 일봉 추세 세팅 완료")
 
 async def on_condition_delete(code: str):
     """Real_Traiding 조건식 이탈 시"""
@@ -251,7 +256,7 @@ async def on_real_tick(tick_data: dict):
 # 7. 메인 루프 (Main)
 # ------------------------------------------
 async def main():
-    global g_client, g_accel_engine, g_ws_client, g_decision_agent
+    global g_client, g_accel_engine, g_ws_client, g_core_manager
     
     logger.info("=========================================")
     logger.info("🚀 [Real_Traiding] 순위 + 테마 + SMA 멀티팩터 봇 시작")
@@ -259,15 +264,16 @@ async def main():
     
     telegram_bot.IS_BOT_ACTIVE = True
     asyncio.create_task(telegram_worker())
-    enqueue_telegram_msg("🚀 [Real_Traiding] 하이브리드 봇 가동\n(조건검색 -> 가속도 랭킹/테마 검증 -> 3분봉 골든/데드 타점)")
+    enqueue_telegram_msg("🚀 [Real_Traiding] 하이브리드 봇 가동\n(조건검색 -> 가속도 랭킹/테마 검증 -> 1분봉 눌림목 타점)")
     
     # 1. 코어 인스턴스 생성
     g_client = KiwoomClient()
     theme_manager = ThemeManager()
-    g_decision_agent = ScalpingDecisionAgent(theme_manager, None)
+    trend_manager = TrendManager(g_client)
+    g_core_manager = CoreTradeManager(theme_manager=theme_manager, trend_manager=trend_manager, max_holdings=MAX_HOLDING_STOCKS)
     
-    # 2. 가속도 랭킹 엔진 생성 (자동 매수/매도 콜백 제외)
-    g_accel_engine = TickAccelerationEngine(g_client, g_decision_agent)
+    # 2. 가속도 랭킹 엔진 생성
+    g_accel_engine = TickAccelerationEngine(g_client, {})
     
     # 3. 비동기 백그라운드 태스크 구동
     asyncio.create_task(chart_trading_agent())

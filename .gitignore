@@ -15,6 +15,23 @@ __pycache__/
 my_pick.xlsx
 
 # IDEs and editors
+# Environments
+.env
+.env.example
+.env*
+*.env*
+.env copy
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data files
+my_pick.xlsx
+
+# IDEs and editors
 .vscode/
 .idea/
 .gemini/
@@ -22,3 +39,8 @@ my_pick.xlsx
 
 # Output Files
 blog_post_*
+
+# Agent Files
+.tmp/
+credentials.json
+token.json
