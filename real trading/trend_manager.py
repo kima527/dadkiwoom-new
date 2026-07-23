@@ -10,9 +10,38 @@ class TrendManager:
     기본적인 이평선 정배열을 넘어, 선형회귀(Linear Regression)를 통한 모멘텀 가속도,
     수급 폭발 여부, 이격도 등을 종합적으로 스코어링하여 학습합니다.
     """
-    def __init__(self, kiwoom_client):
+    def __init__(self, kiwoom_client, timeframe="15m"):
         self.client = kiwoom_client
+        self.timeframe = timeframe
         self.trend_cache = {} # {code: {"is_uptrend": bool, "score": float, "reason": str}}
+        
+    def _check_recent_spike(self, code: str) -> tuple[bool, str]:
+        """
+        최근 20거래일 내에 고가가 전일 종가 대비 20% 이상 급등한 날이 있는지 검사 (끼 필터)
+        """
+        try:
+            daily_candles = self.client.get_daily_candles(code, last_n_days=25)
+            if not daily_candles or len(daily_candles) < 20:
+                return False, "일봉 데이터 20개 미만"
+            
+            df = pd.DataFrame(daily_candles)
+            df['prev_close'] = df['close'].shift(1)
+            df = df.dropna().copy()
+            
+            recent_20 = df.tail(20)
+            
+            # 고가 상승률 계산 (고가 / 전일종가 - 1) * 100
+            recent_20['spike_pct'] = ((recent_20['high'] / recent_20['prev_close']) - 1) * 100
+            
+            if (recent_20['spike_pct'] >= 20.0).any():
+                max_spike = recent_20['spike_pct'].max()
+                return True, f"끼 폭발(최대 {max_spike:.1f}% 급등)"
+            else:
+                return False, "끼 부족 (최근 20일 내 20% 이상 급등 이력 없음)"
+                
+        except Exception as e:
+            logger.error(f"[TrendManager] {code} 급등 이력 검사 중 에러: {e}")
+            return False, "급등 이력 검사 에러"
 
     def _calculate_advanced_trend(self, df: pd.DataFrame) -> tuple[float, str]:
         # 20일, 60일 이동평균선
@@ -77,15 +106,34 @@ class TrendManager:
             if code in self.trend_cache:
                 continue
                 
-            logger.info(f"📊 [TrendManager] {code} 추세 판별을 위한 심층 데이터 사전 학습 중...")
+            logger.info(f"📊 [TrendManager] {code} 추세 판별 및 '끼(급등 이력)' 검사 중... (Timeframe: {self.timeframe})")
             try:
-                candles = self.client.get_daily_candles(code, last_n_days=100)
+                # [신규 필터] 최근 20일 내 20% 급등 이력이 있는지 검사
+                has_spike, spike_reason = self._check_recent_spike(code)
+                if not has_spike:
+                    logger.info(f"❌ [TrendManager] {code} 탈락: {spike_reason}")
+                    self.trend_cache[code] = {
+                        "is_uptrend": False,
+                        "score": 0.0,
+                        "reason": spike_reason
+                    }
+                    continue
+                    
+                # 급등 이력을 통과한 놈들만 본격적으로 15분봉 추세 분석
+                if self.timeframe == "15m":
+                    candles = self.client.get_15min_candles(code, last_n_days=10) # 10일치면 15분봉으로 충분한 양
+                elif self.timeframe == "30m":
+                    candles = self.client.get_30min_candles(code, last_n_days=14)
+                elif self.timeframe == "5m":
+                    candles = self.client.get_5min_candles(code, last_n_days=5)
+                else:
+                    candles = self.client.get_daily_candles(code, last_n_days=100)
                 
                 if not candles or len(candles) < 60:
                     self.trend_cache[code] = {
                         "is_uptrend": False,
                         "score": 0.0,
-                        "reason": "일봉 데이터 부족 (신규 상장 등 60일 미만)"
+                        "reason": f"데이터 부족 ({self.timeframe} 데이터 60개 미만)"
                     }
                     continue
                     
@@ -98,10 +146,10 @@ class TrendManager:
                 self.trend_cache[code] = {
                     "is_uptrend": is_uptrend,
                     "score": score,
-                    "reason": reason
+                    "reason": f"[{spike_reason}] {reason}"
                 }
                     
-                logger.info(f"✅ [TrendManager] {code} 학습 완료: 스코어 {score:.1f}점 | {reason}")
+                logger.info(f"✅ [TrendManager] {code} 학습 완료: 스코어 {score:.1f}점 | [{spike_reason}] {reason}")
                 
             except Exception as e:
                 logger.error(f"[TrendManager] {code} 학습 중 에러 발생: {e}")

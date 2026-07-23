@@ -679,12 +679,14 @@ class KiwoomRealClient:
                 dstr_stk_str = str(result.get("dstr_stk", "")).strip()
                 dstr_rt_str = str(result.get("dstr_rt", "")).strip()
                 flo_stk_str = str(result.get("flo_stk", "")).strip()
+                mac_str = str(result.get("mac", "")).strip()
                 
                 return {
                     "name": result.get("stk_nm", "").strip(),
                     "dstr_stk": int(dstr_stk_str) if dstr_stk_str else 0,
                     "dstr_rt": float(dstr_rt_str) if dstr_rt_str else 0.0,
-                    "flo_stk": int(flo_stk_str) if flo_stk_str else 0
+                    "flo_stk": int(flo_stk_str) if flo_stk_str else 0,
+                    "mac": mac_str
                 }
             return None
         except Exception as e:

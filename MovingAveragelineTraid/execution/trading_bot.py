@@ -126,23 +126,35 @@ class TradingBot:
             signals = calculate_sma_signals(df)
             
             if signals['buy']:
+                # Determine specific reasons and quantity modifier
+                base_reasons = []
+                is_breakout = signals.get('breakout_buy', False)
+                is_dip = signals.get('dip_buy', False)
+                
+                if is_breakout:
+                    base_reasons.append("시가 재돌파 매매 (거래량 폭발)")
+                if is_dip:
+                    base_reasons.append("3-20-60 눌림목 매매")
+                
+                if not base_reasons:
+                    base_reasons.append("일반 정배열 매수")
+
                 # 3. CoreTradeManager 서포터 평가 (테마, 추세)
-                base_reasons = ["SMA 정배열"]
-                approved, reason = self.core_manager.evaluate_buy_candidate(code, float(df.iloc[-1]['close']), base_reasons, name=name)
+                approved, reason = self.core_manager.evaluate_buy_candidate(code, float(df.iloc[-1]['close']), base_reasons, name=info['name'])
                 
                 if approved:
-                    logger.info(f"Signal found and approved for {info['name']} ({code})")
+                    logger.info(f"Signal found and approved for {info['name']} ({code}): {base_reasons}")
                 
-                # Fetch momentum score (Mocked as 1.0 since calculate_momentum may not exist in KiwoomRealClient)
-                momentum = 1.0
-                score = info['weight'] * momentum
-                
-                buy_candidates.append({
-                    'code': code,
-                    'name': info['name'],
-                    'score': score,
-                    'sma20': signals['sma20']
-                })
+                    momentum = 1.0
+                    score = info.get('weight', 10.0) * momentum
+                    
+                    buy_candidates.append({
+                        'code': code,
+                        'name': info['name'],
+                        'score': score,
+                        'sma20': signals['sma20'],
+                        'is_breakout': is_breakout
+                    })
                 
         if not buy_candidates:
             logger.info("No buy signals in this cycle.")
@@ -160,9 +172,13 @@ class TradingBot:
         # 코어 매니저를 통한 최종 비중(수량) 계산
         qty = self.core_manager.calculate_buy_quantity(len(holdings), total_balance, target_price)
         
+        if top_candidate.get('is_breakout'):
+            qty = max(1, qty // 2)
+            logger.info(f"⚠️ 돌파 매매 감지: 리스크 관리를 위해 진입 수량을 절반({qty}주)으로 줄입니다.")
+        
         # 4. Execute Market Order
         if qty > 0:
-            logger.info(f"Executing Buy Order for {top_candidate['name']} (Market Order) x {qty}주 (5% account alloc)")
+            logger.info(f"Executing Buy Order for {top_candidate['name']} (Market Order) x {qty}주")
             result = self.client.place_buy_order(top_candidate['code'], qty, order_type="03") # 03 = 시장가
             if result and result.get('return_code') == 0:
                 logger.info(f"Buy Order successful for {top_candidate['code']}")
