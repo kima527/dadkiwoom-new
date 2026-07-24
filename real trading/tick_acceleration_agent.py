@@ -107,7 +107,7 @@ class TickAccelerationEngine:
             self.top_accel = 0.0
             return
             
-        top3_items = heapq.nlargest(3, self.rankings.items(), key=lambda x: x[1])
+        top3_items = heapq.nlargest(3, list(self.rankings.items()), key=lambda x: x[1])
         self.top3_cache = [(val, k) for k, val in top3_items]
         self.top_code = self.top3_cache[0][1] if self.top3_cache else ""
         self.top_accel = self.top3_cache[0][0] if self.top3_cache else 0.0

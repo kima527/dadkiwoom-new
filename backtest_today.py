@@ -1,21 +1,20 @@
 import os
 import sys
 import json
-import time
 import logging
 import pandas as pd
+import asyncio
 
 real_trading_path = os.path.abspath(r"C:\Users\zoela\OneDrive\바탕 화면\PythonWorksplace\real trading")
 if real_trading_path not in sys.path:
-    sys.path.insert(0, real_trading_path) # 우선순위 높임
+    sys.path.insert(0, real_trading_path)
     
-strategy_path = os.path.abspath(r"C:\Users\zoela\OneDrive\바탕 화면\PythonWorksplace\MovingAveragelineTraid\execution")
+strategy_path = os.path.abspath(r"C:\Users\zoela\OneDrive\바탕 화면\MovingAveragelineTraid\execution")
 if strategy_path not in sys.path:
-    sys.path.append(strategy_path) # 우선순위 낮춤 (config.py 충돌 방지)
+    sys.path.insert(0, strategy_path)
 
 from kiwoom_client import KiwoomRealClient
-from strategy_sma import calculate_sma_signals
-import ta
+from strategy_sma_breakout import calculate_sma_breakout_signals, TradeState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("Backtester")
@@ -29,12 +28,8 @@ def run_backtest():
     results = []
     
     for code, info in watchlist.items():
-        code = code.strip()
         name = info['name']
-        logger.info(f"[{name}] 백테스트 데이터 가져오는 중 (코드: {code})...")
-        
-        # 키움증권 초당 요청 제한(초당 5건) 방지를 위해 딜레이 추가
-        time.sleep(1)
+        logger.info(f"[{name}] 백테스트 데이터 가져오는 중...")
         
         candles = client.get_1min_candles(code, last_n_days=1)
         if not candles or len(candles) < 60:
@@ -43,30 +38,45 @@ def run_backtest():
             
         df = pd.DataFrame(candles)
         
+        if len(df) < 10:
+            logger.warning(f"{name} 데이터 부족. 스킵.")
+            continue
+            
+        # 첫 5개 캔들로 초기 고점 및 최고점봉의 최저점(손절선) 세팅
+        first_5 = df.iloc[:5]
+        max_idx = first_5['high'].idxmax()
+        max_candle = first_5.loc[max_idx]
+        
+        initial_high = max_candle['high']
+        stop_loss = max_candle['low']
+        
+        trade_state = TradeState(initial_high, stop_loss)
+        
         position = None
         trades = []
         
-        # 60이평선 계산을 위해 60번째 분봉부터 탐색
-        for i in range(60, len(df)):
+        # 6번째 캔들(인덱스 5)부터 시뮬레이션 시작
+        for i in range(5, len(df)):
             sub_df = df.iloc[:i+1].copy()
-            signals = calculate_sma_signals(sub_df)
+            signals = calculate_sma_breakout_signals(sub_df, trade_state)
             current_time = sub_df.iloc[-1].get('date', f"Index_{i}")
-            if 'time' in sub_df.columns:
-                current_time = sub_df.iloc[-1]['time']
-            current_price = sub_df.iloc[-1]['close']
             
-            if position is None:
-                if signals.get('buy') or signals.get('breakout_buy') or signals.get('dip_buy'):
-                    reason = "시가 재돌파" if signals.get('breakout_buy') else ("3-20-60 눌림목" if signals.get('dip_buy') else "일반 정배열")
+            if not trade_state.is_holding:
+                if signals.get('buy'):
+                    buy_price = signals.get('price')
+                    
+                    trade_state.is_holding = True
+                    trade_state.has_traded_today = True
+                    
                     position = {
                         'buy_time': current_time,
-                        'buy_price': current_price,
-                        'reason': reason
+                        'buy_price': buy_price,
+                        'reason': signals.get('buy_reason', '매수')
                     }
             else:
                 if signals.get('sell'):
-                    sell_price = current_price
-                    yield_pct = ((sell_price - position['buy_price']) / position['buy_price']) * 100 - 0.26  # 세금/수수료 0.26% 차감
+                    sell_price = signals.get('price')
+                    yield_pct = ((sell_price - position['buy_price']) / position['buy_price']) * 100 - 0.26  # Fee/Tax
                     trades.append({
                         'code': code,
                         'name': name,
@@ -77,6 +87,7 @@ def run_backtest():
                         'reason': position['reason'],
                         'yield': yield_pct
                     })
+                    trade_state.is_holding = False
                     position = None
                     
         # 장 마감 시 강제 청산
@@ -110,8 +121,7 @@ def run_backtest():
     logger.info(f"=====================================")
     logger.info(f"총 매매 횟수: {len(results)}회")
     logger.info(f"합산 수익률: {total_yield:.2f}%")
-    if len(results) > 0:
-        logger.info(f"평균 수익률: {total_yield/len(results):.2f}%")
+    logger.info(f"평균 수익률: {total_yield/len(results):.2f}%")
 
 if __name__ == "__main__":
     run_backtest()

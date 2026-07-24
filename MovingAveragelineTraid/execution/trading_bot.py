@@ -1,190 +1,266 @@
 import os
+import sys
 import json
 import time
+import asyncio
 import logging
-import sys
-import pandas as pd
+from real_api_adapter import RealAPIAdapter
+from strategy_sma_breakout import calculate_sma_breakout_signals, TradeState, get_tick_size
+from theme_manager import ThemeManager
+from datetime import datetime, time as dtime
 
+# real trading 폴더의 websocket_client를 가져오기 위한 경로 추가
 real_trading_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'real trading'))
 if real_trading_path not in sys.path:
     sys.path.insert(0, real_trading_path)
 
-from kiwoom_client import KiwoomRealClient
-from strategy_sma import calculate_sma_signals
-from core_trade_manager import CoreTradeManager
-from theme_manager import ThemeManager
-from trend_manager import TrendManager
+from websocket_client import KiwoomWebSocketClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 class TradingBot:
-    def __init__(self):
-        self.client = KiwoomRealClient()
-        if not self.client.test_connection():
-            logger.error("API Connection Failed")
-            sys.exit(1)
-        self.watchlist = self.load_watchlist()
-        self.tracked_orders = {} 
+    def __init__(self, condition_name="Traiding"):
+        self.client = RealAPIAdapter()
+        self.condition_name = condition_name
+        self.watchlist = {}
         
-        # 통합 코어 매니저 초기화
-        theme_mgr = ThemeManager()
-        trend_mgr = TrendManager(self.client)
-        self.core_manager = CoreTradeManager(
-            theme_manager=theme_mgr,
-            trend_manager=trend_mgr,
-            max_holdings=5,
-            alloc_ratio=0.05
-        )
-        
-        # 추세 서포터 사전 학습 실행
-        watchlist_codes = list(self.watchlist.keys())
-        if watchlist_codes:
-            logger.info(f"사전 학습(Pre-learn)을 위해 {len(watchlist_codes)}개 종목의 추세 데이터를 가져옵니다.")
-            trend_mgr.pre_learn(watchlist_codes)
-    
-    def load_watchlist(self):
-        # 우선 조건검색식으로 생성된 sub_watchlist.json 확인
-        sub_path = os.path.join(os.path.dirname(__file__), '..', 'sub_watchlist.json')
-        if os.path.exists(sub_path):
-            logger.info("sub_watchlist.json (조건검색 결과)를 불러옵니다.")
-            with open(sub_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-                
-        # 없으면 기본 watchlist.json 확인
-        main_path = os.path.join(os.path.dirname(__file__), '..', 'watchlist.json')
-        logger.info("watchlist.json (기본 관심종목)을 불러옵니다.")
-        with open(main_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-            
-    def manage_unexecuted_orders(self):
-        pass # 시장가 매수/매도를 사용하므로 미체결 관리 생략
+        # 오프라인 관심종목(watchlist.json) 로드 삭제 - 오직 실시간 조건검색으로만 종목 편입
 
-    def run_cycle(self):
-        logger.info("Starting 1-minute cycle evaluation...")
+        self.tracked_orders = {} # { order_no: {'code': code, 'qty': qty, 'time': float} }
+        self.theme_manager = ThemeManager()
+        self.theme_manager.load_top_themes(limit=30)
+        
+        # ===== 신규: 돌파 전략 상태 관리 =====
+        self.trade_states = {}       # { code: TradeState }
+        self.setup_phase_done = False  # 장 초반 5분봉 수집 완료 여부
+        
+        self.api_lock = asyncio.Lock() # API 동시 호출 방지용 락
+    
+    async def on_insert(self, code: str):
+        logger.info(f"🟢 [조건검색 편입] 종목코드: {code}")
+        if code not in self.watchlist:
+            name = await asyncio.to_thread(self.client.get_stock_name, code)
+            self.watchlist[code] = {
+                'name': name,
+                'weight': 1.0 # 기본 가중치 부여
+            }
+            logger.info(f"✅ 관심종목 추가 완료: {name} ({code})")
+            
+            # 초기 세팅이 끝난 상태라면, 새로 편입된 종목도 즉시 고점/손절선 세팅
+            if self.setup_phase_done and code not in self.trade_states:
+                try:
+                    async with self.api_lock:
+                        df = await asyncio.to_thread(self.client.get_1m_candles, code)
+                        await asyncio.sleep(0.25)  # API Rate Limit 보호
+                    if df is not None and not df.empty and len(df) >= 5:
+                        first_5 = df.iloc[:5]
+                        max_idx = first_5['high'].idxmax()
+                        max_candle = first_5.loc[max_idx]
+                        state = TradeState(int(max_candle['high']), int(max_candle['low']))
+                        self.trade_states[code] = state
+                        logger.info(f"📐 [{name}] 실시간 편입 종목 초기 세팅 완료: 고점 {int(max_candle['high']):,}원")
+                except Exception as e:
+                    logger.error(f"❌ [{name}] 실시간 편입 종목 세팅 에러: {e}")
+
+    async def on_delete(self, code: str):
+        logger.info(f"🔴 [조건검색 이탈] 종목코드: {code}")
+        if code in self.watchlist:
+            name = self.watchlist[code]['name']
+            del self.watchlist[code]
+            logger.info(f"❌ 관심종목 제거 완료: {name} ({code})")
+
+    async def manage_unexecuted_orders(self):
+        """접수 후 3분(180초)이 경과한 미체결 주문 취소"""
+        current_time = time.time()
+        for order_no, info in list(self.tracked_orders.items()):
+            if current_time - info['time'] > 180:
+                logger.info(f"⏳ 3분 경과! 미체결 주문 자동 취소 진행 (종목: {info['code']})")
+                await asyncio.to_thread(self.client.cancel_order, order_no, info['code'], info['qty'])
+                del self.tracked_orders[order_no]
+
+    async def setup_initial_highs(self):
+        """
+        장 초반 첫 5개 1분봉을 가져와서 종목별 초기 고점(initial_high)과
+        최고점봉의 최저점(stop_loss)을 세팅합니다.
+        09:05 이후에 한 번만 실행됩니다.
+        """
+        logger.info("📐 [초기 세팅] 첫 5분봉 고점 및 손절선을 수집합니다...")
+        for code, info in list(self.watchlist.items()):
+            try:
+                async with self.api_lock:
+                    df = await asyncio.to_thread(self.client.get_1m_candles, code)
+                    await asyncio.sleep(0.25)  # API Rate Limit 보호
+                if df is None or df.empty or len(df) < 5:
+                    logger.warning(f"⚠️ [{info['name']}] 1분봉 데이터 부족, 초기 세팅 스킵")
+                    continue
+                
+                # 첫 5개 캔들 추출 (장 시작부터 시간순으로 정렬되어 있다고 가정)
+                first_5 = df.iloc[:5]
+                max_idx = first_5['high'].idxmax()
+                max_candle = first_5.loc[max_idx]
+                
+                initial_high = int(max_candle['high'])
+                stop_loss = int(max_candle['low'])
+                
+                state = TradeState(initial_high, stop_loss)
+                self.trade_states[code] = state
+                
+                logger.info(f"✅ [{info['name']}] 초기 고점: {initial_high:,}원 | 손절선(최고점봉 저점): {stop_loss:,}원")
+            except Exception as e:
+                logger.error(f"❌ [{info['name']}] 초기 세팅 에러: {e}")
+        
+        self.setup_phase_done = True
+        logger.info(f"📐 [초기 세팅 완료] {len(self.trade_states)}개 종목 세팅 완료")
+
+    async def run_cycle(self):
+        now = datetime.now().time()
+        
+        # 장 시작 전이면 대기
+        if now < dtime(9, 0):
+            logger.info("⏰ 장 시작 전입니다. 대기 중...")
+            return
+        
+        # 09:05 이전이면 아직 첫 5분봉이 완성되지 않았으므로 대기
+        if now < dtime(9, 5):
+            logger.info("⏰ 첫 5분봉 수집 대기 중... (09:05 이후 초기 세팅 시작)")
+            return
+        
+        # 첫 5분봉 고점/손절선 세팅 (한 번만 실행)
+        if not self.setup_phase_done:
+            await self.setup_initial_highs()
+            if not self.trade_states:
+                logger.warning("⚠️ 초기 세팅된 종목이 없습니다. 다음 사이클에 재시도합니다.")
+                self.setup_phase_done = False
+                return
+        
+        logger.info(f"🔄 [돌파 전략 사이클] 감시 종목: {len(self.trade_states)}개")
         
         # 1. 3분 경과 미체결 주문 관리 (취소)
-        self.manage_unexecuted_orders()
+        await self.manage_unexecuted_orders()
         
-        # 2. 계좌 상태 및 잔고 조회
-        holdings_list = self.client.get_holdings()
-        if holdings_list is None:
-            holdings_list = []
-        holdings = {h['code']: h for h in holdings_list}
+        # 2. 계좌 상태 조회
+        holdings = await asyncio.to_thread(self.client.get_account_holdings)
+        unexecuted = await asyncio.to_thread(self.client.get_unexecuted_orders)
         
-        cash = self.client.get_cash_balance()
-        # Calculate total balance (cash + stock value)
-        stock_value = sum(h['quantity'] * h['current_price'] for h in holdings_list)
-        total_balance = cash + stock_value
-        
-        # ==================================================
-        # [매도 로직 (Sell Logic)]
-        # ==================================================
-        for code, h in list(holdings.items()):
-            qty = h['quantity']
-            buy_price = h['buy_price']
-            current_price = h['current_price']
-            name = h['name']
+        # ===== 매도 검사 (보유 종목 중 TradeState가 있는 종목) =====
+        for code in list(holdings.keys()):
+            state = self.trade_states.get(code)
+            if not state:
+                continue  # 이 전략으로 산 종목이 아니면 건드리지 않음
             
-            score = self.core_manager.trend_manager.get_trend_score(code)
-            candles_15m = None
-            # 스윙 전환 조건(80점 이상)일 때만 15분봉 데이터를 요청하여 API 부하를 최소화
-            if score >= 80:
-                candles_15m = self.client.get_15min_candles(code, last_n_days=5)
+            if not state.is_holding:
+                continue  # 봇이 매수한 게 아니라면 스킵
+            
+            async with self.api_lock:
+                df_sell = await asyncio.to_thread(self.client.get_1m_candles, code)
+                await asyncio.sleep(0.25)  # API Rate Limit 보호
+            if df_sell is None or df_sell.empty or len(df_sell) < 10:
+                continue
+            
+            signals = calculate_sma_breakout_signals(df_sell, state)
+            
+            if signals.get('sell'):
+                sell_reason = signals.get('sell_reason', '매도')
+                hold_info = holdings[code]
+                qty_sell = hold_info if isinstance(hold_info, int) else hold_info.get('qty', 1)
+                name = self.watchlist.get(code, {}).get('name', code)
                 
-            candles_1m = self.client.get_1min_candles(code, last_n_days=1)
+                logger.info(f"🔴 [{name}] 매도 신호! 사유: {sell_reason}")
+                await asyncio.to_thread(self.client.place_sell_order, code, qty_sell, price=0, order_type="03")  # 시장가 매도
+                state.is_holding = False
+                # 재매수를 위해 price_dropped_below_high는 리셋하지 않음 (다음 사이클에서 체크)
+        
+        # ===== 매수 검사 (감시 종목 전체) =====
+        if len(holdings) >= 10:
+            logger.info("⚠️ 최대 보유 종목 수(10개)에 도달. 신규 매수 탐색 스킵.")
+            return
+        
+        for code, state in list(self.trade_states.items()):
+            if state.is_holding:
+                continue  # 이미 보유 중
             
-            # CoreTradeManager에게 매도 판단 위임 (다이나믹 스위칭)
-            should_sell, reason = self.core_manager.check_sell_condition(code, buy_price, current_price, candles_1m, candles_15m)
-            
-            if should_sell:
-                logger.info(f"📉 매도 신호 발생 [{name}]: {reason}")
-                self.client.place_sell_order(code, qty, order_type="03")
-                del holdings[code]  # 방금 매도한 종목을 이번 사이클에서 제외
-        
-        # ==================================================
-        # [매수 로직 (Buy Logic)]
-        # ==================================================
-        
-        buy_candidates = []
-        
-        for code, info in self.watchlist.items():
-            # 1. 1종목 1회 매수 및 최대 보유 제한
-            qty_to_buy = self.core_manager.calculate_buy_quantity(len(holdings), total_balance, 1) # target price is placeholder
-            if qty_to_buy <= 0:
-                break
-                
+            # 이미 보유 중이거나 미체결 대기 중이면 패스
             if code in holdings:
                 continue
-                
-            # 2. 이평선 봇 고유의 1차 필터링 (정배열 등)
-            candles = self.client.get_1min_candles(code, last_n_days=1)
-            if not candles or len(candles) < 20:
+            is_unexecuted = any(o['code'] == code for o in self.tracked_orders.values())
+            if is_unexecuted or any(u.get('stock_code') == code for u in unexecuted):
                 continue
-                
-            df = pd.DataFrame(candles)
-            signals = calculate_sma_signals(df)
             
-            if signals['buy']:
-                # Determine specific reasons and quantity modifier
-                base_reasons = []
-                is_breakout = signals.get('breakout_buy', False)
-                is_dip = signals.get('dip_buy', False)
+            info = self.watchlist.get(code, {})
+            name = info.get('name', code)
+            
+            async with self.api_lock:
+                df = await asyncio.to_thread(self.client.get_1m_candles, code)
+                await asyncio.sleep(0.25)  # API Rate Limit 보호
+            if df is None or df.empty or len(df) < 10:
+                continue
+            
+            signals = calculate_sma_breakout_signals(df, state)
+            
+            if signals.get('buy'):
+                buy_reason = signals.get('buy_reason', '매수')
+                buy_price = signals.get('price', df.iloc[-1]['close'])
                 
-                if is_breakout:
-                    base_reasons.append("시가 재돌파 매매 (거래량 폭발)")
-                if is_dip:
-                    base_reasons.append("3-20-60 눌림목 매매")
+                logger.info(f"🟢 [{name}] 매수 신호! 사유: {buy_reason} | 목표가: {int(buy_price):,}원")
                 
-                if not base_reasons:
-                    base_reasons.append("일반 정배열 매수")
-
-                # 3. CoreTradeManager 서포터 평가 (테마, 추세)
-                approved, reason = self.core_manager.evaluate_buy_candidate(code, float(df.iloc[-1]['close']), base_reasons, name=info['name'])
+                # 3초 관망 (추격매수 방지 & API Rate Limit 회피)
+                await asyncio.sleep(3)
                 
-                if approved:
-                    logger.info(f"Signal found and approved for {info['name']} ({code}): {base_reasons}")
+                qty = 1  # 우선 1주 고정
                 
-                    momentum = 1.0
-                    score = info.get('weight', 10.0) * momentum
-                    
-                    buy_candidates.append({
+                # 지정가 주문 (돌파가 기준)
+                tick_size = get_tick_size(int(buy_price))
+                limit_price = int((int(buy_price) // tick_size) * tick_size)
+                
+                logger.info(f"🚀 [{name}] 매수 주문 전송: {limit_price:,}원 x {qty}주")
+                order_no = await asyncio.to_thread(
+                    self.client.place_buy_order, code, qty, price=limit_price, order_type="00"
+                )
+                if order_no:
+                    self.tracked_orders[order_no] = {
                         'code': code,
-                        'name': info['name'],
-                        'score': score,
-                        'sma20': signals['sma20'],
-                        'is_breakout': is_breakout
-                    })
-                
-        if not buy_candidates:
-            logger.info("No buy signals in this cycle.")
-            return
+                        'qty': qty,
+                        'time': time.time()
+                    }
+                    state.is_holding = True
+                    state.has_traded_today = True
+                    logger.info(f"✅ [{name}] 매수 체결 대기 중 (주문번호: {order_no})")
+                else:
+                    logger.warning(f"⚠️ [{name}] 매수 주문 실패. 포지션 유지하지 않음.")            
+    async def start(self):
+        """비동기 스케줄러: 1분마다 run_cycle을 실행"""
+        logger.info("="*50)
+        logger.info(" 🚀 [돌파 전략 봇] 시작")
+        logger.info(" 전략: 초반 5분봉 고점 돌파 + 3-10 이평선 교차")
+        logger.info("="*50)
+        
+        # 조건검색식 실시간 수신을 위한 웹소켓 클라이언트 시작
+        self.ws_client = KiwoomWebSocketClient(
+            target_condition_name=self.condition_name,
+            on_insert=self.on_insert,
+            on_delete=self.on_delete
+        )
+        asyncio.create_task(self.ws_client.run())
             
-        # 1. Priority Filtering: Sort by Theme Weight * Momentum Score
-        buy_candidates.sort(key=lambda x: x['score'], reverse=True)
-        top_candidate = buy_candidates[0]
+        # 최초 1회 실행
+        await self.run_cycle()
         
-        logger.info(f"Top candidate selected: {top_candidate['name']} with priority score {top_candidate['score']:.2f}")
-        
-        # 3. Calculate Limit Order Price (Optional) & Qty
-        target_price = top_candidate['sma20'] # 예상 진입가
-        
-        # 코어 매니저를 통한 최종 비중(수량) 계산
-        qty = self.core_manager.calculate_buy_quantity(len(holdings), total_balance, target_price)
-        
-        if top_candidate.get('is_breakout'):
-            qty = max(1, qty // 2)
-            logger.info(f"⚠️ 돌파 매매 감지: 리스크 관리를 위해 진입 수량을 절반({qty}주)으로 줄입니다.")
-        
-        # 4. Execute Market Order
-        if qty > 0:
-            logger.info(f"Executing Buy Order for {top_candidate['name']} (Market Order) x {qty}주")
-            result = self.client.place_buy_order(top_candidate['code'], qty, order_type="03") # 03 = 시장가
-            if result and result.get('return_code') == 0:
-                logger.info(f"Buy Order successful for {top_candidate['code']}")
-        else:
-            logger.warning("Insufficient funds to execute order.")
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self.run_cycle()
+            except Exception as e:
+                logger.error(f"run_cycle 에러: {e}")
+
+async def main():
+    bot = TradingBot()
+    
+    # 웹소켓 조건검색 연동을 포함한 봇의 스케줄러 실행
+    await bot.start()
 
 if __name__ == "__main__":
-    bot = TradingBot()
-    bot.run_cycle()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("프로그램을 종료합니다.")
