@@ -20,17 +20,20 @@ def get_tick_size(price: int) -> int:
         return 1000
 
 class TradeState:
-    def __init__(self, initial_high: int, stop_loss: int):
+    def __init__(self, initial_high: int, stop_loss: int, initial_low: int = 0):
         self.initial_high = initial_high
         self.stop_loss = stop_loss
+        self.initial_low = initial_low
+        self.first_limit_order_placed = False
         self.has_traded_today = False
         self.price_dropped_below_high = False
         self.is_holding = False
 
-def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState) -> dict:
+def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy_price: float = 0.0) -> dict:
     """
     df: 1분봉 데이터 (마지막 행이 현재 캔들)
     state: 해당 종목의 현재 상태 객체
+    hold_buy_price: 보유 시 매입단가
     반환: {'buy': bool, 'sell': bool, 'sell_reason': str, 'buy_reason': str, 'price': float}
     """
     if len(df) < 10:
@@ -71,6 +74,16 @@ def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState) -> dict:
     if not state.is_holding:
         # 최초 매수
         if not state.has_traded_today:
+            # 장시작과 동시에는 최저가를 확인후 +2호가 매수주문
+            if not state.first_limit_order_placed and state.initial_low > 0:
+                state.first_limit_order_placed = True
+                tick_size = get_tick_size(state.initial_low)
+                return {
+                    "buy": True,
+                    "buy_reason": "장시작 최초 최저가 +2호가 지정가 매수",
+                    "price": state.initial_low + (tick_size * 2)
+                }
+
             # 고가가 초기 고점을 뚫었는가
             if high_price > state.initial_high:
                 exec_price = open_price if open_price > state.initial_high else state.initial_high + tick_size
@@ -98,6 +111,14 @@ def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState) -> dict:
                     
     # 포지션을 보유 중인 경우 (매도 검사)
     else:
+        # 0. 수익률 4% 이상 도달 시 매도
+        if hold_buy_price > 0 and close_price >= hold_buy_price * 1.04:
+            return {
+                "sell": True,
+                "sell_reason": f"수익 4% 이상 달성 (매수가: {hold_buy_price:,.0f})",
+                "price": close_price
+            }
+
         # 1. 강제 손절 (최고점봉의 최저점 이탈)
         if low_price < state.stop_loss:
             exec_price = open_price if open_price < state.stop_loss else state.stop_loss - get_tick_size(state.stop_loss)

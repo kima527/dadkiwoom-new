@@ -25,8 +25,16 @@ class TradingBot:
         self.condition_name = condition_name
         self.watchlist = {}
         
-        # 오프라인 관심종목(watchlist.json) 로드 삭제 - 오직 실시간 조건검색으로만 종목 편입
-
+        # 장 마감 후 생성된 관심종목 리스트 로드
+        watchlist_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'watchlist.json'))
+        if os.path.exists(watchlist_path):
+            try:
+                with open(watchlist_path, 'r', encoding='utf-8') as f:
+                    self.watchlist = json.load(f)
+                logger.info(f"✅ 오프라인 관심종목(watchlist.json) {len(self.watchlist)}개 로드 완료")
+            except Exception as e:
+                logger.error(f"관심종목 로드 에러: {e}")
+                
         self.tracked_orders = {} # { order_no: {'code': code, 'qty': qty, 'time': float} }
         self.theme_manager = ThemeManager()
         self.theme_manager.load_top_themes(limit=30)
@@ -57,7 +65,9 @@ class TradingBot:
                         first_5 = df.iloc[:5]
                         max_idx = first_5['high'].idxmax()
                         max_candle = first_5.loc[max_idx]
-                        state = TradeState(int(max_candle['high']), int(max_candle['low']))
+                        min_idx = first_5['low'].idxmin()
+                        min_candle = first_5.loc[min_idx]
+                        state = TradeState(int(max_candle['high']), int(max_candle['low']), int(min_candle['low']))
                         self.trade_states[code] = state
                         logger.info(f"📐 [{name}] 실시간 편입 종목 초기 세팅 완료: 고점 {int(max_candle['high']):,}원")
                 except Exception as e:
@@ -78,6 +88,13 @@ class TradingBot:
                 logger.info(f"⏳ 3분 경과! 미체결 주문 자동 취소 진행 (종목: {info['code']})")
                 await asyncio.to_thread(self.client.cancel_order, order_no, info['code'], info['qty'])
                 del self.tracked_orders[order_no]
+                
+                # 미체결 취소 시 상태 리셋 (재매수 가능하도록)
+                state = self.trade_states.get(info['code'])
+                if state:
+                    state.is_holding = False
+                    if state.has_traded_today:
+                        state.has_traded_today = False
 
     async def setup_initial_highs(self):
         """
@@ -100,13 +117,17 @@ class TradingBot:
                 max_idx = first_5['high'].idxmax()
                 max_candle = first_5.loc[max_idx]
                 
+                min_idx = first_5['low'].idxmin()
+                min_candle = first_5.loc[min_idx]
+                
                 initial_high = int(max_candle['high'])
                 stop_loss = int(max_candle['low'])
+                initial_low = int(min_candle['low'])
                 
-                state = TradeState(initial_high, stop_loss)
+                state = TradeState(initial_high, stop_loss, initial_low)
                 self.trade_states[code] = state
                 
-                logger.info(f"✅ [{info['name']}] 초기 고점: {initial_high:,}원 | 손절선(최고점봉 저점): {stop_loss:,}원")
+                logger.info(f"✅ [{info['name']}] 초기 고점: {initial_high:,}원 | 초기 저점: {initial_low:,}원 | 손절선(최고점봉 저점): {stop_loss:,}원")
             except Exception as e:
                 logger.error(f"❌ [{info['name']}] 초기 세팅 에러: {e}")
         
@@ -158,7 +179,10 @@ class TradingBot:
             if df_sell is None or df_sell.empty or len(df_sell) < 10:
                 continue
             
-            signals = calculate_sma_breakout_signals(df_sell, state)
+            hold_info = holdings[code]
+            hold_buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
+
+            signals = calculate_sma_breakout_signals(df_sell, state, hold_buy_price)
             
             if signals.get('sell'):
                 sell_reason = signals.get('sell_reason', '매도')
