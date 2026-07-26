@@ -25,16 +25,7 @@ class TradingBot:
         self.condition_name = condition_name
         self.watchlist = {}
         
-        # 장 마감 후 생성된 관심종목 리스트 로드
-        watchlist_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'watchlist.json'))
-        if os.path.exists(watchlist_path):
-            try:
-                with open(watchlist_path, 'r', encoding='utf-8') as f:
-                    self.watchlist = json.load(f)
-                logger.info(f"✅ 오프라인 관심종목(watchlist.json) {len(self.watchlist)}개 로드 완료")
-            except Exception as e:
-                logger.error(f"관심종목 로드 에러: {e}")
-                
+
         self.tracked_orders = {} # { order_no: {'code': code, 'qty': qty, 'time': float} }
         self.theme_manager = ThemeManager()
         self.theme_manager.load_top_themes(limit=30)

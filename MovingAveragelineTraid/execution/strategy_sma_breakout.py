@@ -1,6 +1,7 @@
 import pandas as pd
 import ta
 import math
+from datetime import datetime, time as dtime
 
 def get_tick_size(price: int) -> int:
     """한국 거래소 기준 호가 단위(Tick Size) 계산"""
@@ -28,6 +29,7 @@ class TradeState:
         self.has_traded_today = False
         self.price_dropped_below_high = False
         self.is_holding = False
+        self.trade_ended = False
 
 def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy_price: float = 0.0) -> dict:
     """
@@ -36,22 +38,27 @@ def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy
     hold_buy_price: 보유 시 매입단가
     반환: {'buy': bool, 'sell': bool, 'sell_reason': str, 'buy_reason': str, 'price': float}
     """
-    if len(df) < 10:
+    if state.trade_ended or len(df) < 10:
         return {"buy": False, "sell": False}
         
     df = df.copy()
-    # 3-10 이평선 계산
+    # 3-10, 40-60 이평선 계산
     df['sma3'] = ta.trend.sma_indicator(df['close'], window=3)
     df['sma10'] = ta.trend.sma_indicator(df['close'], window=10)
+    df['sma40'] = ta.trend.sma_indicator(df['close'], window=40)
+    df['sma60'] = ta.trend.sma_indicator(df['close'], window=60)
     
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else None
     
     sma3 = latest['sma3']
     sma10 = latest['sma10']
+    sma40 = latest['sma40']
+    sma60 = latest['sma60']
     
     prev_sma3 = prev['sma3'] if prev is not None else 0
     prev_sma10 = prev['sma10'] if prev is not None else 0
+    prev_sma60 = prev['sma60'] if prev is not None else float('nan')
     
     # NaN 방어: 이평선 데이터가 아직 충분히 쌓이지 않았으면 신호 없음 반환
     if pd.isna(sma3) or pd.isna(sma10) or pd.isna(prev_sma3) or pd.isna(prev_sma10):
@@ -70,6 +77,20 @@ def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy
     close_price = latest['close']
     open_price = latest['open']
     
+    # 14시 이후 60이평선 하락전환 시 매매 종료 검사
+    now = datetime.now().time()
+    if now >= dtime(14, 0) and not pd.isna(sma60) and not pd.isna(prev_sma60):
+        if sma60 < prev_sma60:
+            state.trade_ended = True
+            if state.is_holding:
+                return {
+                    "sell": True,
+                    "sell_reason": "14시 이후 60이평선 하락전환 (매매종료)",
+                    "price": close_price
+                }
+            else:
+                return {"buy": False, "sell": False}
+
     # 포지션을 안 가지고 있는 경우 (매수 검사)
     if not state.is_holding:
         # 최초 매수
@@ -92,32 +113,19 @@ def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy
                     "buy_reason": "초기 고점 돌파 (최초)",
                     "price": exec_price
                 }
-        # 재매수 로직
+        # 재매수 로직 (두번째 매수)
         else:
-            # 고점 밑으로 내려온 적이 있는지 플래그 업데이트
-            if low_price < state.initial_high:
-                state.price_dropped_below_high = True
-                
-            if state.price_dropped_below_high:
-                # 조건: 가격이 고점 근처(2호가 이내)이거나 돌파했고, 동시에 3-10 골든크로스가 발생
-                approached = (high_price >= two_ticks_below)
-                if approached and is_golden_cross:
+            # sma40 > sma60 일때만 3-10 골든크로스시 매수 허용
+            if not pd.isna(sma40) and not pd.isna(sma60) and (sma40 > sma60):
+                if is_golden_cross:
                     return {
                         "buy": True, 
-                        "buy_reason": "골든크로스 + 재돌파/근접 재매수",
-                        # 1분봉상 골든크로스 확인 후 종가 부근 체결 가정
+                        "buy_reason": "sma40>sma60 구간 3-10 골든크로스 재매수",
                         "price": close_price 
                     }
                     
     # 포지션을 보유 중인 경우 (매도 검사)
     else:
-        # 0. 수익률 4% 이상 도달 시 매도
-        if hold_buy_price > 0 and close_price >= hold_buy_price * 1.04:
-            return {
-                "sell": True,
-                "sell_reason": f"수익 4% 이상 달성 (매수가: {hold_buy_price:,.0f})",
-                "price": close_price
-            }
 
         # 1. 강제 손절 (최고점봉의 최저점 이탈)
         if low_price < state.stop_loss:
