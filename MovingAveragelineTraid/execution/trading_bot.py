@@ -169,6 +169,9 @@ class TradingBot:
         if total_positions >= 4:
             logger.info(f"⚠️ 최대 보유 종목 수(4개)에 도달. (보유: {len(holdings)}개, 매수대기: {pending_buy_count}개) 신규 매수 탐색 스킵.")
             return
+            
+        if now >= dtime(11, 0):
+            return  # 11시 이후 신규 매수 금지 (매도/추가매수는 위에서 정상 작동)
         
         for code, state in list(self.trade_states.items()):
             if state.is_holding or state.trade_ended:
