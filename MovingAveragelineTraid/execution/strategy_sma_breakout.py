@@ -21,127 +21,103 @@ def get_tick_size(price: int) -> int:
         return 1000
 
 class TradeState:
-    def __init__(self, initial_high: int, stop_loss: int, initial_low: int = 0):
-        self.initial_high = initial_high
-        self.stop_loss = stop_loss
-        self.initial_low = initial_low
-        self.first_limit_order_placed = False
-        self.has_traded_today = False
-        self.price_dropped_below_high = False
+    def __init__(self):
         self.is_holding = False
         self.trade_ended = False
+        
+        self.first_buy_candle_time = None
+        self.added_on = False
+        self.first_qty = 0
 
 def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy_price: float = 0.0) -> dict:
     """
     df: 1분봉 데이터 (마지막 행이 현재 캔들)
     state: 해당 종목의 현재 상태 객체
     hold_buy_price: 보유 시 매입단가
-    반환: {'buy': bool, 'sell': bool, 'sell_reason': str, 'buy_reason': str, 'price': float}
     """
-    if state.trade_ended or len(df) < 10:
-        return {"buy": False, "sell": False}
+    if state.trade_ended or df.empty:
+        return {"buy": False, "sell": False, "add_buy": False}
         
     df = df.copy()
-    # 3-10, 40-60 이평선 계산
-    df['sma3'] = ta.trend.sma_indicator(df['close'], window=3)
-    df['sma10'] = ta.trend.sma_indicator(df['close'], window=10)
-    df['sma40'] = ta.trend.sma_indicator(df['close'], window=40)
-    df['sma60'] = ta.trend.sma_indicator(df['close'], window=60)
+    # 5, 20 이평선 계산
+    df['sma5'] = ta.trend.sma_indicator(df['close'], window=5)
+    df['sma20'] = ta.trend.sma_indicator(df['close'], window=20)
     
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else None
     
-    sma3 = latest['sma3']
-    sma10 = latest['sma10']
-    sma40 = latest['sma40']
-    sma60 = latest['sma60']
-    
-    prev_sma3 = prev['sma3'] if prev is not None else 0
-    prev_sma10 = prev['sma10'] if prev is not None else 0
-    prev_sma60 = prev['sma60'] if prev is not None else float('nan')
-    
-    # NaN 방어: 이평선 데이터가 아직 충분히 쌓이지 않았으면 신호 없음 반환
-    if pd.isna(sma3) or pd.isna(sma10) or pd.isna(prev_sma3) or pd.isna(prev_sma10):
-        return {"buy": False, "sell": False}
-    
-    # 골든/데드크로스 여부 (현재 캔들 기준)
-    is_golden_cross = (prev_sma3 <= prev_sma10) and (sma3 > sma10)
-    is_dead_cross = (prev_sma3 >= prev_sma10) and (sma3 < sma10)
-    
-    # 2호가 기준 가격 계산
-    tick_size = get_tick_size(state.initial_high)
-    two_ticks_below = state.initial_high - (tick_size * 2)
-    
-    high_price = latest['high']
-    low_price = latest['low']
     close_price = latest['close']
-    open_price = latest['open']
     
-    # 14시 이후 60이평선 하락전환 시 매매 종료 검사
-    now = datetime.now().time()
-    if now >= dtime(14, 0) and not pd.isna(sma60) and not pd.isna(prev_sma60):
-        if sma60 < prev_sma60:
-            state.trade_ended = True
-            if state.is_holding:
-                return {
-                    "sell": True,
-                    "sell_reason": "14시 이후 60이평선 하락전환 (매매종료)",
-                    "price": close_price
-                }
-            else:
-                return {"buy": False, "sell": False}
-
-    # 포지션을 안 가지고 있는 경우 (매수 검사)
+    # 1. 포지션을 안 가지고 있는 경우 (조건검색 포착 즉시 매수)
     if not state.is_holding:
-        # 최초 매수
-        if not state.has_traded_today:
-            # 장시작과 동시에는 최저가를 확인후 +2호가 매수주문
-            if not state.first_limit_order_placed and state.initial_low > 0:
-                state.first_limit_order_placed = True
-                tick_size = get_tick_size(state.initial_low)
-                return {
-                    "buy": True,
-                    "buy_reason": "장시작 최초 최저가 +2호가 지정가 매수",
-                    "price": state.initial_low + (tick_size * 2)
-                }
-
-            # 고가가 초기 고점을 뚫었는가
-            if high_price > state.initial_high:
-                exec_price = open_price if open_price > state.initial_high else state.initial_high + tick_size
-                return {
-                    "buy": True,
-                    "buy_reason": "초기 고점 돌파 (최초)",
-                    "price": exec_price
-                }
-        # 재매수 로직 (두번째 매수)
-        else:
-            # sma40 > sma60 일때만 3-10 골든크로스시 매수 허용
-            if not pd.isna(sma40) and not pd.isna(sma60) and (sma40 > sma60):
-                if is_golden_cross:
-                    return {
-                        "buy": True, 
-                        "buy_reason": "sma40>sma60 구간 3-10 골든크로스 재매수",
-                        "price": close_price 
-                    }
+        return {
+            "buy": True,
+            "buy_reason": "조건검색 즉시 매수",
+            "price": close_price
+        }
                     
-    # 포지션을 보유 중인 경우 (매도 검사)
+    # 2. 포지션을 보유 중인 경우
     else:
-
-        # 1. 강제 손절 (최고점봉의 최저점 이탈)
-        if low_price < state.stop_loss:
-            exec_price = open_price if open_price < state.stop_loss else state.stop_loss - get_tick_size(state.stop_loss)
+        prev_close = prev['close'] if prev is not None else latest['open']
+        
+        # 2.0 이전 캔들 종가 대비 -1.5% 급락 손절 검사
+        if close_price <= prev_close * 0.985:
             return {
                 "sell": True,
-                "sell_reason": f"강제 손절 (손절선 {state.stop_loss} 이탈)",
-                "price": exec_price
-            }
-            
-        # 2. 3-10 데드크로스 매도
-        if is_dead_cross:
-            return {
-                "sell": True,
-                "sell_reason": "3-10 데드크로스",
+                "sell_reason": "전 캔들 종가 대비 -1.5% 급락 손절",
                 "price": close_price
             }
             
-    return {"buy": False, "sell": False}
+        # 2.1 강제 손절 검사: 매입단가 대비 -3%
+        is_stop_loss = False
+        if hold_buy_price > 0 and close_price <= hold_buy_price * 0.97:
+            is_stop_loss = True
+            
+        if is_stop_loss:
+            return {
+                "sell": True,
+                "sell_reason": "고정 손절 (-3%)",
+                "price": close_price
+            }
+            
+        # 2.2 매도 검사: 5-20 데드크로스
+        is_dead_cross = False
+        if prev is not None and not pd.isna(latest['sma5']) and not pd.isna(latest['sma20']) and not pd.isna(prev['sma5']) and not pd.isna(prev['sma20']):
+            if prev['sma5'] >= prev['sma20'] and latest['sma5'] < latest['sma20']:
+                is_dead_cross = True
+                
+        if is_dead_cross:
+            return {
+                "sell": True,
+                "sell_reason": "5-20 이평선 데드크로스",
+                "price": close_price
+            }
+            
+        # 2.2 추가 매수 검사 (물타기)
+        if not state.added_on and state.first_buy_candle_time is not None:
+            # df의 index가 time 문자열인 경우
+            if state.first_buy_candle_time in df.index:
+                buy_idx = df.index.get_loc(state.first_buy_candle_time)
+                
+                # 중복된 인덱스 방어 (get_loc이 slice를 반환할 수 있음)
+                if isinstance(buy_idx, slice):
+                    buy_idx = buy_idx.stop - 1
+                elif isinstance(buy_idx, pd.Series):
+                    buy_idx = buy_idx.to_numpy().nonzero()[0][-1]
+                    
+                # 매수 캔들 다음 캔들이 "완성" 되었는지 확인 (최소 2개 캔들 뒤에 있어야 완성된 것으로 간주)
+                if buy_idx + 1 < len(df) - 1:
+                    next_candle = df.iloc[buy_idx + 1]
+                    # 음봉 확인 (종가 < 시가)
+                    if next_candle['close'] < next_candle['open']:
+                        target_price = next_candle['low'] + get_tick_size(int(next_candle['low']))
+                        return {
+                            "add_buy": True,
+                            "add_buy_reason": "매수 후 다음 캔들 음봉 발생 (최저가+1호가 추가매수)",
+                            "price": target_price
+                        }
+                    else:
+                        # 양봉이면 추가매수 안 함
+                        state.added_on = True
+
+    return {"buy": False, "sell": False, "add_buy": False}
