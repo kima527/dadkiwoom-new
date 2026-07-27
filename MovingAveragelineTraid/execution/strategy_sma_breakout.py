@@ -93,35 +93,6 @@ def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy
                 "price": close_price
             }
             
-        # 2.2 추가 매수 검사 (물타기)
-        if not state.added_on and state.first_buy_candle_time is not None:
-            # df의 index가 time 문자열인 경우
-            if state.first_buy_candle_time in df.index:
-                buy_idx = df.index.get_loc(state.first_buy_candle_time)
-                
-                # 중복된 인덱스 방어 (get_loc이 slice를 반환할 수 있음)
-                if isinstance(buy_idx, slice):
-                    buy_idx = buy_idx.stop - 1
-                elif isinstance(buy_idx, pd.Series):
-                    buy_idx = buy_idx.to_numpy().nonzero()[0][-1]
-                    
-                # 매수 캔들 다음 캔들이 "완성" 되었는지 확인 (최소 2개 캔들 뒤에 있어야 완성된 것으로 간주)
-                if buy_idx + 1 < len(df) - 1:
-                    next_candle = df.iloc[buy_idx + 1]
-                    # 음봉 확인 (종가 < 시가)
-                    if next_candle['close'] < next_candle['open']:
-                        target_price = next_candle['low'] + get_tick_size(int(next_candle['low']))
-                        return {
-                            "add_buy": True,
-                            "add_buy_reason": "매수 후 다음 캔들 음봉 발생 (최저가+1호가 추가매수)",
-                            "price": target_price
-                        }
-                    else:
-                        # 양봉이면 추가매수 안 함
-                        state.added_on = True
-            else:
-                # 매수 캔들이 1분봉 데이터에서 사라진 경우 (API가 오래된 캔들을 잘라냄)
-                # 추가매수 기회를 소진 처리하여 무한 대기 방지
-                state.added_on = True
+    return {"buy": False, "sell": False, "add_buy": False}
 
     return {"buy": False, "sell": False, "add_buy": False}

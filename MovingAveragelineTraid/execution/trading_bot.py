@@ -164,7 +164,8 @@ class TradingBot:
         
         # ===== 신규 매수 검사 (감시 종목 전체) =====
         # 보유 종목 수 + 1차 매수 미체결 주문 수를 합산하여 4개 제한 체크
-        pending_buy_count = sum(1 for o in self.tracked_orders.values() if o.get('order_type') == 'buy')
+        pending_buy_codes = {o['code'] for o in self.tracked_orders.values() if str(o.get('order_type')).startswith('buy')}
+        pending_buy_count = len(pending_buy_codes)
         total_positions = len(holdings) + pending_buy_count
         if total_positions >= 4:
             logger.info(f"⚠️ 최대 보유 종목 수(4개)에 도달. (보유: {len(holdings)}개, 매수대기: {pending_buy_count}개) 신규 매수 탐색 스킵.")
@@ -203,33 +204,51 @@ class TradingBot:
                 buy_reason = signals.get('buy_reason', '매수')
                 buy_price = signals.get('price', df.iloc[-1]['close'])
                 
-                # 수량 계산: 250만원 / 현재가
-                qty = int(2500000 / buy_price)
-                if qty < 1:
-                    qty = 1
+                buy_amount = 2500000
+                total_ratio = 31
                 
-                logger.info(f"🟢 [{name}] 매수 신호! 사유: {buy_reason} | 목표가: {int(buy_price):,}원 x {qty}주")
+                amt_1st = buy_amount * (1 / total_ratio)
+                amt_2nd = buy_amount * (5 / total_ratio)
+                amt_3rd = buy_amount * (25 / total_ratio)
                 
-                tick_size = get_tick_size(int(buy_price))
-                limit_price = int((int(buy_price) // tick_size) * tick_size)
+                tick_1st = get_tick_size(int(buy_price))
+                price_1st = int((int(buy_price) // tick_1st) * tick_1st)
                 
-                order_no = await asyncio.to_thread(
-                    self.client.place_buy_order, code, qty, price=limit_price, order_type="00"
-                )
-                if order_no:
-                    self.tracked_orders[order_no] = {
-                        'code': code,
-                        'qty': qty,
-                        'time': time.time(),
-                        'order_type': 'buy'  # 1차 매수 표시
-                    }
-                    state.is_holding = True
-                    state.first_qty = qty
-                    state.first_buy_candle_time = df.iloc[-1].name
-                    logger.info(f"✅ [{name}] 1차 매수 체결 대기 중 (주문번호: {order_no})")
-                else:
-                    logger.warning(f"⚠️ [{name}] 매수 주문 실패. 당일 매매 금지 처리.")
-                    state.trade_ended = True            
+                tick_2nd = get_tick_size(int(buy_price * 0.997))
+                price_2nd = int((int(buy_price * 0.997) // tick_2nd) * tick_2nd)
+                
+                tick_3rd = get_tick_size(int(buy_price * 0.994))
+                price_3rd = int((int(buy_price * 0.994) // tick_3rd) * tick_3rd)
+                
+                qty_1st = int(amt_1st // price_1st) if price_1st > 0 else 0
+                qty_2nd = int(amt_2nd // price_2nd) if price_2nd > 0 else 0
+                qty_3rd = int(amt_3rd // price_3rd) if price_3rd > 0 else 0
+                
+                logger.info(f"🟢 [{name}] 1:5:25 분할 매수 신호! 사유: {buy_reason}")
+                
+                if qty_1st > 0:
+                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty_1st, price=price_1st, order_type="00")
+                    if order_no:
+                        self.tracked_orders[order_no] = {'code': code, 'qty': qty_1st, 'time': time.time(), 'order_type': 'buy_1'}
+                        logger.info(f"✅ [{name}] 1차 매수 대기: {price_1st}원 x {qty_1st}주 (주문번호: {order_no})")
+                
+                if qty_2nd > 0:
+                    await asyncio.sleep(0.2)
+                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty_2nd, price=price_2nd, order_type="00")
+                    if order_no:
+                        self.tracked_orders[order_no] = {'code': code, 'qty': qty_2nd, 'time': time.time(), 'order_type': 'buy_2'}
+                        logger.info(f"✅ [{name}] 2차 매수 대기(-0.3%): {price_2nd}원 x {qty_2nd}주 (주문번호: {order_no})")
+                
+                if qty_3rd > 0:
+                    await asyncio.sleep(0.2)
+                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty_3rd, price=price_3rd, order_type="00")
+                    if order_no:
+                        self.tracked_orders[order_no] = {'code': code, 'qty': qty_3rd, 'time': time.time(), 'order_type': 'buy_3'}
+                        logger.info(f"✅ [{name}] 3차 매수 대기(-0.6%): {price_3rd}원 x {qty_3rd}주 (주문번호: {order_no})")
+                
+                state.is_holding = True
+                state.first_qty = qty_1st + qty_2nd + qty_3rd
+                state.first_buy_candle_time = df.iloc[-1].name
 
     async def start(self):
         """비동기 스케줄러: 즉시 매수 처리를 위해 주기를 10초로 단축"""
