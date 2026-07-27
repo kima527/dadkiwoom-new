@@ -98,7 +98,9 @@ class TradingBot:
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
             if not state:
-                continue  # 이 전략으로 산 종목이 아니면 건드리지 않음
+                logger.info(f"🔄 미등록 보유 종목 발견: {code}, 상태를 복구합니다.")
+                state = TradeState()
+                self.trade_states[code] = state
             
             if not state.is_holding:
                 hold_info_sync = holdings[code]
@@ -153,6 +155,9 @@ class TradingBot:
                     }
                     state.added_on = True
                     logger.info(f"✅ [{name}] 추가매수 체결 대기 중 (주문번호: {order_no})")
+                else:
+                    logger.warning(f"⚠️ [{name}] 추가매수 주문 실패. 추가 시도 금지.")
+                    state.added_on = True
         
         # ===== 신규 매수 검사 (감시 종목 전체) =====
         if len(holdings) >= 4:
@@ -161,6 +166,10 @@ class TradingBot:
         
         for code, state in list(self.trade_states.items()):
             if state.is_holding or state.trade_ended:
+                continue
+            
+            # 관심종목(watchlist)에서 이탈한 종목은 신규 매수 검사에서 제외 (API 부하 방지)
+            if code not in self.watchlist:
                 continue
             
             if code in holdings:
@@ -210,7 +219,8 @@ class TradingBot:
                     state.first_buy_candle_time = df.iloc[-1].name
                     logger.info(f"✅ [{name}] 1차 매수 체결 대기 중 (주문번호: {order_no})")
                 else:
-                    logger.warning(f"⚠️ [{name}] 매수 주문 실패.")            
+                    logger.warning(f"⚠️ [{name}] 매수 주문 실패. 당일 매매 금지 처리.")
+                    state.trade_ended = True            
 
     async def start(self):
         """비동기 스케줄러: 즉시 매수 처리를 위해 주기를 10초로 단축"""
