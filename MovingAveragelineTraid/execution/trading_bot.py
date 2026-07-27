@@ -118,6 +118,9 @@ class TradingBot:
             
             hold_info = holdings[code]
             hold_buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
+            
+            if hold_buy_price == 0:
+                logger.warning(f"⚠️ [{self.watchlist.get(code, {}).get('name', code)}] 매입단가 정보 없음. -3% 손절은 비활성 상태입니다.")
 
             signals = calculate_sma_breakout_signals(df, state, hold_buy_price)
             name = self.watchlist.get(code, {}).get('name', code)
@@ -160,8 +163,11 @@ class TradingBot:
                     state.added_on = True
         
         # ===== 신규 매수 검사 (감시 종목 전체) =====
-        if len(holdings) >= 4:
-            logger.info("⚠️ 최대 보유 종목 수(4개)에 도달. 신규 매수 탐색 스킵.")
+        # 보유 종목 수 + 1차 매수 미체결 주문 수를 합산하여 4개 제한 체크
+        pending_buy_count = sum(1 for o in self.tracked_orders.values() if o.get('order_type') == 'buy')
+        total_positions = len(holdings) + pending_buy_count
+        if total_positions >= 4:
+            logger.info(f"⚠️ 최대 보유 종목 수(4개)에 도달. (보유: {len(holdings)}개, 매수대기: {pending_buy_count}개) 신규 매수 탐색 스킵.")
             return
         
         for code, state in list(self.trade_states.items()):

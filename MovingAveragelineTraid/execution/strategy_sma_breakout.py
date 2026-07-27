@@ -119,5 +119,9 @@ def calculate_sma_breakout_signals(df: pd.DataFrame, state: TradeState, hold_buy
                     else:
                         # 양봉이면 추가매수 안 함
                         state.added_on = True
+            else:
+                # 매수 캔들이 1분봉 데이터에서 사라진 경우 (API가 오래된 캔들을 잘라냄)
+                # 추가매수 기회를 소진 처리하여 무한 대기 방지
+                state.added_on = True
 
     return {"buy": False, "sell": False, "add_buy": False}
