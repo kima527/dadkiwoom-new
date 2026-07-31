@@ -67,9 +67,9 @@ class TradingBot:
                 # 미체결 취소 시 상태 리셋
                 state = self.trade_states.get(info['code'])
                 if state:
-                    order_type = info.get('order_type', 'buy')  # 'buy' 또는 'add_buy'
-                    if order_type == 'buy':
-                        # 1차 매수가 취소된 경우: 보유 해제하여 재매수 가능하도록
+                    order_type = info.get('order_type', 'buy')  # 'buy_1','buy_2','buy_3','buy_re' 또는 'add_buy'
+                    if order_type.startswith('buy'):
+                        # 분할매수 주문이 취소된 경우: 보유 해제하여 재매수 가능하도록
                         state.is_holding = False
                         state.first_buy_candle_time = None
                         state.first_qty = 0
@@ -109,6 +109,21 @@ class TradingBot:
                 state.is_holding = True
                 state.first_qty = sync_qty
                 state.added_on = True  # 재시작 후에는 추가매수 기회를 소진된 것으로 처리
+                # 재시작 시 initial_breakout_high가 0이면 120봉 고가로 세팅 (재진입 기준 보호)
+                if state.initial_breakout_high == 0.0:
+                    try:
+                        async with self.api_lock:
+                            df_sync = await asyncio.to_thread(self.client.get_1m_candles, code)
+                            await asyncio.sleep(0.25)
+                        if df_sync is not None and not df_sync.empty:
+                            lb = min(len(df_sync), 120)
+                            h120 = float(df_sync['high'].tail(lb).max())
+                            state.initial_breakout_high = h120
+                            state.trailing_high = h120
+                            state.reentry_qty = sync_qty
+                            logger.info(f"🔄 [{code}] initial_breakout_high={h120:,.0f} 복구 완료")
+                    except Exception as e:
+                        logger.warning(f"⚠️ [{code}] 120봉 고가 복구 실패: {e}")
             
             async with self.api_lock:
                 df = await asyncio.to_thread(self.client.get_1m_candles, code)
@@ -122,7 +137,11 @@ class TradingBot:
             if hold_buy_price == 0:
                 logger.warning(f"⚠️ [{self.watchlist.get(code, {}).get('name', code)}] 매입단가 정보 없음. -3% 손절은 비활성 상태입니다.")
 
-            signals = calculate_sma_breakout_signals(df, state, hold_buy_price)
+            # 체결강도 분석을 위한 틱 데이터 조회
+            async with self.api_lock:
+                tick_data = await asyncio.to_thread(self.client.get_tick_data, code)
+                await asyncio.sleep(0.15)
+            signals = calculate_sma_breakout_signals(df, state, hold_buy_price, tick_data=tick_data)
             name = self.watchlist.get(code, {}).get('name', code)
             
             # 매도 신호 처리
@@ -133,7 +152,8 @@ class TradingBot:
                 logger.info(f"🔴 [{name}] 매도 신호! 사유: {sell_reason}")
                 await asyncio.to_thread(self.client.place_sell_order, code, qty_sell, price=0, order_type="03")  # 시장가 매도
                 state.is_holding = False
-                state.trade_ended = True # 재매수 금지
+                state.sold_once = True
+                state.trade_ended = False # 재매수를 위해 감시 유지
             
             # 추가매수 신호 처리
             elif signals.get('add_buy'):
@@ -163,7 +183,7 @@ class TradingBot:
                     state.added_on = True
         
         # ===== 신규 매수 검사 (감시 종목 전체) =====
-        # 보유 종목 수 + 1차 매수 미체결 주문 수를 합산하여 4개 제한 체크
+        # 보유 종목 수 + 1차 매수 미체결 주문 수를 합산하여 1개 제한 체크
         pending_buy_codes = {o['code'] for o in self.tracked_orders.values() if str(o.get('order_type')).startswith('buy')}
         pending_buy_count = len(pending_buy_codes)
         total_positions = len(holdings) + pending_buy_count
@@ -171,15 +191,18 @@ class TradingBot:
             logger.info(f"⚠️ 최대 보유 종목 수(4개)에 도달. (보유: {len(holdings)}개, 매수대기: {pending_buy_count}개) 신규 매수 탐색 스킵.")
             return
             
-        if now >= dtime(11, 0):
-            return  # 11시 이후 신규 매수 금지 (매도/추가매수는 위에서 정상 작동)
+        is_after_10am = now >= dtime(10, 0)
         
         for code, state in list(self.trade_states.items()):
             if state.is_holding or state.trade_ended:
                 continue
             
-            # 관심종목(watchlist)에서 이탈한 종목은 신규 매수 검사에서 제외 (API 부하 방지)
-            if code not in self.watchlist:
+            # 10시 이후: 재돌파 대기(sold_once) 종목만 검사, 순수 신규 매수는 금지
+            if is_after_10am and not state.sold_once:
+                continue
+            
+            # 관심종목(watchlist)에서 이탈한 종목도, 재돌파 대기 중이면 계속 감시
+            if code not in self.watchlist and not state.sold_once:
                 continue
             
             if code in holdings:
@@ -198,11 +221,20 @@ class TradingBot:
             if df is None or df.empty or len(df) < 5:
                 continue
             
-            signals = calculate_sma_breakout_signals(df, state)
+            # 체결강도 분석을 위한 틱 데이터 조회
+            async with self.api_lock:
+                tick_data = await asyncio.to_thread(self.client.get_tick_data, code)
+                await asyncio.sleep(0.15)
+            signals = calculate_sma_breakout_signals(df, state, tick_data=tick_data)
             
             if signals.get('buy'):
                 buy_reason = signals.get('buy_reason', '매수')
                 buy_price = signals.get('price', df.iloc[-1]['close'])
+                
+                if signals.get('is_reentry'):
+                    logger.info(f"🔵 [{name}] 재돌파 1:5:25 분할 매수 신호! 사유: {buy_reason}")
+                else:
+                    logger.info(f"🟢 [{name}] 신규 진입 1:5:25 분할 매수 신호! 사유: {buy_reason}")
                 
                 buy_amount = 2500000
                 total_ratio = 31
@@ -223,8 +255,6 @@ class TradingBot:
                 qty_1st = int(amt_1st // price_1st) if price_1st > 0 else 0
                 qty_2nd = int(amt_2nd // price_2nd) if price_2nd > 0 else 0
                 qty_3rd = int(amt_3rd // price_3rd) if price_3rd > 0 else 0
-                
-                logger.info(f"🟢 [{name}] 1:5:25 분할 매수 신호! 사유: {buy_reason}")
                 
                 if qty_1st > 0:
                     order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty_1st, price=price_1st, order_type="00")
@@ -249,12 +279,24 @@ class TradingBot:
                 state.is_holding = True
                 state.first_qty = qty_1st + qty_2nd + qty_3rd
                 state.first_buy_candle_time = df.iloc[-1].name
+                
+                # 트레일링 스탑 초기값: 현재 120봉 최고가
+                lookback = min(len(df), 120)
+                current_120_high = float(df['high'].tail(lookback).max())
+                state.trailing_high = current_120_high
+                
+                if signals.get('is_reentry'):
+                    state.sold_once = False # 다시 진입했으므로 리셋
+                else:
+                    # 신규 진입 시에만 최초 고가 기억 (재진입 시엔 이전 고가 유지)
+                    state.initial_breakout_high = current_120_high
+                    state.reentry_qty = qty_1st + qty_2nd + qty_3rd
 
     async def start(self):
         """비동기 스케줄러: 즉시 매수 처리를 위해 주기를 10초로 단축"""
         logger.info("="*50)
-        logger.info(" 🚀 [신규 전략 봇] 시작")
-        logger.info(" 전략: 조건검색 즉시 매수 -> 음봉 추가매수 -> 5-20 데드크로스 매도")
+        logger.info(" 🚀 [120봉 돌파 전략 봇] 시작")
+        logger.info(" 전략: 120봉 최고가 돌파 + 체결강도 필터 → 120봉 최고가 -2% 트레일링 스탑")
         logger.info("="*50)
         
         self.ws_client = KiwoomWebSocketClient(
