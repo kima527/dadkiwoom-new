@@ -78,6 +78,36 @@ class RealAPIAdapter:
             logger.error(f"1분봉 변환 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
+    def get_15m_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 15분봉 데이터를 가져와서 trading_bot이 쓰는 Pandas DataFrame으로 변환"""
+        try:
+            raw_candles = self.real_client.get_15min_candles(stock_code, last_n_days=14)
+            
+            if not raw_candles:
+                return pd.DataFrame()
+                
+            df = pd.DataFrame(raw_candles)
+            df.columns = [col.lower() for col in df.columns]
+            
+            if 'time' in df.columns:
+                # 키움 API: "2026-08-01 09:15:00" 형태 문자열 → datetime 변환
+                df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                df.set_index('time', inplace=True)
+                df.sort_index(inplace=True)  # ★ 시간순 정렬 보장 (WMA/shift 계산 필수)
+                
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # date 컬럼은 전략 계산에 불필요하므로 제거
+            if 'date' in df.columns:
+                df.drop(columns=['date'], inplace=True)
+                    
+            return df
+        except Exception as e:
+            logger.error(f"15분봉 변환 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
     def get_tick_data(self, stock_code: str) -> list:
         try:
             return self.real_client.get_tick_data(stock_code, tick_unit="1", limit=30)

@@ -5,7 +5,8 @@ import time
 import asyncio
 import logging
 from real_api_adapter import RealAPIAdapter
-from strategy_sma_breakout import calculate_sma_breakout_signals, TradeState, get_tick_size
+from strategy_sma_breakout import TradeState, get_tick_size
+from strategy_wma_golden_cross import calculate_wma_breakout_signals
 from theme_manager import ThemeManager
 from datetime import datetime, time as dtime
 
@@ -113,7 +114,7 @@ class TradingBot:
                 if state.initial_breakout_high == 0.0:
                     try:
                         async with self.api_lock:
-                            df_sync = await asyncio.to_thread(self.client.get_1m_candles, code)
+                            df_sync = await asyncio.to_thread(self.client.get_15m_candles, code)
                             await asyncio.sleep(0.25)
                         if df_sync is not None and not df_sync.empty:
                             lb = min(len(df_sync), 120)
@@ -126,7 +127,7 @@ class TradingBot:
                         logger.warning(f"⚠️ [{code}] 120봉 고가 복구 실패: {e}")
             
             async with self.api_lock:
-                df = await asyncio.to_thread(self.client.get_1m_candles, code)
+                df = await asyncio.to_thread(self.client.get_15m_candles, code)
                 await asyncio.sleep(0.25)
             if df is None or df.empty or len(df) < 5:
                 continue
@@ -141,7 +142,7 @@ class TradingBot:
             async with self.api_lock:
                 tick_data = await asyncio.to_thread(self.client.get_tick_data, code)
                 await asyncio.sleep(0.15)
-            signals = calculate_sma_breakout_signals(df, state, hold_buy_price, tick_data=tick_data)
+            signals = calculate_wma_breakout_signals(df, state, hold_buy_price, tick_data=tick_data)
             name = self.watchlist.get(code, {}).get('name', code)
             
             # 매도 신호 처리
@@ -183,7 +184,7 @@ class TradingBot:
                     state.added_on = True
         
         # ===== 신규 매수 검사 (감시 종목 전체) =====
-        # 보유 종목 수 + 1차 매수 미체결 주문 수를 합산하여 1개 제한 체크
+        # 보유 종목 수 합산하여 4개 제한 체크
         pending_buy_codes = {o['code'] for o in self.tracked_orders.values() if str(o.get('order_type')).startswith('buy')}
         pending_buy_count = len(pending_buy_codes)
         total_positions = len(holdings) + pending_buy_count
@@ -216,7 +217,7 @@ class TradingBot:
             name = info.get('name', code)
             
             async with self.api_lock:
-                df = await asyncio.to_thread(self.client.get_1m_candles, code)
+                df = await asyncio.to_thread(self.client.get_15m_candles, code)
                 await asyncio.sleep(0.25)
             if df is None or df.empty or len(df) < 5:
                 continue
@@ -225,78 +226,43 @@ class TradingBot:
             async with self.api_lock:
                 tick_data = await asyncio.to_thread(self.client.get_tick_data, code)
                 await asyncio.sleep(0.15)
-            signals = calculate_sma_breakout_signals(df, state, tick_data=tick_data)
+            signals = calculate_wma_breakout_signals(df, state, tick_data=tick_data)
             
             if signals.get('buy'):
                 buy_reason = signals.get('buy_reason', '매수')
                 buy_price = signals.get('price', df.iloc[-1]['close'])
                 
                 if signals.get('is_reentry'):
-                    logger.info(f"🔵 [{name}] 재돌파 1:5:25 분할 매수 신호! 사유: {buy_reason}")
+                    logger.info(f"🔵 [{name}] 재돌파 전량 매수 신호! 사유: {buy_reason}")
                 else:
-                    logger.info(f"🟢 [{name}] 신규 진입 1:5:25 분할 매수 신호! 사유: {buy_reason}")
+                    logger.info(f"🟢 [{name}] 신규 진입 전량 매수 신호! 사유: {buy_reason}")
                 
                 buy_amount = 2500000
-                total_ratio = 31
+                tick = get_tick_size(int(buy_price))
+                price_limit = int((int(buy_price) // tick) * tick)
+                qty = int(buy_amount // price_limit) if price_limit > 0 else 0
                 
-                amt_1st = buy_amount * (1 / total_ratio)
-                amt_2nd = buy_amount * (5 / total_ratio)
-                amt_3rd = buy_amount * (25 / total_ratio)
-                
-                tick_1st = get_tick_size(int(buy_price))
-                price_1st = int((int(buy_price) // tick_1st) * tick_1st)
-                
-                tick_2nd = get_tick_size(int(buy_price * 0.997))
-                price_2nd = int((int(buy_price * 0.997) // tick_2nd) * tick_2nd)
-                
-                tick_3rd = get_tick_size(int(buy_price * 0.994))
-                price_3rd = int((int(buy_price * 0.994) // tick_3rd) * tick_3rd)
-                
-                qty_1st = int(amt_1st // price_1st) if price_1st > 0 else 0
-                qty_2nd = int(amt_2nd // price_2nd) if price_2nd > 0 else 0
-                qty_3rd = int(amt_3rd // price_3rd) if price_3rd > 0 else 0
-                
-                if qty_1st > 0:
-                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty_1st, price=price_1st, order_type="00")
+                if qty > 0:
+                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty, price=price_limit, order_type="00")
                     if order_no:
-                        self.tracked_orders[order_no] = {'code': code, 'qty': qty_1st, 'time': time.time(), 'order_type': 'buy_1'}
-                        logger.info(f"✅ [{name}] 1차 매수 대기: {price_1st}원 x {qty_1st}주 (주문번호: {order_no})")
-                
-                if qty_2nd > 0:
-                    await asyncio.sleep(0.2)
-                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty_2nd, price=price_2nd, order_type="00")
-                    if order_no:
-                        self.tracked_orders[order_no] = {'code': code, 'qty': qty_2nd, 'time': time.time(), 'order_type': 'buy_2'}
-                        logger.info(f"✅ [{name}] 2차 매수 대기(-0.3%): {price_2nd}원 x {qty_2nd}주 (주문번호: {order_no})")
-                
-                if qty_3rd > 0:
-                    await asyncio.sleep(0.2)
-                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty_3rd, price=price_3rd, order_type="00")
-                    if order_no:
-                        self.tracked_orders[order_no] = {'code': code, 'qty': qty_3rd, 'time': time.time(), 'order_type': 'buy_3'}
-                        logger.info(f"✅ [{name}] 3차 매수 대기(-0.6%): {price_3rd}원 x {qty_3rd}주 (주문번호: {order_no})")
-                
-                state.is_holding = True
-                state.first_qty = qty_1st + qty_2nd + qty_3rd
-                state.first_buy_candle_time = df.iloc[-1].name
-                
-                # 트레일링 스탑 초기값: 현재 120봉 최고가
-                lookback = min(len(df), 120)
-                current_120_high = float(df['high'].tail(lookback).max())
-                state.trailing_high = current_120_high
-                
-                if signals.get('is_reentry'):
-                    state.sold_once = False # 다시 진입했으므로 리셋
-                else:
-                    # 신규 진입 시에만 최초 고가 기억 (재진입 시엔 이전 고가 유지)
-                    state.initial_breakout_high = current_120_high
-                    state.reentry_qty = qty_1st + qty_2nd + qty_3rd
+                        self.tracked_orders[order_no] = {'code': code, 'qty': qty, 'time': time.time(), 'order_type': 'buy_1'}
+                        logger.info(f"✅ [{name}] 매수 대기: {price_limit}원 x {qty}주 (주문번호: {order_no})")
+                        
+                        state.is_holding = True
+                        state.first_qty = qty
+                        state.first_buy_candle_time = df.iloc[-1].name
+                        
+                        if signals.get('is_reentry'):
+                            state.sold_once = False
+                        else:
+                            state.initial_breakout_high = df['high'].max()
+                            state.reentry_qty = qty
 
     async def start(self):
         """비동기 스케줄러: 즉시 매수 처리를 위해 주기를 10초로 단축"""
         logger.info("="*50)
-        logger.info(" 🚀 [120봉 돌파 전략 봇] 시작")
-        logger.info(" 전략: 120봉 최고가 돌파 + 체결강도 필터 → 120봉 최고가 -2% 트레일링 스탑")
+        logger.info(" 🚀 [WMA 15분봉 골든크로스 지지돌파 봇] 시작")
+        logger.info(" 전략: 일봉 WMA50 스캐닝 -> 15분봉 지지/돌파 매수 -> 정배열 전고점 전량 익절")
         logger.info("="*50)
         
         self.ws_client = KiwoomWebSocketClient(
