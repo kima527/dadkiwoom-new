@@ -24,6 +24,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from utils import TradeState, calculate_trade_intensity
+
 logger = logging.getLogger(__name__)
 
 
@@ -236,7 +238,8 @@ def analyze_single(
 
     df['Buy_Signal'] = has_signal_2 & (
         (df['Close'] > df['Signal_2']) &
-        (df['Close'].shift(1) <= df['Signal_2'].shift(1))
+        (df['Close'].shift(1) <= df['Signal_2']) &
+        (df['Close'] >= df['Open'])  # 돌파 캔들은 양봉(또는 보합)이어야 함 (갭상승 후 쏟아지는 음봉 휩쏘 방지)
     )
 
     # ==================================================================
@@ -460,7 +463,7 @@ def screen_golden_cross_only(
 # ===========================================================================
 def calculate_wma_breakout_signals(
     df: pd.DataFrame,
-    state: 'TradeState', # type hint (from strategy_sma_breakout)
+    state: TradeState,
     hold_buy_price: float = 0.0,
     tick_data: list | None = None,
 ) -> dict:
@@ -469,9 +472,6 @@ def calculate_wma_breakout_signals(
     """
     if state.trade_ended or df.empty:
         return {"buy": False, "sell": False}
-
-    # 체결강도 함수를 지연 임포트하여 순환참조 방지
-    from strategy_sma_breakout import calculate_trade_intensity
 
     # 파라미터 최적화 (실전 15분봉용)
     params = WMAGoldenCrossParams(

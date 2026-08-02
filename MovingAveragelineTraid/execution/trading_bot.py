@@ -5,9 +5,8 @@ import time
 import asyncio
 import logging
 from real_api_adapter import RealAPIAdapter
-from strategy_sma_breakout import TradeState, get_tick_size
+from utils import TradeState, get_tick_size
 from strategy_wma_golden_cross import calculate_wma_breakout_signals
-from theme_manager import ThemeManager
 from datetime import datetime, time as dtime
 
 # real trading 폴더의 websocket_client를 가져오기 위한 경로 추가
@@ -26,9 +25,7 @@ class TradingBot:
         self.condition_name = condition_name
         self.watchlist = {}
         
-        self.tracked_orders = {} # { order_no: {'code': code, 'qty': qty, 'time': float} }
-        self.theme_manager = ThemeManager()
-        self.theme_manager.load_top_themes(limit=30)
+        self.tracked_orders = {} # { order_no: {'code': code, 'qty': qty, 'time': float, 'order_type': str} }
         
         # 전략 상태 관리
         self.trade_states = {}       # { code: TradeState }
@@ -56,6 +53,27 @@ class TradingBot:
             del self.watchlist[code]
             logger.info(f"❌ 관심종목 제거 완료: {name} ({code})")
 
+    def load_states(self):
+        state_file = os.path.join(os.path.dirname(__file__), "trade_states.json")
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for code, state_dict in data.items():
+                        self.trade_states[code] = TradeState.from_dict(state_dict)
+                logger.info(f"💾 이전 상태 정보를 로드했습니다. ({len(self.trade_states)}개 종목)")
+            except Exception as e:
+                logger.error(f"상태 정보 로드 실패: {e}")
+
+    def save_states(self):
+        state_file = os.path.join(os.path.dirname(__file__), "trade_states.json")
+        try:
+            data = {code: state.to_dict() for code, state in self.trade_states.items()}
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"상태 정보 저장 실패: {e}")
+
     async def manage_unexecuted_orders(self):
         """접수 후 3분(180초)이 경과한 미체결 주문 취소"""
         current_time = time.time()
@@ -70,8 +88,7 @@ class TradingBot:
                 if state:
                     order_type = info.get('order_type', 'buy')  # 'buy_1','buy_2','buy_3','buy_re' 또는 'add_buy'
                     if order_type.startswith('buy'):
-                        # 분할매수 주문이 취소된 경우: 보유 해제하여 재매수 가능하도록
-                        state.is_holding = False
+                        # 분할매수 주문이 취소된 경우: 재매수 가능하도록 상태 리셋
                         state.first_buy_candle_time = None
                         state.first_qty = 0
                     elif order_type == 'add_buy':
@@ -95,6 +112,26 @@ class TradingBot:
         holdings = await asyncio.to_thread(self.client.get_account_holdings)
         unexecuted = await asyncio.to_thread(self.client.get_unexecuted_orders)
         
+        # 3. 체결된 주문을 tracked_orders에서 제거 (5초 유예)
+        unexecuted_codes = [u.get('stock_code') for u in unexecuted]
+        current_time = time.time()
+        for order_no, info in list(self.tracked_orders.items()):
+            if info['code'] not in unexecuted_codes and (current_time - info['time'] > 5):
+                logger.info(f"✅ 주문 체결(또는 취소) 확인됨: 종목 {info['code']}, 주문번호 {order_no}")
+                del self.tracked_orders[order_no]
+                
+        # 4. 잔고에서 사라진 종목 처리 (매도 체결 완료)
+        for code, state in list(self.trade_states.items()):
+            if state.is_holding and code not in holdings:
+                is_sell_unexecuted = any(o['code'] == code and o.get('order_type') == 'sell' for o in self.tracked_orders.values())
+                if not is_sell_unexecuted:
+                    logger.info(f"✅ 잔고 소진 확인 (매도 체결 완료): {code}")
+                    state.is_holding = False
+                    
+        if now >= dtime(15, 20):
+            logger.info("⏰ 15:20 이후 (장 마감/동시호가) - 신규 매수/매도 감시를 중단합니다.")
+            return
+        
         # ===== 매도 및 추가매수 검사 (보유 종목 중 TradeState가 있는 종목) =====
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
@@ -104,13 +141,18 @@ class TradingBot:
                 self.trade_states[code] = state
             
             if not state.is_holding:
-                hold_info_sync = holdings[code]
-                sync_qty = hold_info_sync.get('qty', 1) if isinstance(hold_info_sync, dict) else hold_info_sync
-                logger.info(f"🔄 잔고 동기화: 봇 재시작으로 인해 {code}의 보유 상태를 True로 복구합니다. (수량: {sync_qty})")
-                state.is_holding = True
-                state.first_qty = sync_qty
-                state.added_on = True  # 재시작 후에는 추가매수 기회를 소진된 것으로 처리
-                # 재시작 시 initial_breakout_high가 0이면 120봉 고가로 세팅 (재진입 기준 보호)
+                if state.first_buy_candle_time is not None:
+                    logger.info(f"✅ 매수 체결 확인: {code} 보유 상태로 전환합니다.")
+                    state.is_holding = True
+                else:
+                    hold_info_sync = holdings[code]
+                    sync_qty = hold_info_sync.get('qty', 1) if isinstance(hold_info_sync, dict) else hold_info_sync
+                    logger.info(f"🔄 잔고 동기화: 봇 재시작으로 인해 {code}의 보유 상태를 True로 복구합니다. (수량: {sync_qty})")
+                    state.is_holding = True
+                    state.first_qty = sync_qty
+                    state.added_on = True  # 재시작 후에는 추가매수 기회를 소진된 것으로 처리
+                
+                # 재시작/신규매수 시 initial_breakout_high가 0이면 120봉 고가로 세팅 (재진입 기준 보호)
                 if state.initial_breakout_high == 0.0:
                     try:
                         async with self.api_lock:
@@ -145,14 +187,21 @@ class TradingBot:
             signals = calculate_wma_breakout_signals(df, state, hold_buy_price, tick_data=tick_data)
             name = self.watchlist.get(code, {}).get('name', code)
             
+            # 중복 매도 방지 (현재 처리 중인 매도 주문이 있는지 확인)
+            is_sell_unexecuted = any(o['code'] == code and o.get('order_type') == 'sell' for o in self.tracked_orders.values())
+            if is_sell_unexecuted:
+                continue
+                
             # 매도 신호 처리
             if signals.get('sell'):
                 sell_reason = signals.get('sell_reason', '매도')
                 qty_sell = hold_info if isinstance(hold_info, int) else hold_info.get('qty', 1)
                 
                 logger.info(f"🔴 [{name}] 매도 신호! 사유: {sell_reason}")
-                await asyncio.to_thread(self.client.place_sell_order, code, qty_sell, price=0, order_type="03")  # 시장가 매도
-                state.is_holding = False
+                order_no = await asyncio.to_thread(self.client.place_sell_order, code, qty_sell, price=0, order_type="03")  # 시장가 매도
+                if order_no:
+                    self.tracked_orders[order_no] = {'code': code, 'qty': qty_sell, 'time': time.time(), 'order_type': 'sell'}
+                
                 state.sold_once = True
                 state.trade_ended = False # 재매수를 위해 감시 유지
             
@@ -248,7 +297,6 @@ class TradingBot:
                         self.tracked_orders[order_no] = {'code': code, 'qty': qty, 'time': time.time(), 'order_type': 'buy_1'}
                         logger.info(f"✅ [{name}] 매수 대기: {price_limit}원 x {qty}주 (주문번호: {order_no})")
                         
-                        state.is_holding = True
                         state.first_qty = qty
                         state.first_buy_candle_time = df.iloc[-1].name
                         
@@ -257,6 +305,9 @@ class TradingBot:
                         else:
                             state.initial_breakout_high = df['high'].max()
                             state.reentry_qty = qty
+                            
+        # 사이클 종료 후 상태 저장
+        self.save_states()
 
     async def start(self):
         """비동기 스케줄러: 즉시 매수 처리를 위해 주기를 10초로 단축"""
@@ -264,6 +315,8 @@ class TradingBot:
         logger.info(" 🚀 [WMA 15분봉 골든크로스 지지돌파 봇] 시작")
         logger.info(" 전략: 일봉 WMA50 스캐닝 -> 15분봉 지지/돌파 매수 -> 정배열 전고점 전량 익절")
         logger.info("="*50)
+        
+        self.load_states()
         
         self.ws_client = KiwoomWebSocketClient(
             target_condition_name=self.condition_name,

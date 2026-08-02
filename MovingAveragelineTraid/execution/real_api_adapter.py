@@ -43,8 +43,9 @@ class RealAPIAdapter:
         """실제 예수금 조회"""
         try:
             return self.real_client.get_cash_balance()
-        except:
-            return 10000000.0
+        except Exception as e:
+            logger.error(f"예수금 조회 에러: {e}")
+            return 0.0
 
     def get_1m_candles(self, stock_code: str) -> pd.DataFrame:
         """실전 1분봉 데이터를 가져와서 trading_bot이 쓰는 Pandas DataFrame으로 변환"""
@@ -61,17 +62,16 @@ class RealAPIAdapter:
             df.columns = [col.lower() for col in df.columns]
             
             if 'time' in df.columns:
-                # time 필드가 문자열 "090000" 형태라면 datetime으로 보정 시도
-                # Pandas 연산을 위해 일단 index로 세팅
+                df['time'] = pd.to_datetime(df['time'], errors='coerce')
                 df.set_index('time', inplace=True)
+                df.sort_index(inplace=True)
                 
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                     
-            # 최신 데이터가 아래(뒤)로 오도록 정렬 보정
-            if len(df) > 1 and df['close'].iloc[0] == raw_candles[0].get('close'): # (일반적으로 과거가 먼저옴)
-                pass 
+            if 'date' in df.columns:
+                df.drop(columns=['date'], inplace=True)
                 
             return df
         except Exception as e:
@@ -111,7 +111,8 @@ class RealAPIAdapter:
     def get_tick_data(self, stock_code: str) -> list:
         try:
             return self.real_client.get_tick_data(stock_code, tick_unit="1", limit=30)
-        except:
+        except Exception as e:
+            logger.error(f"틱 데이터 조회 에러 ({stock_code}): {e}")
             return []
 
     def calculate_momentum(self, stock_code: str) -> float:
@@ -139,7 +140,8 @@ class RealAPIAdapter:
             try:
                 recent_low = min(float(t.get('price', t.get('close', sma20_price))) for t in ticks)
                 target_price = max(recent_low * 0.99, sma20_price)
-            except:
+            except Exception as e:
+                logger.error(f"안전마진 매수호가 산출 에러: {e}")
                 pass
         tick_size = self.get_tick_size(target_price)
         return float((int(target_price) // tick_size) * tick_size)
@@ -162,7 +164,7 @@ class RealAPIAdapter:
         try:
             holdings = self.real_client.get_holdings()
             for h in holdings:
-                code = h.get('code', '').replace('A', '')
+                code = h.get('code', '').lstrip('A')
                 if code:
                     holdings_dict[code] = {
                         'qty': int(h.get('quantity', h.get('qty', 0))),
@@ -178,7 +180,8 @@ class RealAPIAdapter:
             unfilled = self.real_client.get_unfilled_orders()
             # 봇은 [{'stock_code': code}] 형태를 기대하므로 맞춰줌
             return [{'stock_code': u.get('code')} for u in unfilled]
-        except:
+        except Exception as e:
+            logger.error(f"미체결 주문 목록 조회 에러: {e}")
             return []
 
     def cancel_order(self, order_no: str, stock_code: str, qty: int):
@@ -190,6 +193,7 @@ class RealAPIAdapter:
     def get_stock_name(self, stock_code: str) -> str:
         try:
             return self.real_client.get_stock_name(stock_code)
-        except:
+        except Exception as e:
+            logger.error(f"종목명 조회 에러 ({stock_code}): {e}")
             return f"Stock_{stock_code}"
 
