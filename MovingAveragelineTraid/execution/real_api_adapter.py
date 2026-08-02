@@ -61,6 +61,9 @@ class RealAPIAdapter:
             # 키움 실전 API 반환값에 맞춰 컬럼명을 소문자로 통일하고 형변환
             df.columns = [col.lower() for col in df.columns]
             
+            # 최신순(미래->과거)으로 오는 데이터를 과거->현재순으로 뒤집기
+            df = df.iloc[::-1].reset_index(drop=True)
+            
             if 'time' in df.columns:
                 df['time'] = pd.to_datetime(df['time'], errors='coerce')
                 df.set_index('time', inplace=True)
@@ -88,6 +91,9 @@ class RealAPIAdapter:
                 
             df = pd.DataFrame(raw_candles)
             df.columns = [col.lower() for col in df.columns]
+            
+            # 최신순(미래->과거)으로 오는 데이터를 과거->현재순으로 뒤집기
+            df = df.iloc[::-1].reset_index(drop=True)
             
             if 'time' in df.columns:
                 # 키움 API: "2026-08-01 09:15:00" 형태 문자열 → datetime 변환

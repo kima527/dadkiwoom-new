@@ -257,7 +257,9 @@ def analyze_single(
     is_aligned = (df['SMA5'] > df['SMA20']) & (df['SMA20'] > df['SMA60'])
     
     # K: 정배열일 때의 종가. 정배열이 아닐 때는 이전 K값 유지 (ffill)
-    df['_K_Raw'] = np.where(is_aligned, df['Close'], np.nan)
+    # [수정] 종가(Close) 대신 고가(High)의 3일 이동평균을 사용하여 자잘한 음봉 휩쏘를 제거
+    df['Smooth_High'] = df['High'].rolling(window=3, min_periods=1).mean()
+    df['_K_Raw'] = np.where(is_aligned, df['Smooth_High'], np.nan)
     df['K'] = df['_K_Raw'].ffill()
 
     # K(1), K(2) - 과거 K값
@@ -272,7 +274,7 @@ def analyze_single(
     df['Sell_Target'] = df['_Sell_Target_Raw'].ffill()
 
     # 임시 컬럼 삭제
-    df.drop(columns=['SMA5', 'SMA20', 'SMA60', '_K_Raw', 'K', '_Sell_Target_Raw'], inplace=True)
+    df.drop(columns=['SMA5', 'SMA20', 'SMA60', 'Smooth_High', '_K_Raw', 'K', '_Sell_Target_Raw'], inplace=True)
 
     # ==================================================================
     # Step 6: 최종 매수 타점 결합

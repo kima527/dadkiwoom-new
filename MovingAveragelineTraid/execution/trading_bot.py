@@ -80,7 +80,8 @@ class TradingBot:
         for order_no, info in list(self.tracked_orders.items()):
             if current_time - info['time'] > 180:
                 logger.info(f"⏳ 3분 경과! 미체결 주문 자동 취소 진행 (종목: {info['code']})")
-                await asyncio.to_thread(self.client.cancel_order, order_no, info['code'], info['qty'])
+                async with self.api_lock:
+                    await asyncio.to_thread(self.client.cancel_order, order_no, info['code'], info['qty'])
                 del self.tracked_orders[order_no]
                 
                 # 미체결 취소 시 상태 리셋
@@ -198,7 +199,8 @@ class TradingBot:
                 qty_sell = hold_info if isinstance(hold_info, int) else hold_info.get('qty', 1)
                 
                 logger.info(f"🔴 [{name}] 매도 신호! 사유: {sell_reason}")
-                order_no = await asyncio.to_thread(self.client.place_sell_order, code, qty_sell, price=0, order_type="03")  # 시장가 매도
+                async with self.api_lock:
+                    order_no = await asyncio.to_thread(self.client.place_sell_order, code, qty_sell, price=0, order_type="03")  # 시장가 매도
                 if order_no:
                     self.tracked_orders[order_no] = {'code': code, 'qty': qty_sell, 'time': time.time(), 'order_type': 'sell'}
                 
@@ -216,9 +218,10 @@ class TradingBot:
                 
                 logger.info(f"🔵 [{name}] 추가매수 신호! 사유: {add_buy_reason} | 목표가: {limit_price:,}원 x {qty}주")
                 
-                order_no = await asyncio.to_thread(
-                    self.client.place_buy_order, code, qty, price=limit_price, order_type="00"
-                )
+                async with self.api_lock:
+                    order_no = await asyncio.to_thread(
+                        self.client.place_buy_order, code, qty, price=limit_price, order_type="00"
+                    )
                 if order_no:
                     self.tracked_orders[order_no] = {
                         'code': code,
@@ -292,7 +295,8 @@ class TradingBot:
                 qty = int(buy_amount // price_limit) if price_limit > 0 else 0
                 
                 if qty > 0:
-                    order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty, price=price_limit, order_type="00")
+                    async with self.api_lock:
+                        order_no = await asyncio.to_thread(self.client.place_buy_order, code, qty, price=price_limit, order_type="00")
                     if order_no:
                         self.tracked_orders[order_no] = {'code': code, 'qty': qty, 'time': time.time(), 'order_type': 'buy_1'}
                         logger.info(f"✅ [{name}] 매수 대기: {price_limit}원 x {qty}주 (주문번호: {order_no})")
