@@ -30,6 +30,11 @@ class TradeState:
         self.reentry_qty = 0
         self.sell_target = 0.0
         self.stop_loss = 0.0
+        # ── 분할매수 봇용 ──
+        self.buy_step = 0           # 0: 미매수, 1: 1차(50%) 매수 완료, 2: 2차(50%) 매수 완료
+        self.tema_sl_price = 0.0    # TEMA 기반 손절가
+        self.signal_1 = 0.0         # WMA 골든크로스 시점 WMA5 값
+        self.signal_2 = 0.0         # WMA 골든크로스 시점 고가(HH)
 
     def to_dict(self) -> dict:
         return {
@@ -44,6 +49,10 @@ class TradeState:
             'reentry_qty': self.reentry_qty,
             'sell_target': getattr(self, 'sell_target', 0.0),
             'stop_loss': getattr(self, 'stop_loss', 0.0),
+            'buy_step': getattr(self, 'buy_step', 0),
+            'tema_sl_price': getattr(self, 'tema_sl_price', 0.0),
+            'signal_1': getattr(self, 'signal_1', 0.0),
+            'signal_2': getattr(self, 'signal_2', 0.0),
         }
 
     @classmethod
@@ -61,6 +70,10 @@ class TradeState:
         state.reentry_qty = data.get('reentry_qty', 0)
         state.sell_target = data.get('sell_target', 0.0)
         state.stop_loss = data.get('stop_loss', 0.0)
+        state.buy_step = data.get('buy_step', 0)
+        state.tema_sl_price = data.get('tema_sl_price', 0.0)
+        state.signal_1 = data.get('signal_1', 0.0)
+        state.signal_2 = data.get('signal_2', 0.0)
         return state
 
 def calculate_trade_intensity(tick_data: list) -> dict:

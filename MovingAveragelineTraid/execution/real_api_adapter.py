@@ -114,6 +114,53 @@ class RealAPIAdapter:
             logger.error(f"15분봉 변환 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
+    def _convert_raw_candles_to_df(self, raw_candles: list, stock_code: str, label: str) -> pd.DataFrame:
+        """분봉 데이터(dict 리스트)를 DataFrame으로 변환하는 공통 메서드"""
+        try:
+            if not raw_candles:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(raw_candles)
+            df.columns = [col.lower() for col in df.columns]
+
+            # 최신순(미래->과거) → 과거->현재 순으로 뒤집기
+            df = df.iloc[::-1].reset_index(drop=True)
+
+            if 'time' in df.columns:
+                df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                df.set_index('time', inplace=True)
+                df.sort_index(inplace=True)
+
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            if 'date' in df.columns:
+                df.drop(columns=['date'], inplace=True)
+
+            return df
+        except Exception as e:
+            logger.error(f"{label} 변환 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
+    def get_5m_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 5분봉 데이터를 가져와서 Pandas DataFrame으로 변환"""
+        try:
+            raw_candles = self.real_client.get_5min_candles(stock_code, last_n_days=3)
+            return self._convert_raw_candles_to_df(raw_candles, stock_code, "5분봉")
+        except Exception as e:
+            logger.error(f"5분봉 조회 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
+    def get_3m_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 3분봉 데이터를 가져와서 Pandas DataFrame으로 변환"""
+        try:
+            raw_candles = self.real_client.get_3min_candles(stock_code, last_n_days=2)
+            return self._convert_raw_candles_to_df(raw_candles, stock_code, "3분봉")
+        except Exception as e:
+            logger.error(f"3분봉 조회 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
     def get_tick_data(self, stock_code: str) -> list:
         try:
             return self.real_client.get_tick_data(stock_code, tick_unit="1", limit=30)
