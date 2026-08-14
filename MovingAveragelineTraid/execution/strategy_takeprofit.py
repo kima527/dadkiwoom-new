@@ -60,16 +60,30 @@ def analyze_takeprofit_signals(df: pd.DataFrame, buy_price: float = 0.0) -> dict
     df['sma5'] = df['close'].rolling(window=5, min_periods=1).mean()
     df['sma20'] = df['close'].rolling(window=20, min_periods=1).mean()
 
-    # ── 데드크로스 감지: CrossDown(SMA5, SMA20) ──
+    # ── RSI(14) 계산 (Wilder's Smoothing) ──
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # ── 감지 로직: 데드크로스 및 RSI 70 하향 이탈 ──
     df['dead_cross'] = (
         (df['sma5'] < df['sma20']) &
         (df['sma5'].shift(1) >= df['sma20'].shift(1))
+    )
+    df['rsi_cross_down'] = (
+        (df['rsi'] < 70) &
+        (df['rsi'].shift(1) >= 70)
     )
 
     latest = df.iloc[-1]
     close_price = float(latest['close'])
     sma5_now = float(latest['sma5']) if pd.notna(latest['sma5']) else 0.0
     sma20_now = float(latest['sma20']) if pd.notna(latest['sma20']) else 0.0
+    rsi_now = float(latest['rsi']) if pd.notna(latest['rsi']) else 0.0
 
     # 수익률 계산
     profit_pct = 0.0
@@ -81,27 +95,40 @@ def analyze_takeprofit_signals(df: pd.DataFrame, buy_price: float = 0.0) -> dict
         "reason": "",
         "sma5": sma5_now,
         "sma20": sma20_now,
+        "rsi": rsi_now,
         "profit_pct": round(profit_pct, 2)
     }
 
     # ── 수익실현 판단 ──
-    # 3분봉 SMA5 < SMA20 데드크로스 발생 + 수익 중
     is_dead_cross = bool(latest['dead_cross']) if pd.notna(latest['dead_cross']) else False
+    is_rsi_exit = bool(latest['rsi_cross_down']) if pd.notna(latest['rsi_cross_down']) else False
 
-    if is_dead_cross:
+    if is_dead_cross or is_rsi_exit:
         if buy_price > 0 and close_price > buy_price:
             # 수익 중일 때만 익절
             result["sell"] = True
-            result["reason"] = (
-                f"3분봉 SMA5({sma5_now:,.0f})<SMA20({sma20_now:,.0f}) 데드크로스 발생, "
-                f"수익률 +{profit_pct:.1f}% 수익실현"
-            )
+            if is_rsi_exit:
+                result["reason"] = (
+                    f"RSI({rsi_now:.1f}) 과매수권(70) 하향 이탈 발생, "
+                    f"수익률 +{profit_pct:.1f}% 수익실현"
+                )
+            else:
+                result["reason"] = (
+                    f"3분봉 SMA5({sma5_now:,.0f})<SMA20({sma20_now:,.0f}) 데드크로스 발생, "
+                    f"수익률 +{profit_pct:.1f}% 수익실현"
+                )
         elif buy_price <= 0:
-            # 매입단가 정보 없으면 데드크로스만으로도 신호 발생 (안전 우선)
+            # 매입단가 정보 없으면 신호만으로도 발생 (안전 우선)
             result["sell"] = True
-            result["reason"] = (
-                f"3분봉 SMA5({sma5_now:,.0f})<SMA20({sma20_now:,.0f}) 데드크로스 발생 "
-                f"(매입단가 미확인, 안전 매도)"
-            )
+            if is_rsi_exit:
+                result["reason"] = (
+                    f"RSI({rsi_now:.1f}) 과매수권(70) 하향 이탈 발생 "
+                    f"(매입단가 미확인, 안전 매도)"
+                )
+            else:
+                result["reason"] = (
+                    f"3분봉 SMA5({sma5_now:,.0f})<SMA20({sma20_now:,.0f}) 데드크로스 발생 "
+                    f"(매입단가 미확인, 안전 매도)"
+                )
 
     return result

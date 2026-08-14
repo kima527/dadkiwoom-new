@@ -129,10 +129,10 @@ class BuyManager:
             # ── 1차 매수 (50%): 아직 매수하지 않은 상태 ──
             if state.buy_step == 0 and signals.get('buy_1'):
                 buy_price = signals['close']
-                half_amount = self.buy_amount // 2  # 50%
                 tick = get_tick_size(int(buy_price))
                 price_limit = int((int(buy_price) // tick) * tick)
-                qty = int(half_amount // price_limit) if price_limit > 0 else 0
+                # 테스트 모드: 금액 상관없이 무조건 1주 매수 (1차)
+                qty = 1
 
                 if qty > 0:
                     # ★ 매수 진입 시점에 TEMA 손절가를 한 번 계산하여 고정
@@ -188,10 +188,10 @@ class BuyManager:
                 # 고정된 signal_2를 0.3% 초과 강하게 돌파 (이전 봉은 이하, 현재 봉은 초과)
                 if close_price > state.signal_2 * 1.003 and prev_close <= state.signal_2:
                     buy_price = close_price
-                half_amount = self.buy_amount // 2  # 나머지 50%
                 tick = get_tick_size(int(buy_price))
                 price_limit = int((int(buy_price) // tick) * tick)
-                qty = int(half_amount // price_limit) if price_limit > 0 else 0
+                # 테스트 모드: 금액 상관없이 무조건 1주 매수 (2차)
+                qty = 1
 
                 if qty > 0:
                     logger.info(
