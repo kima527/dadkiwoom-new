@@ -1,21 +1,23 @@
 """
-trading_bot.py - 5분봉 분할매수 + TEMA 손절 + 3분봉 익절 통합 봇
+trading_bot.py - 30분봉 WMA 골든크로스 고가(HH) 돌파 매수 + WMA 데드크로스 매도 봇
 ===========================================================================
 
 구조:
-  1. BuyManager     - 5분봉 WMA 골든크로스 기반 분할매수 (50% + 50%)
-  2. StopLossManager - 5분봉 TEMA 기반 손절 (손절가 하향 이탈 시 전량 매도)
-  3. TakeProfitManager - 3분봉 SMA 데드크로스 기반 수익실현
+  1. BuyManager  - 30분봉 WMA5/WMA20 골든크로스 시점 고가(HH) 돌파 매수
+  2. SellManager - 30분봉 WMA5/WMA40 데드크로스 매도
 
-각 매니저는 독립적으로 활성화/비활성화할 수 있으며,
-하나의 프로세스 내에서 공유 상태(TradeState)와 API Lock을 통해 안전하게 동작합니다.
+전략 요약:
+  - 매수: 조건검색식 편입 종목 → 30분봉 WMA5가 WMA20 골든크로스 → 그 시점 고가(HH) 저장
+         → 현재가가 HH 돌파 시 매수 (종목당 30만원)
+  - 매도: 30분봉 WMA5가 WMA40 데드크로스 시 전량 시장가 매도
+  - 오버나잇 허용, 매매 시간 제한 없음
+  - 최대 30종목 보유 가능
 
 실행 방법:
-  python trading_bot.py                          # 전체 임무 실행
-  python trading_bot.py --task buy                # 매수 봇만 실행
-  python trading_bot.py --task stoploss           # 손절 봇만 실행
-  python trading_bot.py --task takeprofit         # 수익실현 봇만 실행
-  python trading_bot.py --task buy stoploss       # 매수 + 손절만 실행
+  python trading_bot.py                      # 전체 임무 실행
+  python trading_bot.py --task buy           # 매수 봇만 실행
+  python trading_bot.py --task sell          # 매도 봇만 실행
+  python trading_bot.py --task buy sell      # 매수 + 매도 실행
 """
 
 import os
@@ -28,8 +30,7 @@ import argparse
 from real_api_adapter import RealAPIAdapter
 from utils import TradeState, get_tick_size
 from strategy_buy import analyze_buy_signals
-from strategy_stoploss import analyze_stoploss_signals, get_tema_stoploss_price
-from strategy_takeprofit import analyze_takeprofit_signals
+from strategy_sell import analyze_sell_signals
 from datetime import datetime, time as dtime
 
 # real trading 폴더의 websocket_client를 가져오기 위한 경로 추가
@@ -44,69 +45,51 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# BuyManager - 5분봉 WMA 골든크로스 분할매수
+# BuyManager - 30분봉 SMA 골든크로스 고가(HH) 돌파 매수
 # ═══════════════════════════════════════════════════════════════
 class BuyManager:
     """
-    5분봉 WMA5/WMA20 골든크로스 기반 분할매수 매니저
+    30분봉 WMA5/WMA20 골든크로스 시점의 고가(HH)를 저장하고,
+    현재 종가가 HH를 상향 돌파할 때 종목당 30만원 매수.
 
-    매수 1차 (50%): 골든크로스 발생 시점의 WMA5 값(Signal_1) 이상에서 매수
-    매수 2차 (50%): 골든크로스 발생 시점의 고가(Signal_2)를 강하게 돌파 시 매수
+    최대 30종목까지 보유 가능.
     """
 
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
                  trade_states: dict, tracked_orders: dict, watchlist: dict,
-                 buy_amount: int = 2500000):
+                 buy_amount: int = 300000, max_positions: int = 30):
         self.client = client
         self.api_lock = api_lock
         self.trade_states = trade_states
         self.tracked_orders = tracked_orders
         self.watchlist = watchlist
-        self.buy_amount = buy_amount  # 총 매수 금액 (1차+2차 합산)
+        self.buy_amount = buy_amount      # 종목당 매수 금액
+        self.max_positions = max_positions  # 최대 보유 종목 수
 
     async def run(self, holdings: dict, unexecuted: list):
         """매수 감시 사이클 실행"""
-        now = datetime.now().time()
 
-        # 10시 이후에는 재돌파(sold_once) 종목만 허용
-        is_after_10am = now >= dtime(10, 0)
-
-        # 보유 종목 수 제한 (4개)
+        # 보유 종목 수 제한 (30개)
         pending_buy_codes = {
             o['code'] for o in self.tracked_orders.values()
             if str(o.get('order_type', '')).startswith('buy')
         }
         total_positions = len(holdings) + len(pending_buy_codes)
-        if total_positions >= 4:
+        if total_positions >= self.max_positions:
             logger.info(
-                f"⚠️ 최대 보유 종목 수(4개)에 도달. "
+                f"⚠️ 최대 보유 종목 수({self.max_positions}개)에 도달. "
                 f"(보유: {len(holdings)}개, 매수대기: {len(pending_buy_codes)}개) "
                 f"신규 매수 탐색 스킵."
             )
             return
 
         for code, state in list(self.trade_states.items()):
-            # 이미 2차까지 매수 완료한 종목은 스킵
-            if state.buy_step >= 2 or state.trade_ended:
+            # 이미 매수 완료한 종목은 스킵
+            if state.buy_step >= 1 or state.trade_ended:
                 continue
 
-            # 이미 보유 중인데 buy_step이 0이면 → 이전 버전 복구 상태
-            if state.is_holding and state.buy_step == 0:
-                state.buy_step = 2  # 이전 버전에서 이미 매수 완료로 간주
-                continue
-
-            # 10시 이후: sold_once가 아닌 순수 신규 종목은 스킵
-            if is_after_10am and not state.sold_once and state.buy_step == 0:
-                continue
-
-            # watchlist에서 이탈한 종목은, 재돌파 대기 중이 아니면 스킵
-            if code not in self.watchlist and not state.sold_once:
-                continue
-
-            # 이미 보유 중이고 1차까지만 완료 → 2차 매수만 시도
-            # 미보유 상태 → 1차 매수 시도
-            if state.buy_step == 1 and code not in holdings:
-                # 1차 매수 주문 완료했는데 아직 체결 안 된 상태 → 스킵
+            # watchlist에서 이탈한 종목은 스킵
+            if code not in self.watchlist:
                 continue
 
             # 중복 주문 방지
@@ -116,38 +99,42 @@ class BuyManager:
 
             name = self.watchlist.get(code, {}).get('name', code)
 
-            # 5분봉 데이터 조회
+            # 30분봉 데이터 조회
             async with self.api_lock:
-                df_5m = await asyncio.to_thread(self.client.get_5m_candles, code)
+                df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
                 await asyncio.sleep(0.25)
 
-            if df_5m is None or df_5m.empty or len(df_5m) < 25:
+            if df_30m is None or df_30m.empty or len(df_30m) < 25:
                 continue
 
-            signals = analyze_buy_signals(df_5m)
+            signals = analyze_buy_signals(df_30m)
 
-            # ── 1차 매수 (50%): 아직 매수하지 않은 상태 ──
-            if state.buy_step == 0 and signals.get('buy_1'):
+            # ── 매수: HH 돌파 시 매수 ──
+            if signals.get('buy'):
+                # ── 가속도(체결 강도) 확인 ──
+                async with self.api_lock:
+                    tick_data = await asyncio.to_thread(self.client.get_tick_data, code)
+                    await asyncio.sleep(0.1)
+                
+                from utils import calculate_trade_intensity
+                intensity = calculate_trade_intensity(tick_data)
+                
+                if not intensity['is_strong']:
+                    logger.info(
+                        f"⏳ [{name}] 돌파 확인되나 가속도 부족으로 매수 보류 "
+                        f"(매수/매도 비율: {intensity['ratio']:.2f}, 기준: 1.5 이상)"
+                    )
+                    continue
+
                 buy_price = signals['close']
                 tick = get_tick_size(int(buy_price))
                 price_limit = int((int(buy_price) // tick) * tick)
-                # 테스트 모드: 금액 상관없이 무조건 1주 매수 (1차)
-                qty = 1
+                qty = self.buy_amount // int(buy_price)
 
                 if qty > 0:
-                    # ★ 매수 진입 시점에 TEMA 손절가를 한 번 계산하여 고정
-                    tema_sl = get_tema_stoploss_price(df_5m)
-                    if tema_sl <= 0:
-                        # TEMA 크로스가 아직 없으면 현재가 -5% 를 기본 손절로 설정
-                        tema_sl = buy_price * 0.95
-                        logger.warning(
-                            f"⚠️ [{name}] TEMA 크로스 미발생, "
-                            f"기본 손절가({tema_sl:,.0f}) 적용"
-                        )
-
                     logger.info(
-                        f"🟢 [{name}] 1차 매수 신호 (50%)! {signals['reason']} "
-                        f"| 손절선(고정): {tema_sl:,.0f}"
+                        f"🟢 [{name}] 매수 신호! {signals['reason']} "
+                        f"| HH: {signals['hh']:,.0f} | 체결비율: {intensity['ratio']:.2f}"
                     )
                     async with self.api_lock:
                         order_no = await asyncio.to_thread(
@@ -157,74 +144,26 @@ class BuyManager:
                     if order_no:
                         self.tracked_orders[order_no] = {
                             'code': code, 'qty': qty,
-                            'time': time.time(), 'order_type': 'buy_1'
+                            'time': time.time(), 'order_type': 'buy'
                         }
-                        state.first_qty = qty
-                        state.first_buy_candle_time = df_5m.index[-1]
                         state.buy_step = 1
-                        state.signal_1 = signals['signal_1']
-                        state.signal_2 = signals['signal_2']
-                        state.tema_sl_price = tema_sl  # ★ 진입 시점 손절가 고정
+                        state.first_qty = qty
+                        state.first_buy_candle_time = df_30m.index[-1]
+                        state.signal_1 = signals['hh']  # HH 값 저장
                         logger.info(
-                            f"✅ [{name}] 1차 매수 대기: "
-                            f"{price_limit:,}원 x {qty}주 (주문번호: {order_no})"
-                        )
-
-            # ── 2차 매수 (50%): 1차 매수 진입 시점에 고정된 Signal_2(HH) 강하게 돌파 시 ──
-            elif state.buy_step == 1:
-                # 1차 매수가 체결되었는지 확인 (보유 중이어야 함)
-                if code not in holdings:
-                    continue
-
-                if state.signal_2 <= 0:
-                    continue
-
-                latest = df_5m.iloc[-1]
-                prev = df_5m.iloc[-2] if len(df_5m) >= 2 else latest
-                
-                close_price = float(latest['close'])
-                prev_close = float(prev['close']) if pd.notna(prev['close']) else 0.0
-
-                # 고정된 signal_2를 0.3% 초과 강하게 돌파 (이전 봉은 이하, 현재 봉은 초과)
-                if close_price > state.signal_2 * 1.003 and prev_close <= state.signal_2:
-                    buy_price = close_price
-                tick = get_tick_size(int(buy_price))
-                price_limit = int((int(buy_price) // tick) * tick)
-                # 테스트 모드: 금액 상관없이 무조건 1주 매수 (2차)
-                qty = 1
-
-                if qty > 0:
-                    logger.info(
-                        f"🔵 [{name}] 2차 매수 신호 (50%)! {signals['reason']}"
-                    )
-                    async with self.api_lock:
-                        order_no = await asyncio.to_thread(
-                            self.client.place_buy_order, code, qty,
-                            price=price_limit, order_type="00"
-                        )
-                    if order_no:
-                        self.tracked_orders[order_no] = {
-                            'code': code, 'qty': qty,
-                            'time': time.time(), 'order_type': 'buy_2'
-                        }
-                        state.buy_step = 2
-                        state.added_on = True
-                        logger.info(
-                            f"✅ [{name}] 2차 매수 대기: "
-                            f"{price_limit:,}원 x {qty}주 (주문번호: {order_no})"
+                            f"✅ [{name}] 매수 주문 전송: "
+                            f"{price_limit:,}원 x {qty}주 = "
+                            f"{price_limit * qty:,}원 (주문번호: {order_no})"
                         )
 
 
 # ═══════════════════════════════════════════════════════════════
-# StopLossManager - 매수 진입 시 고정된 TEMA 손절가 기반 손절
+# SellManager - 30분봉 SMA5/SMA40 데드크로스 매도
 # ═══════════════════════════════════════════════════════════════
-class StopLossManager:
+class SellManager:
     """
-    매수 진입 시점에 BuyManager가 계산한 TEMA 손절가(state.tema_sl_price)를
-    기준으로 현재가가 하향 이탈하면 전량 시장가 매도.
-
-    ★ TEMA는 매 사이클마다 재계산하지 않음 → 진입 시 고정된 값만 사용.
-    ★ 봇 재시작 등으로 tema_sl_price가 0인 경우에만 복구용으로 재계산.
+    30분봉 WMA5가 WMA40을 데드크로스할 때 전량 시장가 매도.
+    수익/손실 여부 무관. 오버나잇 허용.
     """
 
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
@@ -236,7 +175,7 @@ class StopLossManager:
         self.watchlist = watchlist
 
     async def run(self, holdings: dict):
-        """손절 감시 사이클 실행 (보유 종목만 대상)"""
+        """매도 감시 사이클 실행 (보유 종목만 대상)"""
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
             if not state or not state.is_holding:
@@ -252,120 +191,40 @@ class StopLossManager:
 
             name = self.watchlist.get(code, {}).get('name', code)
 
-            # ★ 진입 시 고정된 손절가가 없으면 복구용으로 한 번만 계산
-            if state.tema_sl_price <= 0:
-                async with self.api_lock:
-                    df_5m = await asyncio.to_thread(self.client.get_5m_candles, code)
-                    await asyncio.sleep(0.25)
-                if df_5m is not None and not df_5m.empty and len(df_5m) >= 25:
-                    recovered_sl = get_tema_stoploss_price(df_5m)
-                    if recovered_sl > 0:
-                        state.tema_sl_price = recovered_sl
-                        logger.info(
-                            f"🔄 [{name}] 손절가 복구 완료: {recovered_sl:,.0f}"
-                        )
-                    else:
-                        # TEMA 크로스 자체가 없는 경우 매입가 -5% 기본 손절
-                        hold_info = holdings[code]
-                        buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
-                        if buy_price > 0:
-                            state.tema_sl_price = buy_price * 0.95
-                            logger.warning(
-                                f"⚠️ [{name}] TEMA 크로스 미발생, "
-                                f"매입가 기준 -5% 손절가({state.tema_sl_price:,.0f}) 적용"
-                            )
-                continue  # 복구한 사이클에서는 바로 적용하지 않고 다음 사이클에서 판단
-
-            # ★ 현재가 조회 (5분봉 최신 종가)
+            # 30분봉 데이터 조회
             async with self.api_lock:
-                df_5m = await asyncio.to_thread(self.client.get_5m_candles, code)
+                df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
                 await asyncio.sleep(0.25)
 
-            if df_5m is None or df_5m.empty:
+            if df_30m is None or df_30m.empty or len(df_30m) < 45:
                 continue
 
-            # 컬럼명 소문자 통일
-            col_map = {c: c.lower() for c in df_5m.columns if c.lower() in ('close',)}
-            df_5m.rename(columns=col_map, inplace=True)
-            close_price = float(df_5m.iloc[-1]['close'])
-
-            # ── 손절 판단: 현재가 < 진입 시 고정된 TEMA 손절가 ──
-            if close_price < state.tema_sl_price:
-                hold_info = holdings[code]
-                qty_sell = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
-
-                logger.info(
-                    f"🔴 [{name}] TEMA 손절 신호! "
-                    f"현재가({close_price:,.0f}) < 손절선({state.tema_sl_price:,.0f})"
-                )
-                async with self.api_lock:
-                    order_no = await asyncio.to_thread(
-                        self.client.place_sell_order, code, qty_sell,
-                        price=0, order_type="03"  # 시장가 매도
-                    )
-                if order_no:
-                    self.tracked_orders[order_no] = {
-                        'code': code, 'qty': qty_sell,
-                        'time': time.time(), 'order_type': 'sell'
-                    }
-                    state.sold_once = True
-                    logger.info(
-                        f"🚨 [{name}] 손절 매도 전송! "
-                        f"{qty_sell}주 시장가 매도 (주문번호: {order_no})"
-                    )
-
-
-# ═══════════════════════════════════════════════════════════════
-# TakeProfitManager - 3분봉 SMA 데드크로스 수익실현
-# ═══════════════════════════════════════════════════════════════
-class TakeProfitManager:
-    """
-    3분봉 SMA5가 SMA20을 데드크로스할 때,
-    현재가가 매입단가보다 높으면(수익 중) 전량 수익실현.
-    """
-
-    def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
-                 trade_states: dict, tracked_orders: dict, watchlist: dict):
-        self.client = client
-        self.api_lock = api_lock
-        self.trade_states = trade_states
-        self.tracked_orders = tracked_orders
-        self.watchlist = watchlist
-
-    async def run(self, holdings: dict):
-        """수익실현 감시 사이클 실행 (보유 종목만 대상)"""
-        for code in list(holdings.keys()):
-            state = self.trade_states.get(code)
-            if not state or not state.is_holding:
-                continue
-
-            # 이미 매도 주문이 진행 중이면 스킵
-            is_sell_pending = any(
-                o['code'] == code and o.get('order_type') == 'sell'
-                for o in self.tracked_orders.values()
-            )
-            if is_sell_pending:
-                continue
-
-            name = self.watchlist.get(code, {}).get('name', code)
+            signals = analyze_sell_signals(df_30m)
+            
+            latest_high = float(df_30m.iloc[-1]['high'])
+            close_price = float(df_30m.iloc[-1]['close'])
+            
             hold_info = holdings[code]
             buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
 
-            # 3분봉 데이터 조회
-            async with self.api_lock:
-                df_3m = await asyncio.to_thread(self.client.get_3m_candles, code)
-                await asyncio.sleep(0.25)
+            # ── 1. 트레일링 스탑을 위한 최고점(trailing_high) 갱신 ──
+            if state.trailing_high < buy_price:
+                state.trailing_high = buy_price
+            state.trailing_high = max(state.trailing_high, latest_high)
 
-            if df_3m is None or df_3m.empty or len(df_3m) < 25:
-                continue
+            # ── 2. 트레일링 스탑 (최고가 대비 -3% 하락) ──
+            if state.trailing_high > 0 and close_price <= state.trailing_high * 0.97:
+                signals['sell'] = True
+                signals['reason'] = (
+                    f"트레일링 스탑! 최고가({state.trailing_high:,.0f}) 대비 3% 하락 "
+                    f"(현재가 {close_price:,.0f})"
+                )
 
-            signals = analyze_takeprofit_signals(df_3m, buy_price=buy_price)
-
-            # ── 수익실현 신호: 3분봉 SMA 데드크로스 + 수익 중 ──
+            # ── 3. 매도 신호 (데드크로스 또는 트레일링 스탑) ──
             if signals.get('sell'):
                 qty_sell = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
 
-                logger.info(f"💰 [{name}] 수익실현 신호! {signals['reason']}")
+                logger.info(f"🔴 [{name}] 매도 신호! {signals['reason']}")
                 async with self.api_lock:
                     order_no = await asyncio.to_thread(
                         self.client.place_sell_order, code, qty_sell,
@@ -378,9 +237,8 @@ class TakeProfitManager:
                     }
                     state.sold_once = True
                     logger.info(
-                        f"✅ [{name}] 수익실현 매도 전송! "
-                        f"{qty_sell}주, 수익률 {signals.get('profit_pct', 0):.1f}% "
-                        f"(주문번호: {order_no})"
+                        f"✅ [{name}] 매도 주문 전송! "
+                        f"{qty_sell}주 시장가 매도 (주문번호: {order_no})"
                     )
 
 
@@ -389,8 +247,8 @@ class TakeProfitManager:
 # ═══════════════════════════════════════════════════════════════
 class TradingBot:
     def __init__(self, condition_name="Traiding",
-                 enable_buy=True, enable_stoploss=True, enable_takeprofit=True,
-                 buy_amount=2500000):
+                 enable_buy=True, enable_sell=True,
+                 buy_amount=300000, max_positions=30):
         self.client = RealAPIAdapter()
         self.condition_name = condition_name
         self.watchlist = {}
@@ -401,25 +259,19 @@ class TradingBot:
 
         # ── 임무 활성화 설정 ──
         self.enable_buy = enable_buy
-        self.enable_stoploss = enable_stoploss
-        self.enable_takeprofit = enable_takeprofit
+        self.enable_sell = enable_sell
 
         # ── 매니저 생성 ──
         self.buy_manager = BuyManager(
             self.client, self.api_lock,
             self.trade_states, self.tracked_orders, self.watchlist,
-            buy_amount=buy_amount
+            buy_amount=buy_amount, max_positions=max_positions
         ) if enable_buy else None
 
-        self.stoploss_manager = StopLossManager(
+        self.sell_manager = SellManager(
             self.client, self.api_lock,
             self.trade_states, self.tracked_orders, self.watchlist
-        ) if enable_stoploss else None
-
-        self.takeprofit_manager = TakeProfitManager(
-            self.client, self.api_lock,
-            self.trade_states, self.tracked_orders, self.watchlist
-        ) if enable_takeprofit else None
+        ) if enable_sell else None
 
     # ─────────────────────────────────────────────────
     # 조건검색 콜백
@@ -483,32 +335,21 @@ class TradingBot:
                 state = self.trade_states.get(info['code'])
                 if state:
                     order_type = info.get('order_type', 'buy')
-                    if order_type == 'buy_1':
-                        # 1차 매수 취소 → 다시 매수 가능 상태로 복귀
+                    if order_type == 'buy':
+                        # 매수 취소 → 다시 매수 가능 상태로 복귀
                         state.first_buy_candle_time = None
                         state.first_qty = 0
                         state.buy_step = 0
-                    elif order_type == 'buy_2':
-                        # 2차 매수 취소 → 2차 매수 재시도 가능
-                        state.buy_step = 1
 
     # ─────────────────────────────────────────────────
     # 메인 사이클
     # ─────────────────────────────────────────────────
     async def run_cycle(self):
-        now = datetime.now().time()
-
-        if now < dtime(9, 0):
-            logger.info("⏰ 장 시작 전입니다. 대기 중...")
-            return
-
         tasks_str = []
         if self.enable_buy:
             tasks_str.append("매수")
-        if self.enable_stoploss:
-            tasks_str.append("손절")
-        if self.enable_takeprofit:
-            tasks_str.append("익절")
+        if self.enable_sell:
+            tasks_str.append("매도")
 
         logger.info(
             f"🔄 [전략 감시 사이클] 감시 종목: {len(self.trade_states)}개 | "
@@ -545,10 +386,6 @@ class TradingBot:
                     state.is_holding = False
                     state.buy_step = 0  # 매도 완료 → 매수 단계 리셋
 
-        if now >= dtime(15, 20):
-            logger.info("⏰ 15:20 이후 - 신규 매수/매도 감시를 중단합니다.")
-            return
-
         # 5. 보유 종목 상태 동기화
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
@@ -570,28 +407,21 @@ class TradingBot:
                     )
                     state.is_holding = True
                     state.first_qty = sync_qty
-                    state.buy_step = 2  # 재시작 후에는 매수 완료로 간주
+                    state.buy_step = 1  # 재시작 후에는 매수 완료로 간주
                     state.added_on = True
 
         # ═══════════════════════════════════════════════════════════
         # 각 매니저별 감시 실행
         # ═══════════════════════════════════════════════════════════
 
-        # [손절 봇] - 최우선 실행 (손절이 가장 급함)
-        if self.stoploss_manager:
+        # [매도 봇] - 최우선 실행 (매도가 가장 급함)
+        if self.sell_manager:
             try:
-                await self.stoploss_manager.run(holdings)
+                await self.sell_manager.run(holdings)
             except Exception as e:
-                logger.error(f"❌ StopLossManager 에러: {e}")
+                logger.error(f"❌ SellManager 에러: {e}")
 
-        # [수익실현 봇] - 손절 다음으로 실행
-        if self.takeprofit_manager:
-            try:
-                await self.takeprofit_manager.run(holdings)
-            except Exception as e:
-                logger.error(f"❌ TakeProfitManager 에러: {e}")
-
-        # [매수 봇] - 매도 처리 후 마지막으로 실행
+        # [매수 봇] - 매도 처리 후 실행
         if self.buy_manager:
             try:
                 await self.buy_manager.run(holdings, unexecuted)
@@ -606,17 +436,16 @@ class TradingBot:
         tasks_str = []
         if self.enable_buy:
             tasks_str.append("매수")
-        if self.enable_stoploss:
-            tasks_str.append("손절")
-        if self.enable_takeprofit:
-            tasks_str.append("익절")
+        if self.enable_sell:
+            tasks_str.append("매도")
 
         logger.info("=" * 60)
-        logger.info(" 🚀 [5분봉 분할매수 + TEMA 손절 + 3분봉 익절 통합 봇] 시작")
+        logger.info(" 🚀 [30분봉 WMA 고가돌파 매수 + WMA 데드크로스 매도 봇] 시작")
         logger.info(f" 활성 임무: {', '.join(tasks_str)}")
-        logger.info(f" 전략: 5분봉 WMA 골든크로스 50/50 분할매수")
-        logger.info(f"       5분봉 TEMA(5,20) 0.95배 손절선")
-        logger.info(f"       3분봉 SMA(5,20) 데드크로스 수익실현")
+        logger.info(f" 전략: 30분봉 WMA(5,20) 골든크로스 고가(HH) 돌파 매수")
+        logger.info(f"       30분봉 WMA(5,40) 데드크로스 매도")
+        logger.info(f" 종목당 투자금: 300,000원 | 최대 30종목")
+        logger.info(f" 오버나잇: 허용 | 시간 제한: 없음")
         logger.info("=" * 60)
 
         self.load_states()
@@ -643,11 +472,11 @@ class TradingBot:
 # ═══════════════════════════════════════════════════════════════
 async def main():
     parser = argparse.ArgumentParser(
-        description="5분봉 분할매수 + TEMA 손절 + 3분봉 익절 통합 트레이딩 봇"
+        description="30분봉 WMA 고가돌파 매수 + WMA 데드크로스 매도 트레이딩 봇"
     )
     parser.add_argument(
         '--task', nargs='+',
-        choices=['buy', 'stoploss', 'takeprofit', 'all'],
+        choices=['buy', 'sell', 'all'],
         default=['all'],
         help="활성화할 임무 선택 (기본: all)"
     )
@@ -656,8 +485,12 @@ async def main():
         help="키움증권 조건검색식 이름 (기본: Traiding)"
     )
     parser.add_argument(
-        '--amount', type=int, default=2500000,
-        help="종목당 총 매수 금액 (기본: 2,500,000원, 1차+2차 합산)"
+        '--amount', type=int, default=300000,
+        help="종목당 매수 금액 (기본: 300,000원)"
+    )
+    parser.add_argument(
+        '--max-positions', type=int, default=30,
+        help="최대 보유 종목 수 (기본: 30)"
     )
 
     args = parser.parse_args()
@@ -666,19 +499,17 @@ async def main():
     tasks = set(args.task)
     if 'all' in tasks:
         enable_buy = True
-        enable_stoploss = True
-        enable_takeprofit = True
+        enable_sell = True
     else:
         enable_buy = 'buy' in tasks
-        enable_stoploss = 'stoploss' in tasks
-        enable_takeprofit = 'takeprofit' in tasks
+        enable_sell = 'sell' in tasks
 
     bot = TradingBot(
         condition_name=args.condition,
         enable_buy=enable_buy,
-        enable_stoploss=enable_stoploss,
-        enable_takeprofit=enable_takeprofit,
+        enable_sell=enable_sell,
         buy_amount=args.amount,
+        max_positions=args.max_positions,
     )
     await bot.start()
 

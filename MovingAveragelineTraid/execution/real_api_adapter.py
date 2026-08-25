@@ -161,6 +161,15 @@ class RealAPIAdapter:
             logger.error(f"3분봉 조회 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
+    def get_30m_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 30분봉 데이터를 가져와서 Pandas DataFrame으로 변환"""
+        try:
+            raw_candles = self.real_client.get_30min_candles(stock_code, last_n_days=14)
+            return self._convert_raw_candles_to_df(raw_candles, stock_code, "30분봉")
+        except Exception as e:
+            logger.error(f"30분봉 조회 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
     def get_tick_data(self, stock_code: str) -> list:
         try:
             return self.real_client.get_tick_data(stock_code, tick_unit="1", limit=30)
