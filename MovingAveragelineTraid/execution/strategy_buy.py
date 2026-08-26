@@ -93,14 +93,9 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame) -> dict:
         return result  # 완전히 꺾인 하락세
 
     # ─────────────────────────────────────────────────
-    # 2. 120틱 (미시 타점 계산: 근접도 & 골든크로스)
+    # 2. 120틱 (미시 타점 계산: 3이평/5이평 골든크로스)
     # ─────────────────────────────────────────────────
-    # M값 근접 확인: 120틱 차트의 최근 30개 틱 중 최저가가 M선의 +2% 이내로 들어온 적이 있는지 (눌림목 터치)
-    recent_lows = df120['low'].tail(30)
-    touched_support = any(recent_lows <= (M_val * 1.02))
-
-    if not touched_support:
-        return result  # 아직 지지선 부근까지 충분히 눌리지 않음 (허공에 떠 있음)
+    # 대표님 지시사항: 굳이 M선까지 빠지기를 기다리지 않고, 120틱 차트에서 올라가는 흐름이 보이면 바로 격발
 
     # 120틱 이평선 계산 (3이평, 5이평)
     df120['sma3'] = df120['close'].rolling(window=3, min_periods=1).mean()
