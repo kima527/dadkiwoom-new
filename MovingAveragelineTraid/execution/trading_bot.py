@@ -99,32 +99,24 @@ class BuyManager:
 
             name = self.watchlist.get(code, {}).get('name', code)
 
-            # 30분봉 데이터 조회
+            # 30분봉(거시) + 120틱(미시) 데이터 동시 조회
             async with self.api_lock:
                 df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.1)
+                df_120t = await asyncio.to_thread(self.client.get_120t_candles, code)
+                await asyncio.sleep(0.1)
 
-            if df_30m is None or df_30m.empty or len(df_30m) < 25:
+            if df_30m is None or df_30m.empty or df_120t is None or df_120t.empty:
                 continue
 
-            signals = analyze_buy_signals(df_30m)
+            signals = analyze_buy_signals(df_30m, df_120t)
 
             # ── 매수: HH 돌파 시 매수 ──
             if signals.get('buy'):
-                # ── 가속도(체결 강도) 확인 ──
+                # ── 가속도(체결 강도) 확인 (저점 매수이므로 검사 생략) ──
                 async with self.api_lock:
                     tick_data = await asyncio.to_thread(self.client.get_tick_data, code)
                     await asyncio.sleep(0.1)
-                
-                from utils import calculate_trade_intensity
-                intensity = calculate_trade_intensity(tick_data)
-                
-                if not intensity['is_strong']:
-                    logger.info(
-                        f"⏳ [{name}] 돌파 확인되나 가속도 부족으로 매수 보류 "
-                        f"(매수/매도 비율: {intensity['ratio']:.2f}, 기준: 1.5 이상)"
-                    )
-                    continue
 
                 buy_price = signals['close']
                 tick = get_tick_size(int(buy_price))
@@ -134,7 +126,7 @@ class BuyManager:
                 if qty > 0:
                     logger.info(
                         f"🟢 [{name}] 매수 신호! {signals['reason']} "
-                        f"| HH: {signals['hh']:,.0f} | 체결비율: {intensity['ratio']:.2f}"
+                        f"| LL: {signals['ll']:,.0f}"
                     )
                     async with self.api_lock:
                         order_no = await asyncio.to_thread(
@@ -149,7 +141,7 @@ class BuyManager:
                         state.buy_step = 1
                         state.first_qty = qty
                         state.first_buy_candle_time = df_30m.index[-1]
-                        state.signal_1 = signals['hh']  # HH 값 저장
+                        state.signal_1 = signals['ll']  # LL 값 저장
                         logger.info(
                             f"✅ [{name}] 매수 주문 전송: "
                             f"{price_limit:,}원 x {qty}주 = "
@@ -212,13 +204,13 @@ class SellManager:
                 state.trailing_high = buy_price
             state.trailing_high = max(state.trailing_high, latest_high)
 
-            # ── 2. 트레일링 스탑 (최고가 대비 -3% 하락) ──
-            if state.trailing_high > 0 and close_price <= state.trailing_high * 0.97:
-                signals['sell'] = True
-                signals['reason'] = (
-                    f"트레일링 스탑! 최고가({state.trailing_high:,.0f}) 대비 3% 하락 "
-                    f"(현재가 {close_price:,.0f})"
-                )
+            # ── 2. 트레일링 스탑 (최고가 대비 -3% 하락) - 오버나잇을 위해 비활성화 ──
+            # if state.trailing_high > 0 and close_price <= state.trailing_high * 0.97:
+            #     signals['sell'] = True
+            #     signals['reason'] = (
+            #         f"트레일링 스탑! 최고가({state.trailing_high:,.0f}) 대비 3% 하락 "
+            #         f"(현재가 {close_price:,.0f})"
+            #     )
 
             # ── 3. 매도 신호 (데드크로스 또는 트레일링 스탑) ──
             if signals.get('sell'):
@@ -282,6 +274,7 @@ class TradingBot:
             name = await asyncio.to_thread(self.client.get_stock_name, code)
             self.watchlist[code] = {'name': name, 'weight': 1.0}
             logger.info(f"✅ 관심종목 추가 완료: {name} ({code})")
+            self.save_watchlist()
 
             if code not in self.trade_states:
                 self.trade_states[code] = TradeState()
@@ -290,13 +283,32 @@ class TradingBot:
         logger.info(f"🔴 [조건검색 이탈] 종목코드: {code}")
         if code in self.watchlist:
             name = self.watchlist[code]['name']
-            del self.watchlist[code]
-            logger.info(f"❌ 관심종목 제거 완료: {name} ({code})")
+            # del self.watchlist[code] # 검색식 이탈 시 삭제하지 않고 영구 추적
+            logger.info(f"📌 관심종목 이탈 감지됨, 삭제 없이 계속 추적합니다: {name} ({code})")
 
     # ─────────────────────────────────────────────────
     # 상태 저장/로드
     # ─────────────────────────────────────────────────
+    def save_watchlist(self):
+        watch_file = os.path.join(os.path.dirname(__file__), "today_picks.json")
+        try:
+            with open(watch_file, 'w', encoding='utf-8') as f:
+                json.dump(self.watchlist, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.error(f"관심종목 저장 실패: {e}")
+
+    def load_watchlist(self):
+        watch_file = os.path.join(os.path.dirname(__file__), "today_picks.json")
+        if os.path.exists(watch_file):
+            try:
+                with open(watch_file, 'r', encoding='utf-8') as f:
+                    self.watchlist = json.load(f)
+                logger.info(f"📂 저장된 관심종목 리스트를 불러왔습니다. ({len(self.watchlist)}개 종목)")
+            except Exception as e:
+                logger.error(f"관심종목 로드 실패: {e}")
+
     def load_states(self):
+        self.load_watchlist()
         state_file = os.path.join(os.path.dirname(__file__), "trade_states.json")
         if os.path.exists(state_file):
             try:
@@ -309,6 +321,7 @@ class TradingBot:
                 logger.error(f"상태 정보 로드 실패: {e}")
 
     def save_states(self):
+        self.save_watchlist()
         state_file = os.path.join(os.path.dirname(__file__), "trade_states.json")
         try:
             data = {code: state.to_dict() for code, state in self.trade_states.items()}
@@ -351,11 +364,6 @@ class TradingBot:
         if self.enable_sell:
             tasks_str.append("매도")
 
-        logger.info(
-            f"🔄 [전략 감시 사이클] 감시 종목: {len(self.trade_states)}개 | "
-            f"활성 임무: {', '.join(tasks_str)}"
-        )
-
         # 1. 미체결 주문 관리
         await self.manage_unexecuted_orders()
 
@@ -384,7 +392,7 @@ class TradingBot:
                 if not is_sell_unexecuted:
                     logger.info(f"✅ 잔고 소진 확인 (매도 체결 완료): {code}")
                     state.is_holding = False
-                    state.buy_step = 0  # 매도 완료 → 매수 단계 리셋
+                    state.trade_ended = True  # 당일 재매수 금지 (무한 반복 매매 방지)
 
         # 5. 보유 종목 상태 동기화
         for code in list(holdings.keys()):
@@ -410,6 +418,14 @@ class TradingBot:
                     state.buy_step = 1  # 재시작 후에는 매수 완료로 간주
                     state.added_on = True
 
+        # 6. 매수 완료된 종목 관심종목에서 제외 (더 이상 매수 감시 안 함)
+        for code in list(self.watchlist.keys()):
+            state = self.trade_states.get(code)
+            if state and (state.is_holding or state.trade_ended):
+                name = self.watchlist[code]['name']
+                logger.info(f"🗑️ [관심종목 정리] 매수(또는 매매 완료)된 종목을 감시 리스트에서 삭제합니다: {name} ({code})")
+                del self.watchlist[code]
+
         # ═══════════════════════════════════════════════════════════
         # 각 매니저별 감시 실행
         # ═══════════════════════════════════════════════════════════
@@ -428,7 +444,7 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"❌ BuyManager 에러: {e}")
 
-        # 사이클 종료 후 상태 저장
+        # 사이클 종료 후 상태 저장 (이때 save_watchlist도 함께 호출됨)
         self.save_states()
 
     async def start(self):

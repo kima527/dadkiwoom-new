@@ -34,85 +34,88 @@ def wma(series: pd.Series, period: int) -> pd.Series:
     )
 
 
-# ═══════════════════════════════════════════════════════════════
-# 30분봉 매수 신호 분석
-# ═══════════════════════════════════════════════════════════════
-def analyze_buy_signals(df: pd.DataFrame) -> dict:
+def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame) -> dict:
     """
-    30분봉 DataFrame을 받아 WMA 골든크로스 고가(HH) 돌파 매수 신호를 생성합니다.
-
-    Returns
-    -------
-    dict:
-        hh        : float  - 골든크로스 시점의 고가 (매수 돌파 기준선)
-        buy       : bool   - 매수 신호 (종가가 HH를 상향 돌파)
-        close     : float  - 현재 종가
-        reason    : str    - 매수 사유 메시지
+    30분봉과 120틱 하이브리드 로직:
+    1. 30분봉에서 검정색 선(M) 지지 여부 확인 (a > M 또는 가격이 M 위에 위치)
+    2. 120틱 차트에서 가격이 M 부근(+2% 이내)으로 눌렸는지 확인
+    3. 120틱 차트에서 3일선이 5일선을 골든크로스 할 때 매수 (최저점 반등 확인)
     """
-    if df is None or df.empty or len(df) < 25:
-        return {"buy": False, "hh": 0.0, "close": 0.0, "reason": ""}
-
-    df = df.copy()
-
-    # 컬럼명 소문자 통일
-    col_map = {}
-    for col in df.columns:
-        lower = col.lower()
-        if lower in ('open', 'high', 'low', 'close', 'volume'):
-            col_map[col] = lower
-    df.rename(columns=col_map, inplace=True)
-
-    if 'close' not in df.columns or 'high' not in df.columns:
-        return {"buy": False, "hh": 0.0, "close": 0.0, "reason": ""}
-
-    # ── WMA 계산 ──
-    df['wma5'] = wma(df['close'], 5)
-    df['wma20'] = wma(df['close'], 20)
-
-    # ── 골든크로스 감지: CrossUp(WMA5, WMA20) ──
-    df['golden_cross'] = (
-        (df['wma5'] > df['wma20']) &
-        (df['wma5'].shift(1) <= df['wma20'].shift(1))
-    )
-
-    # ── HH = ValueWhen(1, 골든크로스, High) → 가장 최근 골든크로스 시점의 고가 ──
-    df['_raw_hh'] = np.where(df['golden_cross'], df['high'], np.nan)
-    df['hh'] = df['_raw_hh'].ffill()
-
-    # ── 최근 골든크로스 여부 확인 (너무 오래된 신호 제외) ──
-    # 30분봉 기준 하루 약 13봉. 최근 15봉(약 1일 남짓) 이내에 골든크로스가 있었는지 확인
-    recent_gc = df['golden_cross'].tail(15).any()
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else latest
-
-    close_price = float(latest['close'])
-    hh = float(latest['hh']) if pd.notna(latest['hh']) else 0.0
-
     result = {
         "buy": False,
-        "hh": hh,
-        "close": close_price,
+        "ll": 0.0,
+        "close": 0.0,
         "reason": ""
     }
 
-    # ── 매수 신호: 종가가 HH를 상향 돌파 ──
-    if hh > 0:
-        prev_close = float(prev['close']) if pd.notna(prev['close']) else 0.0
-        wma5_now = float(latest['wma5']) if pd.notna(latest['wma5']) else 0.0
-        wma20_now = float(latest['wma20']) if pd.notna(latest['wma20']) else 0.0
+    if df_30m is None or df_30m.empty or len(df_30m) < 60:
+        return result
+    if df_120t is None or df_120t.empty or len(df_120t) < 5:
+        return result
 
-        # 조건: 
-        # 1. 이전봉 종가 <= HH, 현재봉 종가 > HH (정확히 돌파하는 시점)
-        # 2. 너무 갭이 떠서 시점이 지나버린 것 방지 (돌파가 기준 +3% 이하)
-        # 3. 골든크로스가 최근 15봉 이내에 발생했어야 함
-        # 4. WMA5 > WMA20 (정배열 유지)
-        if prev_close <= hh and close_price > hh and close_price <= hh * 1.03 and recent_gc and wma5_now > wma20_now:
-            result["buy"] = True
-            result["reason"] = (
-                f"WMA5>WMA20 정배열(최근 GC), "
-                f"종가({close_price:,.0f})가 HH({hh:,.0f}) 돌파 "
-                f"(+{((close_price / hh) - 1) * 100:.1f}%)"
-            )
+    df30 = df_30m.copy()
+    df120 = df_120t.copy()
+
+    # 컬럼명 소문자 통일
+    df30.rename(columns={col: col.lower() for col in df30.columns}, inplace=True)
+    df120.rename(columns={col: col.lower() for col in df120.columns}, inplace=True)
+
+    if 'close' not in df30.columns or 'close' not in df120.columns:
+        return result
+
+    # ─────────────────────────────────────────────────
+    # 1. 30분봉 (거시 지지선 'M' 계산)
+    # ─────────────────────────────────────────────────
+    df30['a'] = df30['close'].rolling(window=5, min_periods=1).mean()
+    df30['b'] = df30['close'].rolling(window=20, min_periods=1).mean()
+    df30['d'] = df30['close'].rolling(window=60, min_periods=1).mean()
+
+    cond_K = (df30['a'] > df30['b']) & (df30['b'] > df30['d'])
+    df30['K'] = kiwoom_valuewhen(cond_K, df30['close'])
+
+    cond_M = (df30['K'].shift(2) < df30['K'].shift(1)) & (df30['K'].shift(1) > df30['K'])
+    df30['M'] = kiwoom_valuewhen(cond_M, df30['K'].shift(1))
+
+    latest_30m = df30.iloc[-1]
+    M_val = float(latest_30m['M']) if pd.notna(latest_30m['M']) else 0.0
+    a_val = float(latest_30m['a']) if pd.notna(latest_30m['a']) else 0.0
+
+    result['ll'] = M_val
+    current_price = float(df120.iloc[-1]['close'])
+    result['close'] = current_price
+
+    # 아직 한 번도 M(저항/지지선)이 형성되지 않았다면 보류
+    if M_val == 0.0:
+        return result
+
+    # 거시적 조건: 최소한 5일선이나 주가가 검정색 선 위에 있어야 '상승 중 눌림'으로 인정
+    if a_val <= M_val and current_price <= M_val:
+        return result  # 완전히 꺾인 하락세
+
+    # ─────────────────────────────────────────────────
+    # 2. 120틱 (미시 타점 계산: 근접도 & 골든크로스)
+    # ─────────────────────────────────────────────────
+    # M값 근접 확인: 120틱 차트의 최근 30개 틱 중 최저가가 M선의 +2% 이내로 들어온 적이 있는지 (눌림목 터치)
+    recent_lows = df120['low'].tail(30)
+    touched_support = any(recent_lows <= (M_val * 1.02))
+
+    if not touched_support:
+        return result  # 아직 지지선 부근까지 충분히 눌리지 않음 (허공에 떠 있음)
+
+    # 120틱 이평선 계산 (3이평, 5이평)
+    df120['sma3'] = df120['close'].rolling(window=3, min_periods=1).mean()
+    df120['sma5'] = df120['close'].rolling(window=5, min_periods=1).mean()
+
+    # 3이평이 5이평을 상향 돌파 (골든크로스)
+    df120['gc'] = (df120['sma3'].shift(1) <= df120['sma5'].shift(1)) & (df120['sma3'] > df120['sma5'])
+    
+    latest_120t = df120.iloc[-1]
+    
+    if bool(latest_120t['gc']):
+        result['buy'] = True
+        result['reason'] = (
+            f"30m 지지선(M: {M_val:,.0f}) 터치 후 "
+            f"120t 골든크로스(SMA3>SMA5) 발생! (현재가: {current_price:,.0f})"
+        )
 
     return result

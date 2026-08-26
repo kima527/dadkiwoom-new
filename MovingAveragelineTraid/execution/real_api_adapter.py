@@ -170,6 +170,16 @@ class RealAPIAdapter:
             logger.error(f"30분봉 조회 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
+    def get_120t_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 120틱 데이터를 가져와서 Pandas DataFrame으로 변환"""
+        try:
+            # 120틱 데이터는 봉 개수가 많이 필요하므로 limit를 넉넉히(500) 요청합니다.
+            raw_candles = self.real_client.get_tick_data(stock_code, tick_unit="120", limit=500)
+            return self._convert_raw_candles_to_df(raw_candles, stock_code, "120틱")
+        except Exception as e:
+            logger.error(f"120틱 데이터 조회 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
     def get_tick_data(self, stock_code: str) -> list:
         try:
             return self.real_client.get_tick_data(stock_code, tick_unit="1", limit=30)
