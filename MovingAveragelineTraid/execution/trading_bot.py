@@ -27,9 +27,10 @@ import asyncio
 import logging
 import argparse
 from real_api_adapter import RealAPIAdapter
-from utils import TradeState, get_tick_size
+from utils import TradeState, get_tick_size, calculate_trade_intensity
 from strategy_buy import analyze_buy_signals
 from strategy_sell import analyze_sell_signals
+from db_logger import TradeDBLogger
 from datetime import datetime, time as dtime
 
 # real trading 폴더의 websocket_client를 가져오기 위한 경로 추가
@@ -84,10 +85,9 @@ class MarketIndexGuard:
                     open_p = float(df_today.iloc[0]['open'])
                     curr_p = float(df_today.iloc[-1]['close'])
                     kospi_chg = ((curr_p - open_p) / open_p) * 100
-                    
-                if kospi_chg <= -1.5:
-                    kospi_safe = False
-                    warning_reasons.append(f"코스피 급락({kospi_chg:+.2f}%)")
+                    if kospi_chg <= -1.5:
+                        kospi_safe = False
+                        warning_reasons.append(f"코스피 급락({kospi_chg:+.2f}%)")
 
             if df_kosdaq is not None and not df_kosdaq.empty and len(df_kosdaq) >= 20:
                 today_mask = df_kosdaq.index.date == df_kosdaq.index[-1].date()
@@ -96,10 +96,9 @@ class MarketIndexGuard:
                     open_p = float(df_today.iloc[0]['open'])
                     curr_p = float(df_today.iloc[-1]['close'])
                     kosdaq_chg = ((curr_p - open_p) / open_p) * 100
-                    
-                if kosdaq_chg <= -1.8:
-                    kosdaq_safe = False
-                    warning_reasons.append(f"코스닥 급락({kosdaq_chg:+.2f}%)")
+                    if kosdaq_chg <= -1.8:
+                        kosdaq_safe = False
+                        warning_reasons.append(f"코스닥 급락({kosdaq_chg:+.2f}%)")
 
             is_safe = kospi_safe and kosdaq_safe
             reason = "정상 (매수 허용)" if is_safe else ", ".join(warning_reasons) + " 발생 (매수 보류)"
@@ -132,6 +131,7 @@ class BuyManager:
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
                  trade_states: dict, tracked_orders: dict, watchlist: dict,
                  market_guard: MarketIndexGuard = None,
+                 db_logger: TradeDBLogger = None,
                  buy_amount: int = 300000, max_positions: int = 30):
         self.client = client
         self.api_lock = api_lock
@@ -139,6 +139,7 @@ class BuyManager:
         self.tracked_orders = tracked_orders
         self.watchlist = watchlist
         self.market_guard = market_guard
+        self.db_logger = db_logger
         self.buy_amount = buy_amount        # 종목당 매수 금액
         self.max_positions = max_positions  # 최대 보유 종목 수
 
@@ -220,6 +221,22 @@ class BuyManager:
                 buy_price = signals['close']
                 tick = get_tick_size(int(buy_price))
                 price_limit = int((int(buy_price) // tick) * tick)
+
+                # ── 틱 데이터 기반 체결강도 조회 및 스마트 1호가 공격 매수 판별 ──
+                ticks = await asyncio.to_thread(self.client.get_tick_data, code)
+                intensity_info = calculate_trade_intensity(ticks)
+                intensity_ratio = intensity_info.get('ratio', 1.0)
+                is_strong = intensity_info.get('is_strong', False)
+
+                is_aggressive = False
+                if is_strong and intensity_ratio >= 1.5:
+                    price_limit = price_limit + tick
+                    is_aggressive = True
+                    logger.info(
+                        f"⚡ [{name}] 체결강도 폭발({intensity_ratio * 100:.0f}%)! "
+                        f"스마트 1호가 공격 매수 적용: {price_limit:,}원 (+1틱)"
+                    )
+
                 qty = self.buy_amount // int(buy_price)
 
                 if qty > 0:
@@ -246,6 +263,14 @@ class BuyManager:
                             f"{price_limit:,}원 x {qty}주 = "
                             f"{price_limit * qty:,}원 (주문번호: {order_no})"
                         )
+                        # SQLite DB에 매수 기록 저장
+                        if self.db_logger:
+                            self.db_logger.log_buy(
+                                code=code, name=name, buy_price=price_limit,
+                                buy_qty=qty, buy_reason=signals['reason'],
+                                trade_intensity=intensity_ratio * 100,
+                                is_aggressive=is_aggressive
+                            )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -253,20 +278,23 @@ class BuyManager:
 # ═══════════════════════════════════════════════════════════════
 class SellManager:
     """
-    15분봉 SMA5가 SMA40을 데드크로스할 때 전량 시장가 매도.
-    수익/손실 여부 무관. 오버나잇 허용.
+    빠른 손절매(-5%) / 트레일링 스탑(고점대비 -3%) / 15분봉 데드크로스 매도.
     """
 
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
-                 trade_states: dict, tracked_orders: dict, watchlist: dict):
+                 trade_states: dict, tracked_orders: dict, watchlist: dict,
+                 db_logger: TradeDBLogger = None):
         self.client = client
         self.api_lock = api_lock
         self.trade_states = trade_states
         self.tracked_orders = tracked_orders
         self.watchlist = watchlist
+        self.db_logger = db_logger
+        self.last_15m_fetch_time = {} # TR 스로틀링 타이머 {code: float}
 
     async def run(self, holdings: dict):
         """매도 감시 사이클 실행 (보유 종목만 대상)"""
+        now = time.time()
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
             if not state or not state.is_holding:
@@ -284,36 +312,44 @@ class SellManager:
             if not name:
                 name = await asyncio.to_thread(self.client.get_stock_name, code)
 
-            # 15분봉 데이터 조회
-            async with self.api_lock:
-                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
-                await asyncio.sleep(0.25)
-
-            if df_15m is None or df_15m.empty or len(df_15m) < 45:
-                continue
-
-            signals = analyze_sell_signals(df_15m)
-            
-            latest_high = float(df_15m.iloc[-1]['high'])
-            close_price = float(df_15m.iloc[-1]['close'])
-            
             hold_info = holdings[code]
             buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
+            current_price = hold_info.get('current_price', 0) if isinstance(hold_info, dict) else 0.0
+            return_rate = hold_info.get('return_rate', 0.0) if isinstance(hold_info, dict) else 0.0
+            qty_sell = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
+
+            if buy_price > 0 and current_price > 0:
+                calc_return = ((current_price - buy_price) / buy_price) * 100
+            else:
+                calc_return = return_rate
 
             # ── 1. 트레일링 스탑을 위한 최고점(trailing_high) 갱신 ──
             if state.trailing_high < buy_price:
                 state.trailing_high = buy_price
-            state.trailing_high = max(state.trailing_high, latest_high)
+            if current_price > 0:
+                state.trailing_high = max(state.trailing_high, current_price)
 
-            # ── 3. 매도 신호 (데드크로스 또는 트레일링 스탑) ──
-            if signals.get('sell'):
-                qty_sell = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
+            do_sell = False
+            sell_reason = ""
 
-                logger.info(f"🔴 [{name}] 매도 신호! {signals['reason']}")
+            # ── 2. 하드 손절매 및 트레일링 스탑 (TR 호출 없이 잔고 기반 빠른 감시) ──
+            # ⚠️ current_price가 0이면 API 오류이므로 빠른 감시를 건너뛰고 15분봉 차트로 넘어감
+            if current_price > 0 and buy_price > 0:
+                if calc_return <= -5.0:
+                    do_sell = True
+                    sell_reason = f"⚡ 하드 손절매 도달 (-5% 이하): 현재 {calc_return:+.2f}%"
+                elif state.trailing_high > 0:
+                    drawdown = ((current_price - state.trailing_high) / state.trailing_high) * 100
+                    if drawdown <= -3.0:
+                        do_sell = True
+                        sell_reason = f"⚡ 트레일링 스탑 가동 (고점대비 -3% 하락): 고점 {state.trailing_high:,.0f} -> 현재 {current_price:,.0f}"
+
+            if do_sell:
+                logger.info(f"🔴 [{name}] 즉각 매도 신호! {sell_reason}")
                 async with self.api_lock:
                     order_no = await asyncio.to_thread(
                         self.client.place_sell_order, code, qty_sell,
-                        price=0, order_type="03"  # 시장가 매도
+                        price=0, order_type="03"
                     )
                 if order_no:
                     self.tracked_orders[order_no] = {
@@ -321,10 +357,60 @@ class SellManager:
                         'time': time.time(), 'order_type': 'sell'
                     }
                     state.sold_once = True
-                    logger.info(
-                        f"✅ [{name}] 매도 주문 전송! "
-                        f"{qty_sell}주 시장가 매도 (주문번호: {order_no})"
+                    logger.info(f"✅ [{name}] 빠른 시장가 매도 주문 전송 (주문번호: {order_no})")
+                    # SQLite DB에 매도 손익 정산 기록
+                    if self.db_logger:
+                        sell_p = current_price if current_price > 0 else buy_price
+                        self.db_logger.log_sell(
+                            code=code, sell_price=sell_p,
+                            sell_qty=qty_sell, sell_reason=sell_reason
+                        )
+                else:
+                    logger.warning(f"⚠️ [{name}] 매도 주문 전송 실패! 다음 사이클에서 재시도합니다.")
+                continue
+
+            # ── 3. 15분봉 TR 스로틀링 (API 과부하 방지: 60초 제한) ──
+            last_fetch = self.last_15m_fetch_time.get(code, 0)
+            if now - last_fetch < 60:
+                continue
+
+            # 15분봉 데이터 조회
+            async with self.api_lock:
+                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
+                self.last_15m_fetch_time[code] = time.time()
+                await asyncio.sleep(0.25)
+
+            if df_15m is None or df_15m.empty or len(df_15m) < 45:
+                continue
+
+            signals = analyze_sell_signals(df_15m)
+            latest_high = float(df_15m.iloc[-1]['high'])
+            state.trailing_high = max(state.trailing_high, latest_high)
+
+            # ── 4. 15분봉 지표 기반 매도 신호 ──
+            if signals.get('sell'):
+                logger.info(f"🔴 [{name}] 차트 매도 신호! {signals['reason']}")
+                async with self.api_lock:
+                    order_no = await asyncio.to_thread(
+                        self.client.place_sell_order, code, qty_sell,
+                        price=0, order_type="03"
                     )
+                if order_no:
+                    self.tracked_orders[order_no] = {
+                        'code': code, 'qty': qty_sell,
+                        'time': time.time(), 'order_type': 'sell'
+                    }
+                    state.sold_once = True
+                    logger.info(f"✅ [{name}] 차트 기반 시장가 매도 주문 전송 (주문번호: {order_no})")
+                    # SQLite DB에 매도 손익 정산 기록
+                    if self.db_logger:
+                        sell_p = current_price if current_price > 0 else buy_price
+                        self.db_logger.log_sell(
+                            code=code, sell_price=sell_p,
+                            sell_qty=qty_sell, sell_reason=signals.get('reason', '차트 매도')
+                        )
+                else:
+                    logger.warning(f"⚠️ [{name}] 차트 기반 매도 주문 전송 실패! 다음 사이클에서 재시도합니다.")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -349,17 +435,23 @@ class TradingBot:
         # ── 시장 지수 안전가드 생성 ──
         self.market_guard = MarketIndexGuard(self.client, self.api_lock)
 
+        # ── SQLite 매매일지 로거 생성 ──
+        self.db_logger = TradeDBLogger()
+        self.cycle_count = 0
+
         # ── 매니저 생성 ──
         self.buy_manager = BuyManager(
             self.client, self.api_lock,
             self.trade_states, self.tracked_orders, self.watchlist,
             market_guard=self.market_guard,
+            db_logger=self.db_logger,
             buy_amount=buy_amount, max_positions=max_positions
         ) if enable_buy else None
 
         self.sell_manager = SellManager(
             self.client, self.api_lock,
-            self.trade_states, self.tracked_orders, self.watchlist
+            self.trade_states, self.tracked_orders, self.watchlist,
+            db_logger=self.db_logger
         ) if enable_sell else None
 
     # ─────────────────────────────────────────────────
@@ -368,7 +460,8 @@ class TradingBot:
     async def on_insert(self, code: str):
         logger.info(f"🟢 [조건검색 편입] 종목코드: {code}")
         if code not in self.watchlist:
-            name = await asyncio.to_thread(self.client.get_stock_name, code)
+            async with self.api_lock:
+                name = await asyncio.to_thread(self.client.get_stock_name, code)
             self.watchlist[code] = {'name': name, 'weight': 1.0}
             logger.info(f"✅ 관심종목 추가 완료: {name} ({code})")
             self.save_watchlist()
@@ -506,6 +599,8 @@ class TradingBot:
                 else:
                     hold_info = holdings[code]
                     sync_qty = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
+                    sync_buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
+                    sync_current_price = hold_info.get('current_price', 0) if isinstance(hold_info, dict) else 0.0
                     logger.info(
                         f"🔄 잔고 동기화: 봇 재시작으로 인해 {code}의 보유 상태를 "
                         f"True로 복구합니다. (수량: {sync_qty})"
@@ -514,6 +609,10 @@ class TradingBot:
                     state.first_qty = sync_qty
                     state.buy_step = 1  # 재시작 후에는 매수 완료로 간주
                     state.added_on = True
+                    # 트레일링 스탑 기준점 복구: 현재가와 매수가 중 높은 값으로 설정
+                    if state.trailing_high <= 0 and sync_current_price > 0:
+                        state.trailing_high = max(sync_buy_price, sync_current_price)
+                        logger.info(f"🔄 [{code}] trailing_high를 {state.trailing_high:,.0f}원으로 복구")
 
         # 6. 매수 완료된 종목 관심종목에서 제외 (더 이상 매수 감시 안 함)
         for code in list(self.watchlist.keys()):
@@ -543,6 +642,11 @@ class TradingBot:
 
         # 사이클 종료 후 상태 저장 (이때 save_watchlist도 함께 호출됨)
         self.save_states()
+
+        # 10사이클(약 100초)마다 일일 손익/승률 통계 요약 출력
+        self.cycle_count += 1
+        if self.cycle_count % 10 == 0 and self.db_logger:
+            self.db_logger.print_daily_summary()
 
     async def start(self):
         """비동기 스케줄러: 10초 주기로 사이클 실행"""

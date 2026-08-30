@@ -294,7 +294,9 @@ class RealAPIAdapter:
                 if code:
                     holdings_dict[code] = {
                         'qty': int(h.get('quantity', h.get('qty', 0))),
-                        'buy_price': float(h.get('buy_price', 0))
+                        'buy_price': float(h.get('buy_price', 0)),
+                        'current_price': float(h.get('current_price', 0)),
+                        'return_rate': float(h.get('return_rate', 0.0))
                     }
         except Exception as e:
             logger.error(f"잔고 조회 에러: {e}")

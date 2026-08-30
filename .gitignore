@@ -15,6 +15,7 @@ __pycache__/
 *.xlsx
 *.csv
 *.log
+*.db
 blog_post_*
 backtest_5days_result.json
 weekend_scanned_picks.json

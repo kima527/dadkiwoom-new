@@ -83,8 +83,8 @@ def analyze_sell_signals(df_15m: pd.DataFrame, daily_df: pd.DataFrame = None) ->
                     if is_yesterday_upper_limit:
                         today_open = float(df_today.iloc[0]['open'])
                         
-                        # 당일 시가를 돌파하지 못하고 하회 시 (현재가 < 시가)
-                        if close_price < today_open:
+                        # 당일 시가를 돌파하지 못하고 2% 이상 하회 시 (현재가 < 시가 * 0.98) - 휩쏘(흔들기) 방지 버퍼
+                        if close_price < today_open * 0.98:
                             diff_pct = ((close_price - today_open) / today_open) * 100
                             sma5_val = float(df['close'].rolling(5, min_periods=5).mean().iloc[-1]) if len(df) >= 5 else 0.0
                             sma40_val = float(df['close'].rolling(40, min_periods=40).mean().iloc[-1]) if len(df) >= 40 else 0.0
@@ -95,8 +95,8 @@ def analyze_sell_signals(df_15m: pd.DataFrame, daily_df: pd.DataFrame = None) ->
                                 "sma5": sma5_val,
                                 "sma40": sma40_val,
                                 "reason": (
-                                    f"⚡ [전일 상한가 종목] 익일 시가({today_open:,.0f}원) 돌파 실패 및 하회 "
-                                    f"(현재가: {close_price:,.0f}원, 시가대비: {diff_pct:+.2f}%) -> 전량 매도"
+                                    f"⚡ [전일 상한가 종목] 시가대비 -2% 이탈 "
+                                    f"(현재가: {close_price:,.0f}원, 시가대비: {diff_pct:+.2f}%) -> 개미털기 버퍼 초과, 전량 매도"
                                 )
                             }
     except Exception as e:
