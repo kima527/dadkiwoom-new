@@ -1,11 +1,12 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul
 echo ===================================================
-echo   이평선 + 돌파매매 봇 (MovingAverage + Breakout Bot)
+echo   [실전 자동매매] 이평선 돌파 + 15분봉 추세 매매 봇
 echo ===================================================
 echo.
-echo [안내] 실시간 조건검색에서 포착된 종목만을 대상으로 합니다.
-echo [안내] 초기 5분봉 고점 돌파 및 3-10 골든크로스 로직이 적용됩니다.
+echo [매수] 일봉 20이평 돌파 & HH / 30분봉 260이평 돌파 & HH
+echo [매도] 15분봉 5-40 이평 데드크로스 전량 청산
+echo [방어] 코스피/코스닥 지수 급락 시 매수 자동 일시정지
 echo.
-python "MovingAveragelineTraid\execution\trading_bot.py"
+python -X utf8 "MovingAveragelineTraid\execution\trading_bot.py"
 pause

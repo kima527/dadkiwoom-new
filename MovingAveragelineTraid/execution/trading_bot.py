@@ -1,15 +1,14 @@
 """
-trading_bot.py - 30분봉 WMA 골든크로스 고가(HH) 돌파 매수 + WMA 데드크로스 매도 봇
+trading_bot.py - 일봉/30분봉 SMA돌파 + 가중5-20고가선 돌파 매수 + 15분봉 SMA 데드크로스 매도 봇
 ===========================================================================
 
 구조:
-  1. BuyManager  - 30분봉 WMA5/WMA20 골든크로스 시점 고가(HH) 돌파 매수
-  2. SellManager - 30분봉 WMA5/WMA40 데드크로스 매도
+  1. BuyManager  - 일봉 SMA20 돌파 + HH 돌파 / 30분봉 SMA260 돌파 + HH 돌파 매수
+  2. SellManager - 15분봉 SMA5/SMA40 데드크로스 매도
 
 전략 요약:
-  - 매수: 조건검색식 편입 종목 → 30분봉 WMA5가 WMA20 골든크로스 → 그 시점 고가(HH) 저장
-         → 현재가가 HH 돌파 시 매수 (종목당 30만원)
-  - 매도: 30분봉 WMA5가 WMA40 데드크로스 시 전량 시장가 매도
+  - 매수: 조건검색식 편입 종목 → 일봉/30분봉 SMA 돌파 및 가중5-20 고가선(HH) 돌파 시 매수
+  - 매도: 15분봉 SMA5가 SMA40 데드크로스 시 전량 시장가 매도
   - 오버나잇 허용, 매매 시간 제한 없음
   - 최대 30종목 보유 가능
 
@@ -45,29 +44,121 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# BuyManager - 30분봉 SMA 골든크로스 고가(HH) 돌파 매수
+# MarketIndexGuard - 코스피/코스닥 지수 급락 감지 및 매수 방어 모듈
+# ═══════════════════════════════════════════════════════════════
+class MarketIndexGuard:
+    """
+    KODEX 200(069500) 및 KODEX 코스닥150(229200)의 15분봉 및 당일 등락률을 모니터링하여,
+    지수 급락(-1.5% 이하) 또는 폭락 시 신규 매수를 일시 중단(Pause)하는 안전장치.
+    """
+    def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock):
+        self.client = client
+        self.api_lock = api_lock
+        self.last_check_time = 0
+        self.cached_status = {"safe": True, "kospi_chg": 0.0, "kosdaq_chg": 0.0, "reason": "정상"}
+
+    async def check_market_health(self) -> dict:
+        now = time.time()
+        # 30초마다 지수 갱신 (API 부하 절감)
+        if now - self.last_check_time < 30 and self.cached_status.get("checked", False):
+            return self.cached_status
+
+        kospi_chg = 0.0
+        kosdaq_chg = 0.0
+        kospi_safe = True
+        kosdaq_safe = True
+        warning_reasons = []
+
+        try:
+            # 1. 코스피 대표 (069500 KODEX 200) 및 코스닥 대표 (229200 KODEX 코스닥150) 15분봉 조회
+            async with self.api_lock:
+                df_kospi = await asyncio.to_thread(self.client.get_15m_candles, "069500")
+                await asyncio.sleep(0.1)
+                df_kosdaq = await asyncio.to_thread(self.client.get_15m_candles, "229200")
+                await asyncio.sleep(0.1)
+
+            if df_kospi is not None and not df_kospi.empty and len(df_kospi) >= 20:
+                today_mask = df_kospi.index.date == df_kospi.index[-1].date()
+                df_today = df_kospi[today_mask]
+                if not df_today.empty:
+                    open_p = float(df_today.iloc[0]['open'])
+                    curr_p = float(df_today.iloc[-1]['close'])
+                    kospi_chg = ((curr_p - open_p) / open_p) * 100
+                    
+                if kospi_chg <= -1.5:
+                    kospi_safe = False
+                    warning_reasons.append(f"코스피 급락({kospi_chg:+.2f}%)")
+
+            if df_kosdaq is not None and not df_kosdaq.empty and len(df_kosdaq) >= 20:
+                today_mask = df_kosdaq.index.date == df_kosdaq.index[-1].date()
+                df_today = df_kosdaq[today_mask]
+                if not df_today.empty:
+                    open_p = float(df_today.iloc[0]['open'])
+                    curr_p = float(df_today.iloc[-1]['close'])
+                    kosdaq_chg = ((curr_p - open_p) / open_p) * 100
+                    
+                if kosdaq_chg <= -1.8:
+                    kosdaq_safe = False
+                    warning_reasons.append(f"코스닥 급락({kosdaq_chg:+.2f}%)")
+
+            is_safe = kospi_safe and kosdaq_safe
+            reason = "정상 (매수 허용)" if is_safe else ", ".join(warning_reasons) + " 발생 (매수 보류)"
+
+            self.cached_status = {
+                "safe": is_safe,
+                "kospi_chg": kospi_chg,
+                "kosdaq_chg": kosdaq_chg,
+                "reason": reason,
+                "checked": True
+            }
+            self.last_check_time = now
+
+        except Exception as e:
+            logger.warning(f"지수 확인 중 예외 발생: {e}")
+            self.cached_status["safe"] = True
+
+        return self.cached_status
+
+
+# ═══════════════════════════════════════════════════════════════
+# BuyManager - 일봉/30분봉 돌파 매수 + 지수 안전장치
 # ═══════════════════════════════════════════════════════════════
 class BuyManager:
     """
-    30분봉 WMA5/WMA20 골든크로스 시점의 고가(HH)를 저장하고,
-    현재 종가가 HH를 상향 돌파할 때 종목당 30만원 매수.
-
-    최대 30종목까지 보유 가능.
+    일봉 SMA20 돌파 & HH 돌파 또는 30분봉 SMA260 돌파 & HH 돌파 시 종목당 30만원 매수.
+    지수 급락 시에는 신규 매수를 일시 보류하여 자산을 보호함.
     """
 
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
                  trade_states: dict, tracked_orders: dict, watchlist: dict,
+                 market_guard: MarketIndexGuard = None,
                  buy_amount: int = 300000, max_positions: int = 30):
         self.client = client
         self.api_lock = api_lock
         self.trade_states = trade_states
         self.tracked_orders = tracked_orders
         self.watchlist = watchlist
-        self.buy_amount = buy_amount      # 종목당 매수 금액
+        self.market_guard = market_guard
+        self.buy_amount = buy_amount        # 종목당 매수 금액
         self.max_positions = max_positions  # 최대 보유 종목 수
 
     async def run(self, holdings: dict, unexecuted: list):
         """매수 감시 사이클 실행"""
+
+        # ── 1. 시장 지수 급락 안전장치 검사 ──
+        if self.market_guard:
+            market_status = await self.market_guard.check_market_health()
+            kospi_str = f"KOSPI: {market_status['kospi_chg']:+.2f}%"
+            kosdaq_str = f"KOSDAQ: {market_status['kosdaq_chg']:+.2f}%"
+            
+            if not market_status['safe']:
+                logger.warning(
+                    f"🛑 [지수 급락 방어 발동] {kospi_str} | {kosdaq_str} -> "
+                    f"{market_status['reason']}. 이번 사이클 신규 매수를 일시 중단합니다."
+                )
+                return
+            else:
+                logger.info(f"🌐 [시장 지수 상태] {kospi_str} | {kosdaq_str} -> 정상 (매수 탐색 진행)")
 
         # 보유 종목 수 제한 (30개)
         pending_buy_codes = {
@@ -99,25 +190,33 @@ class BuyManager:
 
             name = self.watchlist.get(code, {}).get('name', code)
 
-            # 30분봉(거시) + 120틱(미시) 데이터 동시 조회
+            # 30분봉(거시) + 일봉(필터) 데이터 동시 조회
             async with self.api_lock:
                 df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
                 await asyncio.sleep(0.1)
-                df_120t = await asyncio.to_thread(self.client.get_120t_candles, code)
+                daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
                 await asyncio.sleep(0.1)
 
-            if df_30m is None or df_30m.empty or df_120t is None or df_120t.empty:
+            if df_30m is None or df_30m.empty:
                 continue
 
-            signals = analyze_buy_signals(df_30m, df_120t)
+            signals = analyze_buy_signals(df_30m, None, daily_df)
+            
+            if signals.get('remove_watchlist'):
+                logger.info(f"🗑️ [{name}] 이미 SMA20을 훌쩍 넘긴 종목. 감시대상에서 제외합니다.")
+                if code in self.watchlist:
+                    del self.watchlist[code]
+                continue
 
-            # ── 매수: HH 돌파 시 매수 ──
+            buy_price = signals['close']
+            if buy_price > self.buy_amount:
+                logger.info(f"⏭️ [{name}] 1주 가격({buy_price:,.0f}원)이 종목당 투자예산({self.buy_amount:,.0f}원)을 초과하여 감시대상에서 제외합니다.")
+                if code in self.watchlist:
+                    del self.watchlist[code]
+                continue
+
+            # ── 매수: 조건 충족 시 매수 ──
             if signals.get('buy'):
-                # ── 가속도(체결 강도) 확인 (저점 매수이므로 검사 생략) ──
-                async with self.api_lock:
-                    tick_data = await asyncio.to_thread(self.client.get_tick_data, code)
-                    await asyncio.sleep(0.1)
-
                 buy_price = signals['close']
                 tick = get_tick_size(int(buy_price))
                 price_limit = int((int(buy_price) // tick) * tick)
@@ -150,11 +249,11 @@ class BuyManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SellManager - 30분봉 SMA5/SMA40 데드크로스 매도
+# SellManager - 15분봉 SMA5/SMA40 데드크로스 매도
 # ═══════════════════════════════════════════════════════════════
 class SellManager:
     """
-    30분봉 WMA5가 WMA40을 데드크로스할 때 전량 시장가 매도.
+    15분봉 SMA5가 SMA40을 데드크로스할 때 전량 시장가 매도.
     수익/손실 여부 무관. 오버나잇 허용.
     """
 
@@ -181,20 +280,22 @@ class SellManager:
             if is_sell_pending:
                 continue
 
-            name = self.watchlist.get(code, {}).get('name', code)
+            name = self.watchlist.get(code, {}).get('name')
+            if not name:
+                name = await asyncio.to_thread(self.client.get_stock_name, code)
 
-            # 30분봉 데이터 조회
+            # 15분봉 데이터 조회
             async with self.api_lock:
-                df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
+                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
                 await asyncio.sleep(0.25)
 
-            if df_30m is None or df_30m.empty or len(df_30m) < 45:
+            if df_15m is None or df_15m.empty or len(df_15m) < 45:
                 continue
 
-            signals = analyze_sell_signals(df_30m)
+            signals = analyze_sell_signals(df_15m)
             
-            latest_high = float(df_30m.iloc[-1]['high'])
-            close_price = float(df_30m.iloc[-1]['close'])
+            latest_high = float(df_15m.iloc[-1]['high'])
+            close_price = float(df_15m.iloc[-1]['close'])
             
             hold_info = holdings[code]
             buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
@@ -203,14 +304,6 @@ class SellManager:
             if state.trailing_high < buy_price:
                 state.trailing_high = buy_price
             state.trailing_high = max(state.trailing_high, latest_high)
-
-            # ── 2. 트레일링 스탑 (최고가 대비 -3% 하락) - 오버나잇을 위해 비활성화 ──
-            # if state.trailing_high > 0 and close_price <= state.trailing_high * 0.97:
-            #     signals['sell'] = True
-            #     signals['reason'] = (
-            #         f"트레일링 스탑! 최고가({state.trailing_high:,.0f}) 대비 3% 하락 "
-            #         f"(현재가 {close_price:,.0f})"
-            #     )
 
             # ── 3. 매도 신호 (데드크로스 또는 트레일링 스탑) ──
             if signals.get('sell'):
@@ -253,10 +346,14 @@ class TradingBot:
         self.enable_buy = enable_buy
         self.enable_sell = enable_sell
 
+        # ── 시장 지수 안전가드 생성 ──
+        self.market_guard = MarketIndexGuard(self.client, self.api_lock)
+
         # ── 매니저 생성 ──
         self.buy_manager = BuyManager(
             self.client, self.api_lock,
             self.trade_states, self.tracked_orders, self.watchlist,
+            market_guard=self.market_guard,
             buy_amount=buy_amount, max_positions=max_positions
         ) if enable_buy else None
 
@@ -456,10 +553,10 @@ class TradingBot:
             tasks_str.append("매도")
 
         logger.info("=" * 60)
-        logger.info(" 🚀 [30분봉 WMA 고가돌파 매수 + WMA 데드크로스 매도 봇] 시작")
+        logger.info(" 🚀 [30분봉 WMA 고가돌파 매수 + 15분봉 WMA 데드크로스 매도 봇] 시작")
         logger.info(f" 활성 임무: {', '.join(tasks_str)}")
         logger.info(f" 전략: 30분봉 WMA(5,20) 골든크로스 고가(HH) 돌파 매수")
-        logger.info(f"       30분봉 WMA(5,40) 데드크로스 매도")
+        logger.info(f"       15분봉 WMA(5,40) 데드크로스 매도")
         logger.info(f" 종목당 투자금: 300,000원 | 최대 30종목")
         logger.info(f" 오버나잇: 허용 | 시간 제한: 없음")
         logger.info("=" * 60)

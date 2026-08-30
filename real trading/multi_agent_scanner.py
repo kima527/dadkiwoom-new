@@ -120,7 +120,7 @@ class NewsAgent:
 """
                 try:
                     response = ai_client.models.generate_content(
-                        model='gemini-1.5-flash',
+                        model='gemini-3.7-flash',
                         contents=prompt
                     )
                     ai_score = int(response.text.strip())

@@ -163,8 +163,9 @@ class KiwoomWebSocketClient:
                                         asyncio.create_task(self.on_insert(code))
                                     else:
                                         self.on_insert(code)
-                                    # 편입 시 자동으로 실시간 체결 데이터 구독
-                                    asyncio.create_task(self.subscribe_real_tick(code))
+                                    # 실시간 체결 콜백이 등록되어 있을 때만 체결 데이터 구독 (불필요한 웹소켓 과부하 원천 방지)
+                                    if self.on_real_tick:
+                                        asyncio.create_task(self.subscribe_real_tick(code))
                                         
                                 elif evt_tp == 'D':
                                     if asyncio.iscoroutinefunction(self.on_delete):

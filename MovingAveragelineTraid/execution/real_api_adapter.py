@@ -143,6 +143,60 @@ class RealAPIAdapter:
             logger.error(f"{label} 변환 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
+    def get_daily_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 일봉 데이터를 가져와서 DataFrame으로 변환"""
+        try:
+            # _get_data_code를 쓰지 않아도 일봉은 보통 종목코드 원형으로 조회 가능
+            clean_code = stock_code.replace('_AL', '').replace('_NX', '').strip()
+            if clean_code.startswith('A') and len(clean_code) == 7:
+                clean_code = clean_code[1:]
+                
+            base_dt = datetime.now().strftime('%Y%m%d')
+            result = self.real_client.chart_api.stock_daily_chart_request_ka10081(
+                stk_cd=clean_code,
+                base_dt=base_dt,
+                upd_stkpc_tp='1'
+            )
+            
+            if not result or "stk_dt_pole_chart_qry" not in result:
+                return pd.DataFrame()
+                
+            raw_candles = result["stk_dt_pole_chart_qry"]
+            if not raw_candles:
+                return pd.DataFrame()
+                
+            parsed_candles = []
+            for item in raw_candles:
+                dt_str = item.get("dt", "").strip()
+                if not dt_str:
+                    continue
+                try:
+                    close_prc = abs(float(item.get("cur_prc", 0.0)))
+                    open_prc = abs(float(item.get("open_pric", 0.0)))
+                    high_prc = abs(float(item.get("high_pric", 0.0)))
+                    low_prc = abs(float(item.get("low_pric", 0.0)))
+                    volume = int(item.get("trde_qty", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
+                parsed_candles.append({
+                    "date": dt_str,
+                    "open": open_prc,
+                    "high": high_prc,
+                    "low": low_prc,
+                    "close": close_prc,
+                    "volume": volume
+                })
+                
+            # 최신 데이터가 맨 뒤로 오도록 정렬
+            parsed_candles.sort(key=lambda x: x["date"])
+            df = pd.DataFrame(parsed_candles)
+            return df
+            
+        except Exception as e:
+            logger.error(f"일봉 변환 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
     def get_5m_candles(self, stock_code: str) -> pd.DataFrame:
         """실전 5분봉 데이터를 가져와서 Pandas DataFrame으로 변환"""
         try:
@@ -162,9 +216,9 @@ class RealAPIAdapter:
             return pd.DataFrame()
 
     def get_30m_candles(self, stock_code: str) -> pd.DataFrame:
-        """실전 30분봉 데이터를 가져와서 Pandas DataFrame으로 변환"""
+        """실전 30분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (SMA260 계산을 위해 30일치 조회)"""
         try:
-            raw_candles = self.real_client.get_30min_candles(stock_code, last_n_days=14)
+            raw_candles = self.real_client.get_30min_candles(stock_code, last_n_days=30)
             return self._convert_raw_candles_to_df(raw_candles, stock_code, "30분봉")
         except Exception as e:
             logger.error(f"30분봉 조회 에러 ({stock_code}): {e}")

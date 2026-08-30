@@ -1,46 +1,29 @@
-# Environments
+# Environments & Secrets
 .env
-.env.example
 .env*
 *.env*
-.env copy
+credentials.json
+token.json
 
-# Python cache
+# Python cache & build
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.pyd
 
-# Data files
-my_pick.xlsx
+# Data & Runtime Files
+*.xlsx
+*.csv
+*.log
+blog_post_*
+backtest_5days_result.json
+weekend_scanned_picks.json
+backtest_trades.json
+backtest_summary.json
+MovingAveragelineTraid/execution/trade_states.json
 
-# IDEs and editors
-# Environments
-.env
-.env.example
-.env*
-*.env*
-.env copy
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Data files
-my_pick.xlsx
-
-# IDEs and editors
+# IDEs & Temporary directories
 .vscode/
 .idea/
 .gemini/
-*.log
-
-# Output Files
-blog_post_*
-
-# Agent Files
 .tmp/
-credentials.json
-token.json
