@@ -186,9 +186,17 @@ def evaluate_stock_opportunity(code: str, name: str, df_15m: pd.DataFrame, df_30
     note = ""
 
     if buy_signals.get('buy'):
-        status = "🔥 매수 타점 충족"
-        status_score = 100
+        if buy_signals.get('is_w_rebound'):
+            status = "🔥 30분봉 260이평 W자 반등 최우선 타점"
+            status_score = 120
+        else:
+            status = "🔥 매수 타점 충족"
+            status_score = 100
         note = buy_signals.get('reason')
+    elif buy_signals.get('is_w_rebound'):
+        status = "✨ 30분봉 260이평 W자 반등 진행 중"
+        status_score = 90
+        note = buy_signals.get('w_info', {}).get('description', '30분봉 260이평 W자 반등 패턴')
     elif (-3.0 <= daily_sma20_diff_pct <= 3.0) and (-5.0 <= daily_hh_diff_pct <= 3.0):
         status = "⚡ 일봉 돌파 임박 (저격 대기)"
         status_score = 80

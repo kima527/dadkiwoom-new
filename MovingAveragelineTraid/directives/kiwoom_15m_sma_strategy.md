@@ -1,29 +1,25 @@
-# Kiwoom 15m SMA Strategy Directive
+# Kiwoom Moving Average Line Trading Strategy Directive
 
 ## Overview
-This strategy uses 15-minute candles and Simple Moving Averages (SMA) to capture short-term explosive momentum in target stocks.
+이 전략은 키움증권 실시간 조건검색식(`Traiding`)으로 발굴된 종목을 대상으로, **30분봉 단순 260이평선(SMA 260) W자 반등(이중바닥 재돌파)** 및 **일봉/30분봉 가중 5-20 고가선(HH) 돌파** 시 매수하고, **15분봉 SMA5/SMA40 데드크로스 및 트레일링 스탑(-3%)/하드손절(-5%)**로 매도하는 추세추종/눌림목 재돌파 전략입니다.
 
-## Buy Logic (Entry)
-1. **Trend & Signal Filter**:
-   - The stock must satisfy **SMA 3 > SMA 5 > SMA 20** on the 15-minute timeframe.
-   - This "Perfect short-term order" represents explosive momentum.
+## Buy Logic (Entry) & Prioritization
 
-2. **Priority Filtering**:
-   - If multiple stocks generate a signal simultaneously, calculate a priority score:
-     `Priority Score = Theme Weight (from watchlist.json) * Momentum Score`
-   - Momentum Score is derived from the recent trade speed/acceleration (e.g., how quickly trades are hitting the ask price).
+### 1. [최우선] 30분봉 260이평 W자 반등 (W-Pattern Rebound)
+- **정의**: 주가가 260이평선 위로 1차 상승(Peak 1)한 후 ➔ 260이평선 아래 또는 부근으로 눌림 하락(Trough) ➔ 다시 지지/반등하여 260이평선을 재차 상향 돌파(Rebound Breakout)하는 패턴.
+- **우선순위 부여**:
+  - `detect_w_rebound_30m()` 함수를 통해 W자 반등 완성 여부 및 반등 탄력도(`rebound_pct`) 계산.
+  - W자 반등 종목은 `is_w_rebound=True`, `priority_score >= 100점`으로 분류되어 후보군 중 **최우선 매수 집행**.
 
-3. **3-Second Observation & Safety Zone Limit Order (Rate Limit Solution)**:
-   - When the top priority stock is identified, the bot must wait exactly **3 seconds**.
-   - After 3 seconds, fetch the recent tick data (1 API call).
-   - Calculate a "Safety Zone" (the expected lowest point of the current fluctuation, typically the SMA 20 line or recent tick low).
-   - Calculate buy quantity: `(Available Cash * 0.95) // Safety Zone Price`.
-   - Place a **Limit Order (지정가 매수)** at the Safety Zone price.
+### 2. [기본] 일봉 및 30분봉 돌파 매수
+- **30분봉 조건**: 당일 단순 260이평선(SMA 260) 상향 돌파 + 현재가 > 가중 5-20 고가선(HH).
+- **일봉 조건**: 당일 단순 20이평선(SMA 20) 상향 돌파 + 현재가 > 가중 5-20 고가선(HH).
+
+### 3. 체결강도 및 호가 최적화
+- 체결강도(`calculate_trade_intensity`)가 150% 이상일 경우 스마트 1호가 공격 매수(+1틱) 적용.
 
 ## Sell Logic (Exit)
-1. **Take Profit (Dead Cross)**:
-   - Sell when SMA 3 crosses below SMA 5.
-2. **Trend Break**:
-   - Sell if the price closes below SMA 20.
-3. **Stop Loss**:
-   - Sell immediately if the price drops by -3% from the entry average price.
+1. **하드 손절매**: 매수가 대비 -5.0% 도달 시 즉시 시장가 매도.
+2. **트레일링 스탑**: 진입 이후 최고가 대비 -3.0% 하락 시 즉시 시장가 매도.
+3. **차트 데드크로스**: 15분봉 SMA 5가 SMA 40을 하향 이탈(Dead Cross) 시 전량 시장가 매도.
+

@@ -1,13 +1,13 @@
 """
-trading_bot.py - 일봉/30분봉 SMA돌파 + 가중5-20고가선 돌파 매수 + 15분봉 SMA 데드크로스 매도 봇
+trading_bot.py - 30분봉 260이평 W자 반등 우선 매수 + 15분봉 SMA 데드크로스 매도 봇
 ===========================================================================
 
 구조:
-  1. BuyManager  - 일봉 SMA20 돌파 + HH 돌파 / 30분봉 SMA260 돌파 + HH 돌파 매수
+  1. BuyManager  - 30분봉 260이평 W자 반등 종목 최우선 매수 + 일봉/30분봉 HH 돌파 매수
   2. SellManager - 15분봉 SMA5/SMA40 데드크로스 매도
 
 전략 요약:
-  - 매수: 조건검색식 편입 종목 → 일봉/30분봉 SMA 돌파 및 가중5-20 고가선(HH) 돌파 시 매수
+  - 매수: 조건검색식 편입 종목 중 30분봉 260이평 W자 반등(1차상승 ➔ 눌림 ➔ 260이평 재돌파) 종목 최우선 매수
   - 매도: 15분봉 SMA5가 SMA40 데드크로스 시 전량 시장가 매도
   - 오버나잇 허용, 매매 시간 제한 없음
   - 최대 30종목 보유 가능
@@ -175,6 +175,8 @@ class BuyManager:
             )
             return
 
+        buy_candidates = []
+
         for code, state in list(self.trade_states.items()):
             # 이미 매수 완료한 종목은 스킵
             if state.buy_step >= 1 or state.trade_ended:
@@ -190,6 +192,7 @@ class BuyManager:
                 continue
 
             name = self.watchlist.get(code, {}).get('name', code)
+            weight = self.watchlist.get(code, {}).get('weight', 1.0)
 
             # 30분봉(거시) + 일봉(필터) 데이터 동시 조회
             async with self.api_lock:
@@ -216,61 +219,101 @@ class BuyManager:
                     del self.watchlist[code]
                 continue
 
-            # ── 매수: 조건 충족 시 매수 ──
+            # 매수 신호 포착 종목 수집
             if signals.get('buy'):
-                buy_price = signals['close']
-                tick = get_tick_size(int(buy_price))
-                price_limit = int((int(buy_price) // tick) * tick)
+                buy_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'state': state,
+                    'signals': signals,
+                    'df_30m': df_30m,
+                    'weight': weight,
+                    'is_w_rebound': signals.get('is_w_rebound', False),
+                    'priority_score': signals.get('priority_score', 0.0)
+                })
 
-                # ── 틱 데이터 기반 체결강도 조회 및 스마트 1호가 공격 매수 판별 ──
-                ticks = await asyncio.to_thread(self.client.get_tick_data, code)
-                intensity_info = calculate_trade_intensity(ticks)
-                intensity_ratio = intensity_info.get('ratio', 1.0)
-                is_strong = intensity_info.get('is_strong', False)
+        if not buy_candidates:
+            return
 
-                is_aggressive = False
-                if is_strong and intensity_ratio >= 1.5:
-                    price_limit = price_limit + tick
-                    is_aggressive = True
-                    logger.info(
-                        f"⚡ [{name}] 체결강도 폭발({intensity_ratio * 100:.0f}%)! "
-                        f"스마트 1호가 공격 매수 적용: {price_limit:,}원 (+1틱)"
+        # ── W자 반등(260이평 재돌파) 종목 최우선 정렬 (W자 반등 여부 -> 우선순위 점수 -> 테마 가중치) ──
+        buy_candidates.sort(
+            key=lambda x: (
+                1 if x['is_w_rebound'] else 0,
+                x['priority_score'],
+                x['weight']
+            ),
+            reverse=True
+        )
+
+        # ── 정렬된 우선순위 순서대로 매수 집행 ──
+        for candidate in buy_candidates:
+            if total_positions >= self.max_positions:
+                logger.info(f"⚠️ 매수 진행 중 최대 보유 종목 수({self.max_positions}개) 도달. 잔여 후보 매수 중단.")
+                break
+
+            code = candidate['code']
+            name = candidate['name']
+            state = candidate['state']
+            signals = candidate['signals']
+            df_30m = candidate['df_30m']
+            is_w = candidate['is_w_rebound']
+
+            buy_price = signals['close']
+            tick = get_tick_size(int(buy_price))
+            price_limit = int((int(buy_price) // tick) * tick)
+
+            # ── 틱 데이터 기반 체결강도 조회 및 스마트 1호가 공격 매수 판별 ──
+            ticks = await asyncio.to_thread(self.client.get_tick_data, code)
+            intensity_info = calculate_trade_intensity(ticks)
+            intensity_ratio = intensity_info.get('ratio', 1.0)
+            is_strong = intensity_info.get('is_strong', False)
+
+            is_aggressive = False
+            if is_strong and intensity_ratio >= 1.5:
+                price_limit = price_limit + tick
+                is_aggressive = True
+                logger.info(
+                    f"⚡ [{name}] 체결강도 폭발({intensity_ratio * 100:.0f}%)! "
+                    f"스마트 1호가 공격 매수 적용: {price_limit:,}원 (+1틱)"
+                )
+
+            qty = self.buy_amount // int(buy_price)
+
+            if qty > 0:
+                priority_tag = "🔥 [W자 반등 최우선]" if is_w else "🟢"
+                logger.info(
+                    f"{priority_tag} [{name}] 매수 신호 집행! (우선순위 점수: {candidate['priority_score']:.1f}) "
+                    f"{signals['reason']} | LL: {signals['ll']:,.0f}"
+                )
+                async with self.api_lock:
+                    order_no = await asyncio.to_thread(
+                        self.client.place_buy_order, code, qty,
+                        price=price_limit, order_type="00"
                     )
-
-                qty = self.buy_amount // int(buy_price)
-
-                if qty > 0:
+                if order_no:
+                    self.tracked_orders[order_no] = {
+                        'code': code, 'qty': qty,
+                        'time': time.time(), 'order_type': 'buy'
+                    }
+                    state.buy_step = 1
+                    state.first_qty = qty
+                    state.first_buy_candle_time = df_30m.index[-1]
+                    state.signal_1 = signals['ll']  # LL 값 저장
+                    state.is_w_rebound = is_w
+                    total_positions += 1
                     logger.info(
-                        f"🟢 [{name}] 매수 신호! {signals['reason']} "
-                        f"| LL: {signals['ll']:,.0f}"
+                        f"✅ [{name}] 매수 주문 전송: "
+                        f"{price_limit:,}원 x {qty}주 = "
+                        f"{price_limit * qty:,}원 (주문번호: {order_no})"
                     )
-                    async with self.api_lock:
-                        order_no = await asyncio.to_thread(
-                            self.client.place_buy_order, code, qty,
-                            price=price_limit, order_type="00"
+                    # SQLite DB에 매수 기록 저장
+                    if self.db_logger:
+                        self.db_logger.log_buy(
+                            code=code, name=name, buy_price=price_limit,
+                            buy_qty=qty, buy_reason=signals['reason'],
+                            trade_intensity=intensity_ratio * 100,
+                            is_aggressive=is_aggressive
                         )
-                    if order_no:
-                        self.tracked_orders[order_no] = {
-                            'code': code, 'qty': qty,
-                            'time': time.time(), 'order_type': 'buy'
-                        }
-                        state.buy_step = 1
-                        state.first_qty = qty
-                        state.first_buy_candle_time = df_30m.index[-1]
-                        state.signal_1 = signals['ll']  # LL 값 저장
-                        logger.info(
-                            f"✅ [{name}] 매수 주문 전송: "
-                            f"{price_limit:,}원 x {qty}주 = "
-                            f"{price_limit * qty:,}원 (주문번호: {order_no})"
-                        )
-                        # SQLite DB에 매수 기록 저장
-                        if self.db_logger:
-                            self.db_logger.log_buy(
-                                code=code, name=name, buy_price=price_limit,
-                                buy_qty=qty, buy_reason=signals['reason'],
-                                trade_intensity=intensity_ratio * 100,
-                                is_aggressive=is_aggressive
-                            )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -657,11 +700,12 @@ class TradingBot:
             tasks_str.append("매도")
 
         logger.info("=" * 60)
-        logger.info(" 🚀 [30분봉 WMA 고가돌파 매수 + 15분봉 WMA 데드크로스 매도 봇] 시작")
+        logger.info(" 🚀 [30분봉 260이평 W자 반등 우선 매수 + 15분봉 SMA 데드크로스 매도 봇] 시작")
         logger.info(f" 활성 임무: {', '.join(tasks_str)}")
-        logger.info(f" 전략: 30분봉 WMA(5,20) 골든크로스 고가(HH) 돌파 매수")
-        logger.info(f"       15분봉 WMA(5,40) 데드크로스 매도")
-        logger.info(f" 종목당 투자금: 300,000원 | 최대 30종목")
+        logger.info(f" 전략: [최우선] 30분봉 260이평 W자 반등 종목 우선 매수")
+        logger.info(f"       [기본] 일봉/30분봉 SMA 돌파 및 가중5-20고가선(HH) 돌파 매수")
+        logger.info(f"       [매도] 15분봉 SMA(5,40) 데드크로스 시장가 매도")
+        logger.info(f" 종목당 투자금: {self.buy_manager.buy_amount if self.buy_manager else 300000:,.0f}원 | 최대 30종목")
         logger.info(f" 오버나잇: 허용 | 시간 제한: 없음")
         logger.info("=" * 60)
 

@@ -35,6 +35,7 @@ class TradeState:
         self.tema_sl_price = 0.0    # TEMA 기반 손절가
         self.signal_1 = 0.0         # WMA 골든크로스 시점 WMA5 값
         self.signal_2 = 0.0         # WMA 골든크로스 시점 고가(HH)
+        self.is_w_rebound = False   # 30분봉 260이평 W자 반등 여부
 
     def to_dict(self) -> dict:
         return {
@@ -53,6 +54,7 @@ class TradeState:
             'tema_sl_price': getattr(self, 'tema_sl_price', 0.0),
             'signal_1': getattr(self, 'signal_1', 0.0),
             'signal_2': getattr(self, 'signal_2', 0.0),
+            'is_w_rebound': getattr(self, 'is_w_rebound', False),
         }
 
     @classmethod
@@ -74,6 +76,7 @@ class TradeState:
         state.tema_sl_price = data.get('tema_sl_price', 0.0)
         state.signal_1 = data.get('signal_1', 0.0)
         state.signal_2 = data.get('signal_2', 0.0)
+        state.is_w_rebound = data.get('is_w_rebound', False)
         return state
 
 def calculate_trade_intensity(tick_data: list) -> dict:
