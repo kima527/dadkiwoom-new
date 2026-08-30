@@ -19,14 +19,21 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 # 15분봉 매도 신호 분석
 # ═══════════════════════════════════════════════════════════════
-def analyze_sell_signals(df_15m: pd.DataFrame) -> dict:
+def analyze_sell_signals(df_15m: pd.DataFrame, daily_df: pd.DataFrame = None) -> dict:
     """
-    15분봉 DataFrame을 받아 SMA5/SMA40 데드크로스 매도 신호를 생성합니다.
+    15분봉 DataFrame(및 일봉)을 받아 매도 신호를 생성합니다.
+
+    매도 조건:
+    1. [전일 상한가 종목 익일 시가 돌파 실패/이탈]:
+       - 전일에 상한가(등락률 >= +29.0% 또는 고가 29.5%+ 안착)를 기록한 종목인 경우,
+       - 익일(당일) 현재가가 시가(Open)를 돌파하지 못하고 하회(현재가 < 시가)하면 즉시 전량 매도.
+    2. [15분봉 SMA5/SMA40 데드크로스]:
+       - 15분봉 SMA5가 SMA40을 하향 돌파(CrossDown) 시 전량 매도.
 
     Returns
     -------
     dict:
-        sell      : bool   - 매도 신호 (SMA5가 SMA40을 하향 돌파)
+        sell      : bool   - 매도 신호
         close     : float  - 현재 종가
         sma5      : float  - 현재 SMA5 값
         sma40     : float  - 현재 SMA40 값
@@ -40,20 +47,65 @@ def analyze_sell_signals(df_15m: pd.DataFrame) -> dict:
     # 컬럼명 소문자 통일
     col_map = {}
     for col in df.columns:
-        lower = col.lower()
+        lower = str(col).lower()
         if lower in ('open', 'high', 'low', 'close', 'volume'):
             col_map[col] = lower
     df.rename(columns=col_map, inplace=True)
 
-    if 'close' not in df.columns:
+    if 'close' not in df.columns or 'open' not in df.columns:
         return {"sell": False, "close": 0.0, "sma5": 0.0, "sma40": 0.0, "reason": ""}
 
-    # ── SMA 계산 (min_periods를 기간과 동일하게 설정하여 초반 가짜 신호 방지) ──
+    close_price = float(df.iloc[-1]['close'])
+
+    # ── [조건 1] 전일 상한가 종목의 익일 시가 돌파 실패 매도 검사 ──
+    try:
+        if hasattr(df.index, 'date'):
+            unique_dates = sorted(list(set(df.index.date)))
+            if len(unique_dates) >= 2:
+                today_date = unique_dates[-1]
+                yesterday_date = unique_dates[-2]
+                
+                df_yesterday = df[df.index.date == yesterday_date]
+                df_today = df[df.index.date == today_date]
+                df_prior = df[df.index.date < yesterday_date]
+                
+                if not df_prior.empty and not df_yesterday.empty and not df_today.empty:
+                    prior_close = float(df_prior.iloc[-1]['close'])
+                    yest_close = float(df_yesterday.iloc[-1]['close'])
+                    yest_high = float(df_yesterday['high'].max())
+                    
+                    yest_ret = ((yest_close - prior_close) / prior_close) * 100 if prior_close > 0 else 0.0
+                    yest_high_ret = ((yest_high - prior_close) / prior_close) * 100 if prior_close > 0 else 0.0
+                    
+                    # 전일 상한가 달성 여부 (+29% 이상 종가 마감 또는 +29.5% 상한가 터치 후 고가 근처 유지)
+                    is_yesterday_upper_limit = (yest_ret >= 29.0) or (yest_high_ret >= 29.5 and yest_close >= yest_high * 0.985)
+                    
+                    if is_yesterday_upper_limit:
+                        today_open = float(df_today.iloc[0]['open'])
+                        
+                        # 당일 시가를 돌파하지 못하고 하회 시 (현재가 < 시가)
+                        if close_price < today_open:
+                            diff_pct = ((close_price - today_open) / today_open) * 100
+                            sma5_val = float(df['close'].rolling(5, min_periods=5).mean().iloc[-1]) if len(df) >= 5 else 0.0
+                            sma40_val = float(df['close'].rolling(40, min_periods=40).mean().iloc[-1]) if len(df) >= 40 else 0.0
+                            
+                            return {
+                                "sell": True,
+                                "close": close_price,
+                                "sma5": sma5_val,
+                                "sma40": sma40_val,
+                                "reason": (
+                                    f"⚡ [전일 상한가 종목] 익일 시가({today_open:,.0f}원) 돌파 실패 및 하회 "
+                                    f"(현재가: {close_price:,.0f}원, 시가대비: {diff_pct:+.2f}%) -> 전량 매도"
+                                )
+                            }
+    except Exception as e:
+        logger.debug(f"상한가 시가 검사 중 예외: {e}")
+
+    # ── [조건 2] 15분봉 SMA5/SMA40 데드크로스 매도 ──
     df['sma5'] = df['close'].rolling(window=5, min_periods=5).mean()
     df['sma40'] = df['close'].rolling(window=40, min_periods=40).mean()
 
-    # ── 데드크로스 감지: CrossDown(SMA5, SMA40) ──
-    # 이전 봉: SMA5 >= SMA40, 현재 봉: SMA5 < SMA40
     df['dead_cross'] = (
         (df['sma5'] < df['sma40']) &
         (df['sma5'].shift(1) >= df['sma40'].shift(1))
@@ -62,7 +114,6 @@ def analyze_sell_signals(df_15m: pd.DataFrame) -> dict:
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else latest
 
-    close_price = float(latest['close'])
     sma5_now = float(latest['sma5']) if pd.notna(latest['sma5']) else 0.0
     sma40_now = float(latest['sma40']) if pd.notna(latest['sma40']) else 0.0
 
@@ -74,7 +125,6 @@ def analyze_sell_signals(df_15m: pd.DataFrame) -> dict:
         "reason": ""
     }
 
-    # ── 매도 신호: 현재 봉 또는 직전 완성봉에서 SMA5가 SMA40을 데드크로스 ──
     is_dead_cross = bool(latest['dead_cross']) or bool(prev['dead_cross'])
     if is_dead_cross:
         result["sell"] = True
