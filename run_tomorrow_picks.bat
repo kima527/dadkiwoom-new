@@ -1,18 +1,20 @@
 @echo off
-chcp 65001
+chcp 65001 >nul
 echo =========================================================
-echo       [종가 스캔] 내일의 주도주 자동 추출 시스템
+echo       [종가 스캔] 내일의 주도주 / 돌파 임박 종목 자동 추출
 echo =========================================================
-echo 거래대금 상위 200종목 중 "최근 20일 내 20%% 이상 급등" 이력이 있는
-echo 1조원 미만의 중소형주만 엄선하여 관심종목으로 저장합니다.
+echo  - 30분봉 260이평 W자 반등 종목
+echo  - 일봉 20이평선 상향 돌파 임박 종목
+echo  - 30분봉 3일선-5일선 골든크로스 수렴 종목
+echo  - 가중 5-20 고가선(HH) 돌파 사정권 종목
+echo =========================================================
 echo.
 
-cd /d "C:\Users\zoela\OneDrive\바탕 화면\MovingAveragelineTraid"
-call "C:\Users\zoela\OneDrive\바탕 화면\PythonWorksplace\.venv\Scripts\activate.bat"
-
-python extract_tomorrow_picks.py
+cd /d "C:\Users\zoela\OneDrive\바탕 화면\PythonWorksplace"
+python -X utf8 "MovingAveragelineTraid\execution\scan_tomorrow_picks.py"
 
 echo.
-echo 스캔이 완료되었습니다! 
-echo 이제 내일 아침 run_watchlist_bot.bat을 실행하시면 됩니다.
-pause
+echo [알림] 스캔이 완료되었습니다!
+echo 내일 아침 09:00에 run_moving_average_bot.bat을 실행하면 이 종목들이 최우선 매수 감시됩니다.
+echo.
+timeout /t 10

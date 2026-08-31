@@ -23,6 +23,7 @@ import os
 import sys
 import json
 import time
+import socket
 import asyncio
 import logging
 import argparse
@@ -32,6 +33,36 @@ from strategy_buy import analyze_buy_signals
 from strategy_sell import analyze_sell_signals
 from db_logger import TradeDBLogger
 from datetime import datetime, time as dtime
+
+# ═══════════════════════════════════════════════════════════════
+# SingleInstanceLock - 봇 프로세스 중복 실행 방지 락 (Localhost Socket Lock)
+# ═══════════════════════════════════════════════════════════════
+class SingleInstanceLock:
+    """
+    로컬 TCP 포트 바인딩을 이용한 단일 인스턴스 보장 락.
+    프로세스가 종료되거나 강제 종료되어도 OS가 포트를 즉시 회수하므로
+    좀비 락 파일 문제 없이 100% 안전하게 중복 실행을 차단합니다.
+    """
+    def __init__(self, port: int = 59128):
+        self.port = port
+        self.sock = None
+
+    def acquire(self) -> bool:
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.bind(('127.0.0.1', self.port))
+            self.sock.listen(1)
+            return True
+        except OSError:
+            return False
+
+    def release(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
 
 # real trading 폴더의 websocket_client를 가져오기 위한 경로 추가
 real_trading_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'real trading'))
@@ -297,6 +328,27 @@ class BuyManager:
 
             qty = self.buy_amount // int(buy_price)
 
+            # ── [중복 매수 원천 차단 이중 안전장치] ──
+            # 1. 상태 객체 기준 이미 매수 완료/보유/당일매매종료 상태인지 재확인
+            if state.buy_step >= 1 or state.is_holding or state.trade_ended:
+                logger.info(
+                    f"⏭️ [{name}] 이미 매수 처리되었거나 보유/종료된 종목입니다. "
+                    f"(buy_step={state.buy_step}, is_holding={state.is_holding}) 중복 매수 스킵."
+                )
+                continue
+
+            # 2. 현재 미체결/대기 중인 매수 주문이 있는지 재확인
+            if any(o['code'] == code for o in self.tracked_orders.values()):
+                logger.info(f"⏭️ [{name}] 이미 주문이 전송되어 대기 중이므로 중복 매수 스킵.")
+                continue
+
+            # 3. 실시간 계좌 잔고(holdings)에 이미 존재하는지 재확인
+            if code in holdings:
+                logger.info(f"⏭️ [{name}] 계좌 잔고에 이미 보유 중인 종목입니다. 상태를 동기화하고 중복 매수 스킵.")
+                state.is_holding = True
+                state.buy_step = 1
+                continue
+
             if qty > 0:
                 priority_tag = "🔥 [W자 반등 최우선]" if is_w else "🟢"
                 logger.info(
@@ -315,6 +367,7 @@ class BuyManager:
                         'time': time.time(), 'order_type': 'buy'
                     }
                     state.buy_step = 1
+                    state.is_holding = True  # 선제적 보유 플래그 설정 (이중 매수 방어)
                     state.first_qty = qty
                     state.first_buy_candle_time = df_30m.index[-1]
                     state.signal_1 = signals['ll']  # LL 값 저장
@@ -405,7 +458,7 @@ class SellManager:
                 async with self.api_lock:
                     order_no = await asyncio.to_thread(
                         self.client.place_sell_order, code, qty_sell,
-                        price=0, order_type="03"
+                        price=current_price if current_price > 0 else buy_price, order_type="03"
                     )
                 if order_no:
                     self.tracked_orders[order_no] = {
@@ -453,7 +506,7 @@ class SellManager:
                 async with self.api_lock:
                     order_no = await asyncio.to_thread(
                         self.client.place_sell_order, code, qty_sell,
-                        price=0, order_type="03"
+                        price=current_price if current_price > 0 else buy_price, order_type="03"
                     )
                 if order_no:
                     self.tracked_orders[order_no] = {
@@ -573,7 +626,6 @@ class TradingBot:
                 logger.error(f"상태 정보 로드 실패: {e}")
 
     def save_states(self):
-        self.save_watchlist()
         state_file = os.path.join(os.path.dirname(__file__), "trade_states.json")
         try:
             data = {code: state.to_dict() for code, state in self.trade_states.items()}
@@ -685,16 +737,30 @@ class TradingBot:
                 del self.watchlist[code]
 
         # ═══════════════════════════════════════════════════════════
-        # 각 매니저별 감시 실행 (정규장 09:00 ~ 15:30 중에만 실행)
+        # 각 매니저별 감시 실행:
+        # 1. NXT 프리마켓: 08:00 ~ 08:50 (NXT 지정가 매매)
+        # 2. KRX 정규장:  09:00 ~ 15:30 (정규장 실시간 매매)
+        # (08:50 ~ 09:00은 정규장 동시호가/개장 준비 구간으로 대기)
         # ═══════════════════════════════════════════════════════════
         now_time = datetime.now().time()
+        nxt_open = dtime(8, 0, 0)
+        nxt_close = dtime(8, 50, 0)
         market_open = dtime(9, 0, 0)
         market_close = dtime(15, 30, 0)
 
-        if now_time < market_open or now_time > market_close:
+        is_nxt_session = (nxt_open <= now_time < nxt_close)
+        is_regular_session = (market_open <= now_time <= market_close)
+
+        if not (is_nxt_session or is_regular_session):
+            if nxt_close <= now_time < market_open:
+                wait_reason = "08:50~09:00 정규장 개장 준비 구간 (NXT 마감)"
+            elif now_time < nxt_open:
+                wait_reason = "08:00 NXT 프리마켓 개장 대기"
+            else:
+                wait_reason = "15:30 정규장 마감"
             logger.info(
-                f"⏳ [정규장 개장 대기/마감] 현재 {now_time.strftime('%H:%M:%S')}. "
-                f"정규장(09:00~15:30) 중에만 실시간 매매/손절을 실행합니다. (잔고 동기화만 유지)"
+                f"⏳ [{wait_reason}] 현재 {now_time.strftime('%H:%M:%S')}. "
+                f"(매매 세션: NXT 08:00~08:50 / KRX 09:00~15:30) 잔고 동기화만 유지합니다."
             )
             self.save_states()
             return
@@ -732,6 +798,7 @@ class TradingBot:
         logger.info("=" * 60)
         logger.info(" 🚀 [30분봉 260이평 W자 반등 우선 매수 + 15분봉 SMA 데드크로스 매도 봇] 시작")
         logger.info(f" 활성 임무: {', '.join(tasks_str)}")
+        logger.info(f" 세션: [NXT 프리마켓] 08:00 ~ 08:50 | [KRX 정규장] 09:00 ~ 15:30")
         logger.info(f" 전략: [최우선] 30분봉 260이평 W자 반등 종목 우선 매수")
         logger.info(f"       [기본] 일봉/30분봉 SMA 돌파 및 가중5-20고가선(HH) 돌파 매수")
         logger.info(f"       [매도] 15분봉 SMA(5,40) 데드크로스 시장가 매도")
@@ -806,7 +873,17 @@ async def main():
 
 
 if __name__ == "__main__":
+    lock = SingleInstanceLock(port=59128)
+    if not lock.acquire():
+        logger.error("=" * 60)
+        logger.error("🛑 [중복 실행 방지] 이미 다른 trading_bot 프로세스가 실행 중입니다!")
+        logger.error("   동일 종목 이중 매수 사고를 방지하기 위해 이 프로세스를 즉시 종료합니다.")
+        logger.error("=" * 60)
+        sys.exit(1)
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("프로그램을 종료합니다.")
+    finally:
+        lock.release()
