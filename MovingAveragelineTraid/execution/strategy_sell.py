@@ -125,12 +125,22 @@ def analyze_sell_signals(df_15m: pd.DataFrame, daily_df: pd.DataFrame = None) ->
         "reason": ""
     }
 
-    is_dead_cross = bool(latest['dead_cross']) or bool(prev['dead_cross'])
-    if is_dead_cross:
-        result["sell"] = True
-        result["reason"] = (
-            f"15분봉 SMA5({sma5_now:,.0f})<SMA40({sma40_now:,.0f}) 데드크로스 발생, "
-            f"종가: {close_price:,.0f}"
-        )
+    # 1호가 미세 흔들림(이격도 미세)으로 인한 휩쏘 방지:
+    # 1) SMA5가 SMA40 대비 최소 0.4% 이상 확실하게 하회 이탈(SMA5 < SMA40 * 0.996)하거나 현재가가 SMA40을 하회
+    # 2) 과거 15봉 중 5이평이 40이평 위에 머물렀던 '선행 상승 추세' 이력이 최소 3봉 이상 존재할 때만 매도
+    if sma5_now > 0 and sma40_now > 0:
+        is_cross_down = bool(latest['dead_cross']) or bool(prev['dead_cross'])
+        is_meaningful_breakdown = (sma5_now < sma40_now * 0.996) or (close_price < sma40_now * 0.995)
+        
+        lookback_df = df.iloc[-15:-1] if len(df) >= 15 else df.iloc[:-1]
+        had_prior_uptrend = bool((lookback_df['sma5'] > lookback_df['sma40']).sum() >= 3) if not lookback_df.empty else True
+
+        if is_cross_down and is_meaningful_breakdown and had_prior_uptrend:
+            diff_pct = ((sma5_now - sma40_now) / sma40_now) * 100
+            result["sell"] = True
+            result["reason"] = (
+                f"15분봉 SMA5({sma5_now:,.0f})<SMA40({sma40_now:,.0f}) 데드크로스 이탈 확인 "
+                f"(이격도: {diff_pct:+.2f}%, 종가: {close_price:,.0f})"
+            )
 
     return result

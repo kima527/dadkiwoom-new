@@ -36,6 +36,7 @@ class TradeState:
         self.signal_1 = 0.0         # WMA 골든크로스 시점 WMA5 값
         self.signal_2 = 0.0         # WMA 골든크로스 시점 고가(HH)
         self.is_w_rebound = False   # 30분봉 260이평 W자 반등 여부
+        self.buy_time = 0.0         # 매수 체결 시간 (초 단위 timestamp)
 
     def to_dict(self) -> dict:
         return {
@@ -55,6 +56,7 @@ class TradeState:
             'signal_1': getattr(self, 'signal_1', 0.0),
             'signal_2': getattr(self, 'signal_2', 0.0),
             'is_w_rebound': getattr(self, 'is_w_rebound', False),
+            'buy_time': getattr(self, 'buy_time', 0.0),
         }
 
     @classmethod
@@ -77,6 +79,7 @@ class TradeState:
         state.signal_1 = data.get('signal_1', 0.0)
         state.signal_2 = data.get('signal_2', 0.0)
         state.is_w_rebound = data.get('is_w_rebound', False)
+        state.buy_time = data.get('buy_time', 0.0)
         return state
 
 def calculate_trade_intensity(tick_data: list) -> dict:

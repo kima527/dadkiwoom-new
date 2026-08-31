@@ -117,23 +117,15 @@ def calculate_sma_breakout_signals(
                 )
 
     # ===================================================================
-    # 3. 보유 중 — 트레일링 스탑 (120봉 최고가 × 0.98)
+    # 3. 보유 중 — 매입단가 -5% 손절 감시
     # ===================================================================
     else:
-        # 트레일링 고점 갱신 (보유 진입 이후 최고가 추적)
-        if highest_120 > state.trailing_high:
-            state.trailing_high = highest_120
-
-        stop_price = state.trailing_high * 0.98
-
-        # 현재 종가가 손절선(-2%) 이하로 내려오면 즉시 매도
-        if close_price <= stop_price:
+        # 3.1 매입단가 기준 -5% 하드 손절
+        if hold_buy_price > 0 and close_price <= hold_buy_price * 0.95:
+            calc_ret = ((close_price - hold_buy_price) / hold_buy_price) * 100
             return {
                 "sell": True,
-                "sell_reason": (
-                    f"120봉 최고가({state.trailing_high:,.0f}) × 0.98 = "
-                    f"{stop_price:,.0f} 하향이탈"
-                ),
+                "sell_reason": f"⚡ 매입단가({hold_buy_price:,.0f}원) 대비 -5% 하드 손절: 현재가 {close_price:,.0f}원 ({calc_ret:+.2f}%)",
                 "price": close_price,
             }
 

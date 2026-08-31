@@ -53,15 +53,79 @@ def calculate_hh(df: pd.DataFrame) -> pd.Series:
     return df['hh_line']
 
 # ═══════════════════════════════════════════════════════════════
+# 30분봉 실시간 3일선 / 5일선 계산 (키움증권 분봉 수식)
+# ═══════════════════════════════════════════════════════════════
+def calculate_realtime_day_smas(df_30m: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    30분봉 차트에서 키움증권 일봉 3일선/5일선을 실시간 계산:
+      3일선 = (npredayclose(2) + npredayclose(1) + dayclose()) / 3
+      5일선 = (npredayclose(4) + npredayclose(3) + npredayclose(2) + npredayclose(1) + dayclose()) / 5
+    """
+    if df_30m is None or df_30m.empty or daily_df is None or len(daily_df) < 5:
+        return df_30m
+
+    df30 = df_30m.copy()
+    df30.rename(columns={col: col.lower() for col in df30.columns}, inplace=True)
+
+    df_d = daily_df.copy()
+    df_d.rename(columns={col: col.lower() for col in df_d.columns}, inplace=True)
+
+    if 'date' in df_d.columns:
+        df_d['dt'] = pd.to_datetime(df_d['date']).dt.date
+    elif isinstance(df_d.index, pd.DatetimeIndex):
+        df_d['dt'] = df_d.index.date
+    else:
+        df_d['dt'] = pd.date_range(end=pd.Timestamp.today().date(), periods=len(df_d)).date
+
+    df_d.sort_values('dt', inplace=True)
+
+    df_d['c_d1'] = df_d['close'].shift(1)  # npredayclose(1)
+    df_d['c_d2'] = df_d['close'].shift(2)  # npredayclose(2)
+    df_d['c_d3'] = df_d['close'].shift(3)  # npredayclose(3)
+    df_d['c_d4'] = df_d['close'].shift(4)  # npredayclose(4)
+
+    day_map = df_d.set_index('dt')[['c_d1', 'c_d2', 'c_d3', 'c_d4']].to_dict(orient='index')
+
+    if isinstance(df30.index, pd.DatetimeIndex):
+        df30['dt'] = df30.index.date
+    elif 'time' in df30.columns:
+        df30['dt'] = pd.to_datetime(df30['time']).dt.date
+    else:
+        latest_dt = df_d['dt'].iloc[-1]
+        df30['dt'] = latest_dt
+
+    d1_list, d2_list, d3_list, d4_list = [], [], [], []
+    for d in df30['dt']:
+        vals = day_map.get(d)
+        if not vals:
+            vals = df_d[['c_d1', 'c_d2', 'c_d3', 'c_d4']].iloc[-1].to_dict()
+        d1_list.append(vals['c_d1'])
+        d2_list.append(vals['c_d2'])
+        d3_list.append(vals['c_d3'])
+        d4_list.append(vals['c_d4'])
+
+    df30['c_d1'] = d1_list
+    df30['c_d2'] = d2_list
+    df30['c_d3'] = d3_list
+    df30['c_d4'] = d4_list
+
+    df30['day_sma3'] = (df30['c_d2'] + df30['c_d1'] + df30['close']) / 3.0
+    df30['day_sma5'] = (df30['c_d4'] + df30['c_d3'] + df30['c_d2'] + df30['c_d1'] + df30['close']) / 5.0
+
+    df30['gc_3_5'] = (df30['day_sma3'] > df30['day_sma5']) & (df30['day_sma3'].shift(1) <= df30['day_sma5'].shift(1))
+    return df30
+
+# ═══════════════════════════════════════════════════════════════
 # 30분봉 260이평선 W자 반등(이중바닥 재돌파) 검출
 # ═══════════════════════════════════════════════════════════════
-def detect_w_rebound_30m(df30: pd.DataFrame, lookback: int = 280) -> tuple[bool, dict]:
+# ═══════════════════════════════════════════════════════════════
+def detect_w_rebound_30m(df30: pd.DataFrame, lookback: int = 200) -> tuple[bool, dict]:
     """
-    30분봉 차트에서 단순 260이평선 기준 W자 반등 패턴을 검출:
-    (단기 3~5일 주기 및 20일 전 1차 돌파 후 재돌파하는 중기 20일 주기까지 모두 탐색)
-    1) 1차 상승: 과거 260이평선 위로 상승했던 이력 (Peak 1, High > SMA260) - 최대 20~25영업일 전
-    2) 하락/눌림: 1차 상승 이후 260이평선 아래 또는 부근으로 눌림목 형성 (Trough, Low <= SMA260)
-    3) 2차 반등: 눌림 이후 다시 반등하여 260이평선을 재차 상향 돌파/안착 (Right arm Rebound)
+    30분봉 260이평선을 '중심 기준선(Baseline)'으로 잡고 W자 이중바닥 반등 패턴 검출:
+    1) 1차 바닥 (Left Bottom): 260이평선 아래로 이탈 또는 260선 지지 터치 (Low <= SMA260 * 1.01)
+    2) 중간 반등 (Middle Peak): 260이평선 위로 상승 (High >= SMA260 * 1.015)
+    3) 2차 바닥 (Right Bottom/눌림): 다시 260선으로 내려와 지지 형성 (Low <= SMA260 * 1.015)
+    4) W자 완성 돌파 (Breakout): 당일 260선(기준선)을 상향 돌파/지지 후 갓 올라선 상태 (이격도 +0% ~ +3.5% 이내)
     """
     empty_res = (False, {})
     if df30 is None or len(df30) < 260:
@@ -75,7 +139,6 @@ def detect_w_rebound_30m(df30: pd.DataFrame, lookback: int = 280) -> tuple[bool,
     if 'sma260' not in df.columns:
         df['sma260'] = df['close'].rolling(window=260, min_periods=260).mean()
 
-    # sma260이 유효하게 계산된 구간에서 최근 lookback(최대 280봉, 약 20~22영업일) 추출
     valid_df = df.dropna(subset=['sma260'])
     if valid_df.empty:
         return empty_res
@@ -92,77 +155,86 @@ def detect_w_rebound_30m(df30: pd.DataFrame, lookback: int = 280) -> tuple[bool,
     curr_c = closes[-1]
     curr_sma = sma260s[-1]
 
-    # 현재가는 260이평선 위이거나 돌파 직후 안착 상태여야 함 (0.5% 오차 허용)
-    if curr_c < curr_sma * 0.995:
+    # [핵심 1] 기준선 이격도 엄격 제한:
+    # W자 패턴 완성 타점은 260이평선(기준선) 바로 위/근처(+0.0% ~ +3.5% 이내)여야 함!
+    # 이미 260선에서 +10%, +20% 폭등해 있는 고점 종목(예: 성광벤드)은 원천 탈락!
+    if curr_c < curr_sma * 0.995 or curr_c > curr_sma * 1.035:
         return empty_res
 
-    # 1. 최근 1~6봉 내에 260이평선 재돌파(Rebound) 또는 지지 반등 확인
-    recent_rebound_idx = None
-    for i in range(n - 1, max(0, n - 7), -1):
-        if closes[i] >= sma260s[i] * 0.998:
-            recent_rebound_idx = i
+    # [핵심 2] 당일/최근 260선 기준선 상향 돌파 또는 지지 반등 확인
+    recent_breakout = False
+    for i in range(n - 1, max(0, n - 5), -1):
+        if closes[i] >= sma260s[i] * 0.998 and (i == 0 or closes[i - 1] <= sma260s[i - 1] * 1.005 or lows[i] <= sma260s[i] * 1.005):
+            recent_breakout = True
             break
 
-    if recent_rebound_idx is None:
+    if not recent_breakout:
         return empty_res
 
-    # 2. recent_rebound_idx 이전에 260이평선 아래 또는 부근으로 하락했던 눌림목(Trough) 탐색 (최대 250봉 전까지 탐색)
-    trough_idx = None
-    trough_low = float('inf')
-    for i in range(recent_rebound_idx - 1, max(0, recent_rebound_idx - 250), -1):
-        # 260이평선 아래로 내려갔거나 260이평선에 밀착된 저점
-        if closes[i] < sma260s[i] or lows[i] <= sma260s[i] * 1.002:
-            if lows[i] < trough_low:
-                trough_low = lows[i]
-                trough_idx = i
+    # [핵심 3] 2차 바닥 (Right Bottom / 260선 부근 눌림 지지) 탐색 (최근 2~60봉 내)
+    right_trough_idx = None
+    right_trough_low = float('inf')
+    for i in range(n - 2, max(0, n - 65), -1):
+        if lows[i] <= sma260s[i] * 1.015:
+            if lows[i] < right_trough_low:
+                right_trough_low = lows[i]
+                right_trough_idx = i
 
-    if trough_idx is None or (recent_rebound_idx - trough_idx < 1):
+    if right_trough_idx is None:
         return empty_res
 
-    # 3. trough_idx 이전에 260이평선 위로 상승했던 1차 상승(Peak 1) 탐색 (눌림목 이전 전체 구간 탐색)
-    peak1_idx = None
-    peak1_high = float('-inf')
-    for i in range(trough_idx - 1, -1, -1):
-        if highs[i] > sma260s[i] * 1.002 or closes[i] > sma260s[i]:
-            if highs[i] > peak1_high:
-                peak1_high = highs[i]
-                peak1_idx = i
+    # [핵심 4] 중간 반등 고점 (Middle Peak) 탐색 (2차 바닥 이전)
+    middle_peak_idx = None
+    middle_peak_high = float('-inf')
+    for i in range(right_trough_idx - 1, max(0, right_trough_idx - 80), -1):
+        if highs[i] >= sma260s[i] * 1.015 or closes[i] > sma260s[i]:
+            if highs[i] > middle_peak_high:
+                middle_peak_high = highs[i]
+                middle_peak_idx = i
 
-    if peak1_idx is None or (trough_idx - peak1_idx < 1):
+    if middle_peak_idx is None:
         return empty_res
 
-    # 4. 형상 유효성 검증:
-    # 1차 고점 > 눌림 저점
-    if peak1_high <= trough_low:
+    # [핵심 5] 1차 바닥 (Left Bottom) 탐색 (중간 반등 이전)
+    left_trough_idx = None
+    left_trough_low = float('inf')
+    for i in range(middle_peak_idx - 1, max(0, middle_peak_idx - 100), -1):
+        if lows[i] <= sma260s[i] * 1.015:
+            if lows[i] < left_trough_low:
+                left_trough_low = lows[i]
+                left_trough_idx = i
+
+    if left_trough_idx is None:
         return empty_res
 
-    # 반등 탄력도(%)
-    rebound_pct = ((curr_c - trough_low) / trough_low) * 100 if trough_low > 0 else 0.0
-    peak1_bars_ago = n - 1 - peak1_idx
-    trough_bars_ago = n - 1 - trough_idx
+    # [핵심 6] W자 형상 검증: 중간 고점 > 1차 바닥 & 2차 바닥
+    if middle_peak_high <= left_trough_low or middle_peak_high <= right_trough_low:
+        return empty_res
 
-    # 주기 유형 분류 (단기 W자 vs 20일 전 1차 돌파 중기 W자)
-    days_ago = peak1_bars_ago / 13.0
-    if peak1_bars_ago >= 130:
-        cycle_name = f"중기 20일선 W자 재돌파 ({days_ago:.1f}일 전 1차돌파)"
-    else:
-        cycle_name = f"단기 W자 반등 ({max(1, int(days_ago + 0.5))}일 주기)"
+    rebound_pct = ((curr_c - right_trough_low) / right_trough_low) * 100 if right_trough_low > 0 else 0.0
+    left_bars_ago = n - 1 - left_trough_idx
+    peak_bars_ago = n - 1 - middle_peak_idx
+    right_bars_ago = n - 1 - right_trough_idx
 
     w_info = {
         "is_w_rebound": True,
-        "cycle_name": cycle_name,
-        "peak1_high": peak1_high,
-        "peak1_bars_ago": peak1_bars_ago,
-        "peak1_days_ago": round(days_ago, 1),
-        "trough_low": trough_low,
-        "trough_bars_ago": trough_bars_ago,
+        "cycle_name": "30분봉 260이평 기준선 W자 반등",
+        "left_bottom_low": left_trough_low,
+        "left_bars_ago": left_bars_ago,
+        "middle_peak_high": middle_peak_high,
+        "middle_bars_ago": peak_bars_ago,
+        "right_bottom_low": right_trough_low,
+        "right_bars_ago": right_bars_ago,
         "sma260": curr_sma,
         "current_price": curr_c,
         "rebound_pct": rebound_pct,
+        "diff_from_sma260_pct": ((curr_c - curr_sma) / curr_sma) * 100,
         "description": (
-            f"[{cycle_name}] 완성 (1차고점:{peak1_high:,.0f}원[{peak1_bars_ago}봉전({days_ago:.1f}일전)] ➔ "
-            f"눌림저점:{trough_low:,.0f}원[{trough_bars_ago}봉전] ➔ "
-            f"260이평({curr_sma:,.0f}원) 재돌파 +{rebound_pct:.1f}%)"
+            f"[30분봉 260이평 기준선 W자 패턴 완성] "
+            f"1차바닥:{left_trough_low:,.0f}원[{left_bars_ago}봉전] ➔ "
+            f"중간반등:{middle_peak_high:,.0f}원[{peak_bars_ago}봉전] ➔ "
+            f"2차지지바닥:{right_trough_low:,.0f}원[{right_bars_ago}봉전] ➔ "
+            f"260이평({curr_sma:,.0f}원) 기준선 재돌파 안착 (현재가:{curr_c:,.0f}원, 이격도:{((curr_c - curr_sma)/curr_sma)*100:+.2f}%)"
         )
     }
     return True, w_info
@@ -211,124 +283,168 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
     daily_hh_val = 0.0
 
     # ─────────────────────────────────────────────────
-    # 1. 일봉 차트 검사
+    # [조건 1] 30분봉에서 260이평선 당일 돌파 검사
     # ─────────────────────────────────────────────────
-    if daily_df is not None and not daily_df.empty and len(daily_df) >= 20:
-        df_d = daily_df.copy()
-        df_d.rename(columns={col: col.lower() for col in df_d.columns}, inplace=True)
-        
-        # 일봉 SMA 20 (최소 20개 필요)
-        df_d['sma20'] = df_d['close'].rolling(window=20, min_periods=20).mean()
-        
-        # 일봉 HH (가중 5-20 고가선)
-        df_d['hh'] = calculate_hh(df_d)
-        
-        if len(df_d) >= 2:
-            d_latest = df_d.iloc[-1]
-            d_prev = df_d.iloc[-2]
-            
-            d_sma20 = float(d_latest['sma20']) if pd.notna(d_latest['sma20']) else 0.0
-            d_prev_sma20 = float(d_prev['sma20']) if pd.notna(d_prev['sma20']) else 0.0
-
-            prev_hh_val = float(d_prev['hh']) if (pd.notna(d_prev['hh']) and float(d_prev['hh']) > 0) else 0.0
-            latest_hh_val = float(d_latest['hh']) if pd.notna(d_latest['hh']) else 0.0
-            d_hh = prev_hh_val if prev_hh_val > 0 else latest_hh_val
-            
-            if d_sma20 > 0 and d_prev_sma20 > 0 and d_hh > 0:
-                daily_sma20_crossup = (float(d_prev['close']) <= d_prev_sma20) and (current_price > d_sma20)
-                daily_above_hh = (current_price > d_hh) or (current_price >= latest_hh_val)
-                daily_hh_val = d_hh
-                
-                if daily_sma20_crossup and daily_above_hh:
-                    is_daily_condition_met = True
-                    daily_reason = (
-                        f"일봉 조건 충족: 당일 SMA20({d_sma20:,.0f}) 돌파 & "
-                        f"가중5-20고가선({d_hh:,.0f}) 위 위치 (현재가: {current_price:,.0f})"
-                    )
-
-    # ─────────────────────────────────────────────────
-    # 2. 30분봉 차트 검사
-    # ─────────────────────────────────────────────────
-    is_30m_condition_met = False
+    cond1_30m_sma260 = False
     m30_reason = ""
-    m30_hh_val = 0.0
-    
-    if len(df30) >= 260:
-        # 30분봉 SMA 260
-        df30['sma260'] = df30['close'].rolling(window=260, min_periods=260).mean()
-        
-        # 30분봉 HH (가중 5-20 고가선)
-        df30['hh'] = calculate_hh(df30)
-        
-        m30_latest = df30.iloc[-1]
-        m30_prev = df30.iloc[-2] if len(df30) >= 2 else m30_latest
-        
-        m30_sma260 = float(m30_latest['sma260']) if pd.notna(m30_latest['sma260']) else 0.0
-        
-        prev_m30_hh = float(m30_prev['hh']) if (pd.notna(m30_prev['hh']) and float(m30_prev['hh']) > 0) else 0.0
-        latest_m30_hh = float(m30_latest['hh']) if pd.notna(m30_latest['hh']) else 0.0
-        m30_hh = prev_m30_hh if prev_m30_hh > 0 else latest_m30_hh
-        m30_hh_val = m30_hh
+    m30_sma260_val = 0.0
 
-        if m30_sma260 > 0 and m30_hh > 0:
+    if len(df30) >= 260:
+        df30['sma260'] = df30['close'].rolling(window=260, min_periods=260).mean()
+        m30_latest = df30.iloc[-1]
+        m30_sma260_val = float(m30_latest['sma260']) if pd.notna(m30_latest['sma260']) else 0.0
+
+        if m30_sma260_val > 0 and current_price > m30_sma260_val:
             if isinstance(df30.index, pd.DatetimeIndex):
                 today_date = df30.index[-1].date()
                 today_mask = df30.index.date == today_date
                 df30_today = df30[today_mask]
-                df30_prev_days = df30[~today_mask]
+                df30_prev = df30[~today_mask]
             else:
                 df30_today = df30.iloc[-13:]
-                df30_prev_days = df30.iloc[:-13]
+                df30_prev = df30.iloc[:-13]
 
-            prev_day_last_close = float(df30_prev_days.iloc[-1]['close']) if not df30_prev_days.empty else 0.0
-            prev_day_last_sma260 = float(df30_prev_days.iloc[-1]['sma260']) if (not df30_prev_days.empty and pd.notna(df30_prev_days.iloc[-1]['sma260'])) else 0.0
+            prev_day_last_close = float(df30_prev.iloc[-1]['close']) if not df30_prev.empty else 0.0
+            prev_day_last_sma260 = float(df30_prev.iloc[-1]['sma260']) if (not df30_prev.empty and pd.notna(df30_prev.iloc[-1]['sma260'])) else 0.0
             
-            climbed_from_prev_day = (prev_day_last_close <= prev_day_last_sma260) and (current_price > m30_sma260)
-            
-            today_crossup_sma260 = False
+            # 어제 종가 <= 어제 SMA260 이었거나, 당일 장중 캔들에서 직접 CrossUp 발생했거나, W자 반등 완성
+            climbed_from_prev_day = (prev_day_last_close <= prev_day_last_sma260)
+            today_crossup = False
             if len(df30_today) >= 2:
                 crosses = (df30_today['close'] > df30_today['sma260']) & (df30_today['close'].shift(1) <= df30_today['sma260'].shift(1))
-                today_crossup_sma260 = bool(crosses.any())
+                today_crossup = bool(crosses.any())
 
-            m30_sma260_climbed = (current_price > m30_sma260) and (climbed_from_prev_day or today_crossup_sma260 or is_w_rebound)
-
-            prior_m30_hh = float(df30_prev_days['hh'].dropna().iloc[-1]) if (not df30_prev_days.empty and df30_prev_days['hh'].notna().any()) else latest_m30_hh
-            m30_hh_val = prior_m30_hh if prior_m30_hh > 0 else latest_m30_hh
-
-            m30_above_hh = (current_price > prior_m30_hh) or (current_price >= latest_m30_hh)
-
-            if m30_sma260_climbed and m30_above_hh and m30_hh_val > 0:
-                is_30m_condition_met = True
+            if climbed_from_prev_day or today_crossup or is_w_rebound:
+                cond1_30m_sma260 = True
+                diff_pct = ((current_price - m30_sma260_val) / m30_sma260_val) * 100
                 if is_w_rebound:
                     m30_reason = (
-                        f"🔥 [30분봉 260이평 W자 반등 최우선] {w_info['description']} & "
-                        f"가중5-20고가선({m30_hh_val:,.0f}) 돌파 (현재가: {current_price:,.0f})"
+                        f"🔥 [조건1: 30분봉 260이평 W자 반등 돌파] {w_info['description']} "
+                        f"(260이평: {m30_sma260_val:,.0f}원, 현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
                     )
                 else:
                     m30_reason = (
-                        f"30분봉 조건 충족: 당일 SMA260({m30_sma260:,.0f}) 돌파 & "
-                        f"가중5-20고가선({m30_hh_val:,.0f}) 돌파 (현재가: {current_price:,.0f})"
+                        f"🟢 [조건1: 30분봉 당일 260이평 상향 돌파] "
+                        f"260이평({m30_sma260_val:,.0f}원) 위 안착 (현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
                     )
 
     # ─────────────────────────────────────────────────
-    # 3. 매수 신호 종합 (W자 반등 우선 적용)
+    # [조건 2] 일봉에서 당일 20이평선 위로 돌파 검사
     # ─────────────────────────────────────────────────
-    if is_w_rebound and (is_30m_condition_met or is_daily_condition_met):
-        result['buy'] = True
-        result['reason'] = m30_reason if is_30m_condition_met else (f"🔥 [30분봉 W자 반등 최우선] {w_info['description']} & " + daily_reason)
-        result['ll'] = m30_hh_val if is_30m_condition_met else daily_hh_val
-        result['priority_score'] = 100.0 + min(w_info.get('rebound_pct', 0.0), 20.0)
+    cond2_daily_sma20 = False
+    daily_reason = ""
+    d_sma20_val = 0.0
 
-    elif is_30m_condition_met:
-        result['buy'] = True
-        result['reason'] = m30_reason
-        result['ll'] = m30_hh_val
-        result['priority_score'] = 80.0
+    if daily_df is not None and not daily_df.empty and len(daily_df) >= 20:
+        df_d = daily_df.copy()
+        df_d.rename(columns={col: col.lower() for col in df_d.columns}, inplace=True)
+        df_d['sma20'] = df_d['close'].rolling(window=20, min_periods=20).mean()
 
-    elif is_daily_condition_met:
+        if len(df_d) >= 2:
+            d_latest = df_d.iloc[-1]
+            d_prev = df_d.iloc[-2]
+            d_sma20_val = float(d_latest['sma20']) if pd.notna(d_latest['sma20']) else 0.0
+            d_prev_sma20 = float(d_prev['sma20']) if pd.notna(d_prev['sma20']) else 0.0
+            d_prev_close = float(d_prev['close']) if pd.notna(d_prev['close']) else 0.0
+
+            if d_sma20_val > 0 and d_prev_sma20 > 0:
+                # 전일 종가 <= 전일 20이평 & 현재가 > 당일 20이평
+                if (d_prev_close <= d_prev_sma20) and (current_price > d_sma20_val):
+                    cond2_daily_sma20 = True
+                    diff_pct = ((current_price - d_sma20_val) / d_sma20_val) * 100
+                    daily_reason = (
+                        f"🟢 [조건2: 일봉 당일 20이평선 상향 돌파] "
+                        f"일봉 20이평({d_sma20_val:,.0f}원) 돌파 안착 (현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
+                    )
+
+    # ─────────────────────────────────────────────────
+    # [조건 3] 30분봉에서 실시간 3일선이 5일선 당일 돌파 검사 (3일선 우상향 필수)
+    # ─────────────────────────────────────────────────
+    cond3_day_sma_cross = False
+    day_sma_reason = ""
+    curr_sma3 = 0.0
+    curr_sma5 = 0.0
+    prev_sma3 = 0.0
+
+    if daily_df is not None and len(daily_df) >= 5:
+        df30_day_sma = calculate_realtime_day_smas(df30, daily_df)
+        if 'day_sma3' in df30_day_sma.columns and 'day_sma5' in df30_day_sma.columns:
+            latest_s = df30_day_sma.iloc[-1]
+            prev_s = df30_day_sma.iloc[-2] if len(df30_day_sma) >= 2 else latest_s
+
+            curr_sma3 = float(latest_s['day_sma3']) if pd.notna(latest_s['day_sma3']) else 0.0
+            curr_sma5 = float(latest_s['day_sma5']) if pd.notna(latest_s['day_sma5']) else 0.0
+            prev_sma3 = float(prev_s['day_sma3']) if pd.notna(prev_s['day_sma3']) else 0.0
+
+            # 3일선이 5일선 위에 위치(정배열)하고, 반드시 3일선이 직전 대비 '우상향(상향 방향)' 중이어야 함
+            is_s3_above_s5 = (curr_sma3 > curr_sma5)
+            is_s3_slope_up = (curr_sma3 >= prev_sma3)  # 3일선 상향 방향 확인 (데드크로스/하향 절대 금지)
+
+            if curr_sma3 > 0 and curr_sma5 > 0 and is_s3_above_s5 and is_s3_slope_up:
+                if isinstance(df30_day_sma.index, pd.DatetimeIndex):
+                    today_date = df30_day_sma.index[-1].date()
+                    today_mask = df30_day_sma.index.date == today_date
+                    df30_today_smas = df30_day_sma[today_mask]
+                    df30_prev_smas = df30_day_sma[~today_mask]
+                else:
+                    df30_today_smas = df30_day_sma.iloc[-13:]
+                    df30_prev_smas = df30_day_sma.iloc[:-13]
+
+                was_below_yesterday = True
+                if not df30_prev_smas.empty:
+                    prev_last_s3 = float(df30_prev_smas.iloc[-1]['day_sma3'])
+                    prev_last_s5 = float(df30_prev_smas.iloc[-1]['day_sma5'])
+                    was_below_yesterday = (prev_last_s3 <= prev_last_s5)
+
+                today_crossup = False
+                if len(df30_today_smas) >= 2:
+                    crosses = (df30_today_smas['day_sma3'] > df30_today_smas['day_sma5']) & (df30_today_smas['day_sma3'].shift(1) <= df30_today_smas['day_sma5'].shift(1))
+                    today_crossup = bool(crosses.any())
+
+                if was_below_yesterday or today_crossup:
+                    cond3_day_sma_cross = True
+                    diff_pct = ((curr_sma3 - curr_sma5) / curr_sma5) * 100
+                    slope_pct = ((curr_sma3 - prev_sma3) / prev_sma3) * 100 if prev_sma3 > 0 else 0.0
+                    day_sma_reason = (
+                        f"⚡ [조건3: 30분봉 당일 3일-5일선 골든크로스 & 3일선 우상향 돌파!] "
+                        f"3일선({curr_sma3:,.0f}원, 기울기:{slope_pct:+.2f}%) > 5일선({curr_sma5:,.0f}원) "
+                        f"(이격도: {diff_pct:+.2f}%, 현재가: {current_price:,.0f}원)"
+                    )
+
+    # ─────────────────────────────────────────────────
+    # [최종 대전제 검증] 3일선-5일선 정배열(3일선>5일선) 및 3일선 우상향 필수
+    # ─────────────────────────────────────────────────
+    # ⚠️ 조건 1, 2, 3 중 무엇을 만족하든 간에, 단기 3일선이 5일선 아래에 있거나(데드크로스/역배열)
+    # 3일선이 아래로 꺾여 하향 중인 종목은 절대로 매수하지 않습니다 (로보티즈 등 손실 유발 차단).
+    if curr_sma3 > 0 and curr_sma5 > 0:
+        is_strictly_bullish = (curr_sma3 > curr_sma5) and (curr_sma3 >= prev_sma3)
+        if not is_strictly_bullish:
+            return result
+
+    # ─────────────────────────────────────────────────
+    # 매수 신호 판정: 조건 1 OR 조건 2 OR 조건 3
+    # ─────────────────────────────────────────────────
+    if cond1_30m_sma260 or cond2_daily_sma20 or cond3_day_sma_cross:
         result['buy'] = True
-        result['reason'] = daily_reason
-        result['ll'] = daily_hh_val
-        result['priority_score'] = 75.0
+        
+        # 사유 조합 및 우선순위 점수 산정
+        reasons = []
+        if cond1_30m_sma260:
+            reasons.append(m30_reason)
+            result['ll'] = m30_sma260_val
+            base_score = 100.0 + min(w_info.get('rebound_pct', 0.0), 20.0) if is_w_rebound else 85.0
+            result['priority_score'] = max(result['priority_score'], base_score)
+
+        if cond3_day_sma_cross:
+            reasons.append(day_sma_reason)
+            result['ll'] = curr_sma5 if result['ll'] == 0 else result['ll']
+            result['priority_score'] = max(result['priority_score'], 90.0)
+
+        if cond2_daily_sma20:
+            reasons.append(daily_reason)
+            result['ll'] = d_sma20_val if result['ll'] == 0 else result['ll']
+            result['priority_score'] = max(result['priority_score'], 80.0)
+
+        result['reason'] = " | ".join(reasons)
 
     return result

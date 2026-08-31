@@ -85,7 +85,7 @@ class MarketIndexGuard:
                     open_p = float(df_today.iloc[0]['open'])
                     curr_p = float(df_today.iloc[-1]['close'])
                     kospi_chg = ((curr_p - open_p) / open_p) * 100
-                    if kospi_chg <= -1.5:
+                    if kospi_chg <= -2.5:
                         kospi_safe = False
                         warning_reasons.append(f"코스피 급락({kospi_chg:+.2f}%)")
 
@@ -96,7 +96,7 @@ class MarketIndexGuard:
                     open_p = float(df_today.iloc[0]['open'])
                     curr_p = float(df_today.iloc[-1]['close'])
                     kosdaq_chg = ((curr_p - open_p) / open_p) * 100
-                    if kosdaq_chg <= -1.8:
+                    if kosdaq_chg <= -3.0:
                         kosdaq_safe = False
                         warning_reasons.append(f"코스닥 급락({kosdaq_chg:+.2f}%)")
 
@@ -147,19 +147,20 @@ class BuyManager:
         """매수 감시 사이클 실행"""
 
         # ── 1. 시장 지수 급락 안전장치 검사 ──
+        is_market_in_danger = False
         if self.market_guard:
             market_status = await self.market_guard.check_market_health()
             kospi_str = f"KOSPI: {market_status['kospi_chg']:+.2f}%"
             kosdaq_str = f"KOSDAQ: {market_status['kosdaq_chg']:+.2f}%"
             
             if not market_status['safe']:
+                is_market_in_danger = True
                 logger.warning(
-                    f"🛑 [지수 급락 방어 발동] {kospi_str} | {kosdaq_str} -> "
-                    f"{market_status['reason']}. 이번 사이클 신규 매수를 일시 중단합니다."
+                    f"🛑 [지수 급락 방어 모드] {kospi_str} | {kosdaq_str} -> "
+                    f"{market_status['reason']}. 체결강도 150% 이상 강력 주도주 및 W자 반등 대장주만 선별 매수합니다."
                 )
-                return
             else:
-                logger.info(f"🌐 [시장 지수 상태] {kospi_str} | {kosdaq_str} -> 정상 (매수 탐색 진행)")
+                logger.info(f"🌐 [시장 지수 상태] {kospi_str} | {kosdaq_str} -> 정상 (전체 매수 탐색 진행)")
 
         # 보유 종목 수 제한 (30개)
         pending_buy_codes = {
@@ -177,13 +178,11 @@ class BuyManager:
 
         buy_candidates = []
 
-        for code, state in list(self.trade_states.items()):
+        for code, info in list(self.watchlist.items()):
+            state = self.trade_states.setdefault(code, TradeState())
+            
             # 이미 매수 완료한 종목은 스킵
             if state.buy_step >= 1 or state.trade_ended:
-                continue
-
-            # watchlist에서 이탈한 종목은 스킵
-            if code not in self.watchlist:
                 continue
 
             # 중복 주문 방지
@@ -191,15 +190,15 @@ class BuyManager:
             if is_unexecuted or any(u.get('stock_code') == code for u in unexecuted):
                 continue
 
-            name = self.watchlist.get(code, {}).get('name', code)
-            weight = self.watchlist.get(code, {}).get('weight', 1.0)
+            name = info.get('name', code) if isinstance(info, dict) else str(info)
+            weight = info.get('weight', 1.0) if isinstance(info, dict) else 1.0
 
             # 30분봉(거시) + 일봉(필터) 데이터 동시 조회
             async with self.api_lock:
                 df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.08)
                 daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.08)
 
             if df_30m is None or df_30m.empty:
                 continue
@@ -263,10 +262,29 @@ class BuyManager:
             price_limit = int((int(buy_price) // tick) * tick)
 
             # ── 틱 데이터 기반 체결강도 조회 및 스마트 1호가 공격 매수 판별 ──
-            ticks = await asyncio.to_thread(self.client.get_tick_data, code)
-            intensity_info = calculate_trade_intensity(ticks)
-            intensity_ratio = intensity_info.get('ratio', 1.0)
-            is_strong = intensity_info.get('is_strong', False)
+            intensity_ratio = 1.0
+            is_strong = False
+            try:
+                ticks = await asyncio.to_thread(self.client.get_tick_data, code)
+                if ticks:
+                    intensity_info = calculate_trade_intensity(ticks)
+                    intensity_ratio = intensity_info.get('ratio', 1.0)
+                    is_strong = intensity_info.get('is_strong', False)
+            except Exception:
+                pass
+
+            # 지수 급락 방어 모드일 때는 W자 반등 대장주이거나 체결강도 150% 이상인 종목만 예외 매수 허용
+            if is_market_in_danger:
+                can_buy_in_danger = is_w or (is_strong and intensity_ratio >= 1.5)
+                if not can_buy_in_danger:
+                    logger.info(
+                        f"⏸️ [{name}] 지수 급락 방어 중 - 체결강도({intensity_ratio * 100:.0f}%) 또는 W자 반등 기준 미달로 매수 보류"
+                    )
+                    continue
+                else:
+                    logger.info(
+                        f"🔥 [{name}] 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 체결강도={intensity_ratio * 100:.0f}%)"
+                    )
 
             is_aggressive = False
             if is_strong and intensity_ratio >= 1.5:
@@ -290,6 +308,7 @@ class BuyManager:
                         self.client.place_buy_order, code, qty,
                         price=price_limit, order_type="00"
                     )
+                    await asyncio.sleep(0.25)
                 if order_no:
                     self.tracked_orders[order_no] = {
                         'code': code, 'qty': qty,
@@ -300,6 +319,7 @@ class BuyManager:
                     state.first_buy_candle_time = df_30m.index[-1]
                     state.signal_1 = signals['ll']  # LL 값 저장
                     state.is_w_rebound = is_w
+                    state.buy_time = time.time()  # 매수 시각 기록 (30분 보호 유예용)
                     total_positions += 1
                     logger.info(
                         f"✅ [{name}] 매수 주문 전송: "
@@ -356,9 +376,9 @@ class SellManager:
                 name = await asyncio.to_thread(self.client.get_stock_name, code)
 
             hold_info = holdings[code]
-            buy_price = hold_info.get('buy_price', 0) if isinstance(hold_info, dict) else 0.0
-            current_price = hold_info.get('current_price', 0) if isinstance(hold_info, dict) else 0.0
-            return_rate = hold_info.get('return_rate', 0.0) if isinstance(hold_info, dict) else 0.0
+            buy_price = float(hold_info.get('buy_price', 0)) if isinstance(hold_info, dict) else 0.0
+            current_price = float(hold_info.get('current_price', 0)) if isinstance(hold_info, dict) else 0.0
+            return_rate = float(hold_info.get('return_rate', 0.0)) if isinstance(hold_info, dict) else 0.0
             qty_sell = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
 
             if buy_price > 0 and current_price > 0:
@@ -366,26 +386,19 @@ class SellManager:
             else:
                 calc_return = return_rate
 
-            # ── 1. 트레일링 스탑을 위한 최고점(trailing_high) 갱신 ──
-            if state.trailing_high < buy_price:
-                state.trailing_high = buy_price
-            if current_price > 0:
-                state.trailing_high = max(state.trailing_high, current_price)
-
             do_sell = False
             sell_reason = ""
 
-            # ── 2. 하드 손절매 및 트레일링 스탑 (TR 호출 없이 잔고 기반 빠른 감시) ──
+            # ── 1. 하드 손절매(-5%) 빠른 감시 ──
             # ⚠️ current_price가 0이면 API 오류이므로 빠른 감시를 건너뛰고 15분봉 차트로 넘어감
             if current_price > 0 and buy_price > 0:
+                # [원칙] 매입단가 기준 -5% 하드 손절 (고점과 무관하게 평단가 대비 손실 감시)
                 if calc_return <= -5.0:
                     do_sell = True
-                    sell_reason = f"⚡ 하드 손절매 도달 (-5% 이하): 현재 {calc_return:+.2f}%"
-                elif state.trailing_high > 0:
-                    drawdown = ((current_price - state.trailing_high) / state.trailing_high) * 100
-                    if drawdown <= -3.0:
-                        do_sell = True
-                        sell_reason = f"⚡ 트레일링 스탑 가동 (고점대비 -3% 하락): 고점 {state.trailing_high:,.0f} -> 현재 {current_price:,.0f}"
+                    sell_reason = (
+                        f"⚡ 하드 손절매 도달 (매입단가 대비 -5.0% 이하): "
+                        f"매입단가 {buy_price:,.0f}원 -> 현재가 {current_price:,.0f}원 ({calc_return:+.2f}%)"
+                    )
 
             if do_sell:
                 logger.info(f"🔴 [{name}] 즉각 매도 신호! {sell_reason}")
@@ -412,7 +425,13 @@ class SellManager:
                     logger.warning(f"⚠️ [{name}] 매도 주문 전송 실패! 다음 사이클에서 재시도합니다.")
                 continue
 
-            # ── 3. 15분봉 TR 스로틀링 (API 과부하 방지: 60초 제한) ──
+            # ── 3. 신규 매수 보호 유예 (매수 후 30분 동안 15분봉 데드크로스 매도 유예) ──
+            # (단, -5% 하드 손절 및 -3% 트레일링 스탑은 상단 2단계에서 실시간 감시 완료)
+            buy_t = getattr(state, 'buy_time', 0.0)
+            if buy_t > 0 and (now - buy_t < 1800):
+                continue
+
+            # ── 4. 15분봉 TR 스로틀링 (API 과부하 방지: 60초 제한) ──
             last_fetch = self.last_15m_fetch_time.get(code, 0)
             if now - last_fetch < 60:
                 continue
@@ -427,10 +446,8 @@ class SellManager:
                 continue
 
             signals = analyze_sell_signals(df_15m)
-            latest_high = float(df_15m.iloc[-1]['high'])
-            state.trailing_high = max(state.trailing_high, latest_high)
 
-            # ── 4. 15분봉 지표 기반 매도 신호 ──
+            # ── 5. 15분봉 지표 기반 매도 신호 ──
             if signals.get('sell'):
                 logger.info(f"🔴 [{name}] 차트 매도 신호! {signals['reason']}")
                 async with self.api_lock:
@@ -535,7 +552,9 @@ class TradingBot:
         if os.path.exists(watch_file):
             try:
                 with open(watch_file, 'r', encoding='utf-8') as f:
-                    self.watchlist = json.load(f)
+                    data = json.load(f)
+                    self.watchlist.clear()
+                    self.watchlist.update(data)
                 logger.info(f"📂 저장된 관심종목 리스트를 불러왔습니다. ({len(self.watchlist)}개 종목)")
             except Exception as e:
                 logger.error(f"관심종목 로드 실패: {e}")
@@ -652,10 +671,10 @@ class TradingBot:
                     state.first_qty = sync_qty
                     state.buy_step = 1  # 재시작 후에는 매수 완료로 간주
                     state.added_on = True
-                    # 트레일링 스탑 기준점 복구: 현재가와 매수가 중 높은 값으로 설정
-                    if state.trailing_high <= 0 and sync_current_price > 0:
-                        state.trailing_high = max(sync_buy_price, sync_current_price)
-                        logger.info(f"🔄 [{code}] trailing_high를 {state.trailing_high:,.0f}원으로 복구")
+                    # 트레일링 스탑 기준점 복구: 수익 중이면 현재가, 손실 중이면 매입단가로 설정하여 불필요한 트레일링 조기발동 방지
+                    if state.trailing_high <= 0 and sync_buy_price > 0:
+                        state.trailing_high = max(sync_buy_price, sync_current_price) if sync_current_price > sync_buy_price else sync_buy_price
+                        logger.info(f"🔄 [{code}] trailing_high를 {state.trailing_high:,.0f}원으로 복구 (매입단가: {sync_buy_price:,.0f}원)")
 
         # 6. 매수 완료된 종목 관심종목에서 제외 (더 이상 매수 감시 안 함)
         for code in list(self.watchlist.keys()):
@@ -666,8 +685,19 @@ class TradingBot:
                 del self.watchlist[code]
 
         # ═══════════════════════════════════════════════════════════
-        # 각 매니저별 감시 실행
+        # 각 매니저별 감시 실행 (정규장 09:00 ~ 15:30 중에만 실행)
         # ═══════════════════════════════════════════════════════════
+        now_time = datetime.now().time()
+        market_open = dtime(9, 0, 0)
+        market_close = dtime(15, 30, 0)
+
+        if now_time < market_open or now_time > market_close:
+            logger.info(
+                f"⏳ [정규장 개장 대기/마감] 현재 {now_time.strftime('%H:%M:%S')}. "
+                f"정규장(09:00~15:30) 중에만 실시간 매매/손절을 실행합니다. (잔고 동기화만 유지)"
+            )
+            self.save_states()
+            return
 
         # [매도 봇] - 최우선 실행 (매도가 가장 급함)
         if self.sell_manager:
