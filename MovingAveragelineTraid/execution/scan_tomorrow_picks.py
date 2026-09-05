@@ -55,19 +55,23 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
     exclude_keywords = [
         "KODEX", "TIGER", "KBSTAR", "KINDEX", "ARIRANG", "KOSEF", "HANARO",
         "ACE", "ETN", "스팩", "SOL", "인버스", "레버리지", "선물", "KOACT",
-        "TIMEFOLIO", "WOORI", "히어로즈", "PLUS", "WON", "2X", "KRX", "합병"
+        "TIMEFOLIO", "WOORI", "히어로즈", "PLUS", "WON", "2X", "KRX", "합병", "RISE"
     ]
 
     logger.info("🔍 1. 키움 API 거래대금 상위 150종목 수집 중...")
     try:
         raw_top = client.real_client.get_top_trading_value_stocks(limit=150)
         for code_raw in raw_top:
-            code = code_raw.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
-            if len(code) == 6 and code.isdigit():
-                name = client.get_stock_name(code)
-                if any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
-                    continue
-                universe[code] = name
+            try:
+                code = code_raw.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+                if len(code) == 6 and code.isalnum():
+                    name = client.get_stock_name(code) or ""
+                    if not name or any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
+                        continue
+                    universe[code] = name
+                    time.sleep(0.04)
+            except Exception:
+                continue
         logger.info(f" -> 거래대금 상위 {len(universe)}개 일반 종목 로드 완료")
     except Exception as e:
         logger.warning(f"거래대금 상위 수집 중 오류: {e}")
@@ -76,12 +80,16 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
     try:
         rates = client.real_client.get_top_fluctuation_stocks_with_rates(limit=100)
         for code_raw in rates.keys():
-            code = code_raw.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
-            if len(code) == 6 and code.isdigit() and code not in universe:
-                name = client.get_stock_name(code)
-                if any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
-                    continue
-                universe[code] = name
+            try:
+                code = code_raw.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+                if len(code) == 6 and code.isalnum() and code not in universe:
+                    name = client.get_stock_name(code) or ""
+                    if not name or any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
+                        continue
+                    universe[code] = name
+                    time.sleep(0.04)
+            except Exception:
+                continue
         logger.info(f" -> 등락률 상위 포함 총 {len(universe)}개 종목 확보")
     except Exception as e:
         logger.warning(f"등락률 상위 수집 중 오류: {e}")
@@ -94,20 +102,20 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
                 old_picks = json.load(f)
                 for code, info in old_picks.items():
                     c = code.lstrip('A')
-                    if len(c) == 6 and c.isdigit() and c not in universe:
+                    if len(c) == 6 and c.isalnum() and c not in universe:
                         name = info.get('name') or client.get_stock_name(c)
                         universe[c] = name
         except Exception:
             pass
 
-    # 핵심 주도 테마주 리스트 보강
+    # 핵심 주도 테마주 리스트 보강 (10조 이상 초대형주 제외, 실전 탄력성 높은 중소형/주도주 중심)
     core_stocks = {
-        "005930": "삼성전자", "000660": "SK하이닉스", "042700": "한미반도체",
-        "053690": "한미글로벌", "014620": "성광벤드", "405100": "큐알티",
-        "006110": "삼아알미늄", "034020": "두산에너빌리티", "348370": "엔켐",
-        "178320": "서진시스템", "047080": "한빛소프트", "052460": "아이크래프트",
-        "213420": "덕산네오룩스", "108490": "로보티즈", "052300": "오션인더블유",
-        "035420": "NAVER", "035720": "카카오", "086520": "에코프로"
+        "042700": "한미반도체", "053690": "한미글로벌", "014620": "성광벤드",
+        "405100": "큐알티", "006110": "삼아알미늄", "034020": "두산에너빌리티",
+        "348370": "엔켐", "178320": "서진시스템", "047080": "한빛소프트",
+        "052460": "아이크래프트", "213420": "덕산네오룩스", "108490": "로보티즈",
+        "052300": "오션인더블유", "0039P0": "매드업", "080220": "제주반도체",
+        "153890": "져스텍", "002620": "제일파마홀딩스", "043360": "디지아이"
     }
     for c, n in core_stocks.items():
         if c not in universe:
@@ -125,10 +133,22 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
         daily_df = client.get_daily_candles(code)
         time.sleep(0.05)
 
-        if df_30m is None or df_30m.empty or len(df_30m) < 60:
+        if df_30m is None or df_30m.empty or len(df_30m) < 30:
             return None
 
-        if daily_df is None or daily_df.empty or len(daily_df) < 20:
+        if daily_df is None or daily_df.empty or len(daily_df) < 5:
+            return None
+
+        # ── [필터 1] 5일 평균 거래대금 10억 미만 소외주 제외 ──
+        trade_val_5d = (daily_df['close'] * daily_df['volume']).tail(5).mean()
+        if trade_val_5d < 1_000_000_000:
+            logger.debug(f"⏭️ [{name}({code})] 5일 평균 거래대금({trade_val_5d/1e8:.1f}억) 10억 미만으로 스캔 제외")
+            return None
+
+        # ── [필터 2] 시가총액 10조원 이상 초대형주 제외 (삼성전자, SK하이닉스, 현대차, NAVER 등) ──
+        market_cap = client.get_market_cap(code)
+        if market_cap >= 10_000_000_000_000:
+            logger.info(f"⏭️ [{name}({code})] 시가총액({market_cap/1e12:.1f}조원) 10조 이상 대형주로 스캔 제외")
             return None
 
         curr_close = float(df_30m['close'].iloc[-1])
@@ -146,9 +166,12 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
                 diff_sma260 = ((curr_close - sma260_val) / sma260_val) * 100
 
         # ── 2. 일봉 20이평선 상향 돌파 검출 ──
-        daily_sma20_series = daily_df['close'].rolling(20).mean()
-        daily_sma20 = float(daily_sma20_series.iloc[-1]) if not daily_sma20_series.dropna().empty else 0.0
-        diff_daily_sma20 = ((curr_close - daily_sma20) / daily_sma20 * 100) if daily_sma20 > 0 else 999.0
+        daily_sma20 = 0.0
+        diff_daily_sma20 = 999.0
+        if len(daily_df) >= 20:
+            daily_sma20_series = daily_df['close'].rolling(20).mean()
+            daily_sma20 = float(daily_sma20_series.iloc[-1]) if not daily_sma20_series.dropna().empty else 0.0
+            diff_daily_sma20 = ((curr_close - daily_sma20) / daily_sma20 * 100) if daily_sma20 > 0 else 999.0
 
         # ── 3. 가중 5-20 고가선(HH) 돌파 검출 ──
         hh_series = calculate_hh(df_30m)
@@ -183,7 +206,7 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
             notes.append(f"260이평({sma260_val:,.0f}원) 대비 {diff_sma260:+.2f}% 사정권")
 
         # [일봉 20선 돌파]
-        if -2.0 <= diff_daily_sma20 <= 1.0:
+        if -2.0 <= diff_daily_sma20 <= 1.0 and daily_sma20 > 0:
             score += 40.0
             tags.append("🟢 [일봉 20선 돌파 임박]")
             notes.append(f"일봉 20이평({daily_sma20:,.0f}원) 대비 {diff_daily_sma20:+.2f}%")
@@ -194,10 +217,14 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
             tags.append("⚡ [3-5선 수렴 돌파 임박]")
             notes.append(f"3일선({day_sma3:,.0f}) 5일선({day_sma5:,.0f}) 초수렴 ({diff_3_5:+.2f}%)")
 
-        # [가중 고가선 HH 돌파]
-        if -1.5 <= diff_hh <= 0.8:
-            score += 25.0
-            tags.append("🎯 [고가선(HH) 저격권]")
+        # [가중 고가선 HH 안착 및 돌파 사정권 (핵심 강화)]
+        if -0.8 <= diff_hh <= 0.6 and hh_val > 0:
+            score += 65.0  # 고가선에 바짝 안착한 종목 단독 합격권 부여!
+            tags.append("🎯 [5-20 고가선(HH) 완벽 안착]")
+            notes.append(f"가중고가선({hh_val:,.0f}원) 완벽안착({diff_hh:+.2f}%)")
+        elif -1.8 <= diff_hh <= 1.2 and hh_val > 0:
+            score += 50.0  # 고가선 사정권
+            tags.append("🎯 [고가선(HH) 돌파 사정권]")
             notes.append(f"가중고가선({hh_val:,.0f}원) 대비 {diff_hh:+.2f}%")
 
         if is_live_buy:
@@ -209,7 +236,7 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
             return None
 
         # 너무 고점 폭등한 종목(예: 260선 대비 +15% 초과 등)은 과열로 제외
-        if diff_sma260 > 15.0:
+        if sma260_val > 0 and diff_sma260 > 15.0:
             return None
 
         status_text = " | ".join(tags)

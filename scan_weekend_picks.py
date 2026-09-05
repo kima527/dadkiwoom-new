@@ -51,7 +51,7 @@ def get_market_universe():
             if top_stocks:
                 for s in top_stocks:
                     clean = s.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
-                    if len(clean) == 6 and clean.isdigit():
+                    if len(clean) == 6 and clean.isalnum():
                         name = client.get_stock_name(clean)
                         if any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
                             continue
@@ -68,7 +68,7 @@ def get_market_universe():
                 data = json.load(f)
                 for code, info in data.items():
                     clean = code.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
-                    if len(clean) == 6 and clean.isdigit():
+                    if len(clean) == 6 and clean.isalnum():
                         name = info.get('name') or f"Stock_{clean}"
                         if any(kw in name for kw in exclude_keywords) or name.endswith("우"):
                             continue

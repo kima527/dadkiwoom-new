@@ -325,3 +325,29 @@ class RealAPIAdapter:
             logger.error(f"종목명 조회 에러 ({stock_code}): {e}")
             return f"Stock_{stock_code}"
 
+    def get_market_cap(self, stock_code: str) -> float:
+        """
+        종목의 시가총액(원 단위)을 조회합니다. (캐시 활용)
+        Kiwoom basic_stock_information_request_ka10001의 'mac' 필드는 '억원' 단위.
+        """
+        if not hasattr(self, '_market_cap_cache'):
+            self._market_cap_cache = {}
+
+        code = stock_code.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+        if code in self._market_cap_cache:
+            return self._market_cap_cache[code]
+
+        try:
+            res = self.real_client.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
+            if res and 'mac' in res:
+                mac_val = str(res['mac']).replace(',', '').replace('+', '').replace('-', '').strip()
+                if mac_val.isdigit():
+                    # 억원 -> 원 변환 (1억원 = 100,000,000원)
+                    cap_won = float(mac_val) * 100_000_000.0
+                    self._market_cap_cache[code] = cap_won
+                    return cap_won
+        except Exception as e:
+            logger.debug(f"시가총액 조회 에러 ({stock_code}): {e}")
+
+        return 0.0
+

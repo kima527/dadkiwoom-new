@@ -37,6 +37,10 @@ class TradeState:
         self.signal_2 = 0.0         # WMA 골든크로스 시점 고가(HH)
         self.is_w_rebound = False   # 30분봉 260이평 W자 반등 여부
         self.buy_time = 0.0         # 매수 체결 시간 (초 단위 timestamp)
+        # ── M선(정배열 정점 저항선) 50% 분할 익절용 ──
+        self.m_resistance_line = 0.0 # 정배열 최고 정점선 (M선 가격)
+        self.m_partial_sold = False  # M선 도달 50% 1차 익절 완료 여부
+        self.m_touch_high = 0.0      # M선 도달 후 기록한 최고가
 
     def to_dict(self) -> dict:
         return {
@@ -57,6 +61,9 @@ class TradeState:
             'signal_2': getattr(self, 'signal_2', 0.0),
             'is_w_rebound': getattr(self, 'is_w_rebound', False),
             'buy_time': getattr(self, 'buy_time', 0.0),
+            'm_resistance_line': getattr(self, 'm_resistance_line', 0.0),
+            'm_partial_sold': getattr(self, 'm_partial_sold', False),
+            'm_touch_high': getattr(self, 'm_touch_high', 0.0),
         }
 
     @classmethod
@@ -80,6 +87,9 @@ class TradeState:
         state.signal_2 = data.get('signal_2', 0.0)
         state.is_w_rebound = data.get('is_w_rebound', False)
         state.buy_time = data.get('buy_time', 0.0)
+        state.m_resistance_line = data.get('m_resistance_line', 0.0)
+        state.m_partial_sold = data.get('m_partial_sold', False)
+        state.m_touch_high = data.get('m_touch_high', 0.0)
         return state
 
 def calculate_trade_intensity(tick_data: list) -> dict:

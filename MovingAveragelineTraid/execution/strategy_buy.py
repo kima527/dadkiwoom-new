@@ -283,55 +283,9 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
     daily_hh_val = 0.0
 
     # ─────────────────────────────────────────────────
-    # [조건 1] 30분봉에서 260이평선 당일 돌파 검사
+    # [원칙 1] 일봉 1-20 골든크로스 (당일 주가가 일봉 20이평선 상향 돌파 시점)
     # ─────────────────────────────────────────────────
-    cond1_30m_sma260 = False
-    m30_reason = ""
-    m30_sma260_val = 0.0
-
-    if len(df30) >= 260:
-        df30['sma260'] = df30['close'].rolling(window=260, min_periods=260).mean()
-        m30_latest = df30.iloc[-1]
-        m30_sma260_val = float(m30_latest['sma260']) if pd.notna(m30_latest['sma260']) else 0.0
-
-        if m30_sma260_val > 0 and current_price > m30_sma260_val:
-            if isinstance(df30.index, pd.DatetimeIndex):
-                today_date = df30.index[-1].date()
-                today_mask = df30.index.date == today_date
-                df30_today = df30[today_mask]
-                df30_prev = df30[~today_mask]
-            else:
-                df30_today = df30.iloc[-13:]
-                df30_prev = df30.iloc[:-13]
-
-            prev_day_last_close = float(df30_prev.iloc[-1]['close']) if not df30_prev.empty else 0.0
-            prev_day_last_sma260 = float(df30_prev.iloc[-1]['sma260']) if (not df30_prev.empty and pd.notna(df30_prev.iloc[-1]['sma260'])) else 0.0
-            
-            # 어제 종가 <= 어제 SMA260 이었거나, 당일 장중 캔들에서 직접 CrossUp 발생했거나, W자 반등 완성
-            climbed_from_prev_day = (prev_day_last_close <= prev_day_last_sma260)
-            today_crossup = False
-            if len(df30_today) >= 2:
-                crosses = (df30_today['close'] > df30_today['sma260']) & (df30_today['close'].shift(1) <= df30_today['sma260'].shift(1))
-                today_crossup = bool(crosses.any())
-
-            if climbed_from_prev_day or today_crossup or is_w_rebound:
-                cond1_30m_sma260 = True
-                diff_pct = ((current_price - m30_sma260_val) / m30_sma260_val) * 100
-                if is_w_rebound:
-                    m30_reason = (
-                        f"🔥 [조건1: 30분봉 260이평 W자 반등 돌파] {w_info['description']} "
-                        f"(260이평: {m30_sma260_val:,.0f}원, 현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
-                    )
-                else:
-                    m30_reason = (
-                        f"🟢 [조건1: 30분봉 당일 260이평 상향 돌파] "
-                        f"260이평({m30_sma260_val:,.0f}원) 위 안착 (현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
-                    )
-
-    # ─────────────────────────────────────────────────
-    # [조건 2] 일봉에서 당일 20이평선 위로 돌파 검사
-    # ─────────────────────────────────────────────────
-    cond2_daily_sma20 = False
+    cond1_daily_sma20 = False
     daily_reason = ""
     d_sma20_val = 0.0
 
@@ -348,17 +302,65 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
             d_prev_close = float(d_prev['close']) if pd.notna(d_prev['close']) else 0.0
 
             if d_sma20_val > 0 and d_prev_sma20 > 0:
-                # 전일 종가 <= 전일 20이평 & 현재가 > 당일 20이평
-                if (d_prev_close <= d_prev_sma20) and (current_price > d_sma20_val):
-                    cond2_daily_sma20 = True
+                # 전일 종가 <= 전일 20이평 & 현재가 >= 당일 20이평 (1-20 골든크로스 발발)
+                # 매수 주문 가격: 일봉 20이평선 가격(d_sma20_val) 그 자체로 지정가 매수!
+                if (d_prev_close <= d_prev_sma20) and (current_price >= d_sma20_val):
+                    cond1_daily_sma20 = True
                     diff_pct = ((current_price - d_sma20_val) / d_sma20_val) * 100
                     daily_reason = (
-                        f"🟢 [조건2: 일봉 당일 20이평선 상향 돌파] "
-                        f"일봉 20이평({d_sma20_val:,.0f}원) 돌파 안착 (현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
+                        f"🟢 [원칙1: 일봉 1-20 골든크로스] "
+                        f"일봉 20이평선({d_sma20_val:,.0f}원) 돌파 ➔ 20일선 지정가 예약매수 (현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
                     )
 
     # ─────────────────────────────────────────────────
-    # [조건 3] 30분봉에서 실시간 3일선이 5일선 당일 돌파 검사 (3일선 우상향 필수)
+    # [원칙 2] 30분봉 1-260 골든크로스 (당일 주가가 30분봉 260이평선 상향 돌파 시점)
+    # ─────────────────────────────────────────────────
+    cond2_30m_sma260 = False
+    m30_reason = ""
+    m30_sma260_val = 0.0
+
+    if len(df30) >= 260:
+        df30['sma260'] = df30['close'].rolling(window=260, min_periods=260).mean()
+        m30_latest = df30.iloc[-1]
+        m30_sma260_val = float(m30_latest['sma260']) if pd.notna(m30_latest['sma260']) else 0.0
+
+        if m30_sma260_val > 0 and current_price >= m30_sma260_val:
+            if isinstance(df30.index, pd.DatetimeIndex):
+                today_date = df30.index[-1].date()
+                today_mask = df30.index.date == today_date
+                df30_today = df30[today_mask]
+                df30_prev = df30[~today_mask]
+            else:
+                df30_today = df30.iloc[-13:]
+                df30_prev = df30.iloc[:-13]
+
+            prev_day_last_close = float(df30_prev.iloc[-1]['close']) if not df30_prev.empty else 0.0
+            prev_day_last_sma260 = float(df30_prev.iloc[-1]['sma260']) if (not df30_prev.empty and pd.notna(df30_prev.iloc[-1]['sma260'])) else 0.0
+            
+            # 어제 종가 <= 어제 SMA260 이었거나, 당일 장중 캔들에서 직접 CrossUp 발생했거나, W자 반등 완성
+            # 매수 주문 가격: 30분봉 260이평선 가격(m30_sma260_val) 그 자체로 지정가 매수!
+            climbed_from_prev_day = (prev_day_last_close <= prev_day_last_sma260)
+            today_crossup = False
+            if len(df30_today) >= 2:
+                crosses = (df30_today['close'] > df30_today['sma260']) & (df30_today['close'].shift(1) <= df30_today['sma260'].shift(1))
+                today_crossup = bool(crosses.any())
+
+            if climbed_from_prev_day or today_crossup or is_w_rebound:
+                cond2_30m_sma260 = True
+                diff_pct = ((current_price - m30_sma260_val) / m30_sma260_val) * 100
+                if is_w_rebound:
+                    m30_reason = (
+                        f"🔥 [원칙2: 30분봉 1-260 W자 반등 골든크로스] {w_info['description']} "
+                        f"➔ 260이평선({m30_sma260_val:,.0f}원) 지정가 예약매수 (현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
+                    )
+                else:
+                    m30_reason = (
+                        f"🟢 [원칙2: 30분봉 1-260 골든크로스] "
+                        f"260이평선({m30_sma260_val:,.0f}원) 돌파 ➔ 260이평 지정가 예약매수 (현재가: {current_price:,.0f}원, 이격도: {diff_pct:+.2f}%)"
+                    )
+
+    # ─────────────────────────────────────────────────
+    # [원칙 3] 30분봉 3이평-5이평 골든크로스 (당일 3일선이 5일선 상향 돌파 시점)
     # ─────────────────────────────────────────────────
     cond3_day_sma_cross = False
     day_sma_reason = ""
@@ -377,8 +379,9 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
             prev_sma3 = float(prev_s['day_sma3']) if pd.notna(prev_s['day_sma3']) else 0.0
 
             # 3일선이 5일선 위에 위치(정배열)하고, 반드시 3일선이 직전 대비 '우상향(상향 방향)' 중이어야 함
+            # 매수 주문 가격: 실시간 3일선 가격(curr_sma3) 그 자체로 지정가 매수!
             is_s3_above_s5 = (curr_sma3 > curr_sma5)
-            is_s3_slope_up = (curr_sma3 >= prev_sma3)  # 3일선 상향 방향 확인 (데드크로스/하향 절대 금지)
+            is_s3_slope_up = (curr_sma3 >= prev_sma3)
 
             if curr_sma3 > 0 and curr_sma5 > 0 and is_s3_above_s5 and is_s3_slope_up:
                 if isinstance(df30_day_sma.index, pd.DatetimeIndex):
@@ -403,47 +406,43 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
 
                 if was_below_yesterday or today_crossup:
                     cond3_day_sma_cross = True
-                    diff_pct = ((curr_sma3 - curr_sma5) / curr_sma5) * 100
+                    diff_from_sma3 = ((current_price - curr_sma3) / curr_sma3) * 100
                     slope_pct = ((curr_sma3 - prev_sma3) / prev_sma3) * 100 if prev_sma3 > 0 else 0.0
                     day_sma_reason = (
-                        f"⚡ [조건3: 30분봉 당일 3일-5일선 골든크로스 & 3일선 우상향 돌파!] "
-                        f"3일선({curr_sma3:,.0f}원, 기울기:{slope_pct:+.2f}%) > 5일선({curr_sma5:,.0f}원) "
-                        f"(이격도: {diff_pct:+.2f}%, 현재가: {current_price:,.0f}원)"
+                        f"⚡ [원칙3: 30분봉 3-5 골든크로스] "
+                        f"3일선({curr_sma3:,.0f}원, 기울기:{slope_pct:+.2f}%) > 5일선({curr_sma5:,.0f}원) ➔ "
+                        f"3일선({curr_sma3:,.0f}원) 지정가 예약매수 (현재가: {current_price:,.0f}원, 이격도: {diff_from_sma3:+.2f}%)"
                     )
 
     # ─────────────────────────────────────────────────
-    # [최종 대전제 검증] 3일선-5일선 정배열(3일선>5일선) 및 3일선 우상향 필수
+    # 매수 신호 판정: 3대 핵심 원칙 (독립적 OR 조건 결합)
+    # [원칙 1] 일봉 1-20 골든크로스 ➔ 일봉 20일선 가격(d_sma20_val)에 지정가 매수
+    # [원칙 2] 30분봉 1-260 골든크로스 ➔ 30분봉 260선 가격(m30_sma260_val)에 지정가 매수
+    # [원칙 3] 30분봉 3이평-5이평 골든크로스 ➔ 3일선 가격(curr_sma3)에 지정가 매수
     # ─────────────────────────────────────────────────
-    # ⚠️ 조건 1, 2, 3 중 무엇을 만족하든 간에, 단기 3일선이 5일선 아래에 있거나(데드크로스/역배열)
-    # 3일선이 아래로 꺾여 하향 중인 종목은 절대로 매수하지 않습니다 (로보티즈 등 손실 유발 차단).
-    if curr_sma3 > 0 and curr_sma5 > 0:
-        is_strictly_bullish = (curr_sma3 > curr_sma5) and (curr_sma3 >= prev_sma3)
-        if not is_strictly_bullish:
-            return result
-
-    # ─────────────────────────────────────────────────
-    # 매수 신호 판정: 조건 1 OR 조건 2 OR 조건 3
-    # ─────────────────────────────────────────────────
-    if cond1_30m_sma260 or cond2_daily_sma20 or cond3_day_sma_cross:
+    if cond1_daily_sma20 or cond2_30m_sma260 or cond3_day_sma_cross:
         result['buy'] = True
         
-        # 사유 조합 및 우선순위 점수 산정
+        # 사유 조합 및 우선순위 점수/지정가 매수 목표가격 산정
         reasons = []
-        if cond1_30m_sma260:
+        if cond2_30m_sma260:
             reasons.append(m30_reason)
             result['ll'] = m30_sma260_val
+            result['target_price'] = m30_sma260_val
             base_score = 100.0 + min(w_info.get('rebound_pct', 0.0), 20.0) if is_w_rebound else 85.0
             result['priority_score'] = max(result['priority_score'], base_score)
 
-        if cond3_day_sma_cross:
-            reasons.append(day_sma_reason)
-            result['ll'] = curr_sma5 if result['ll'] == 0 else result['ll']
-            result['priority_score'] = max(result['priority_score'], 90.0)
-
-        if cond2_daily_sma20:
+        if cond1_daily_sma20:
             reasons.append(daily_reason)
             result['ll'] = d_sma20_val if result['ll'] == 0 else result['ll']
+            result['target_price'] = d_sma20_val if result.get('target_price', 0) == 0 else result['target_price']
             result['priority_score'] = max(result['priority_score'], 80.0)
+
+        if cond3_day_sma_cross:
+            reasons.append(day_sma_reason)
+            result['ll'] = curr_sma3 if result['ll'] == 0 else result['ll']
+            result['target_price'] = curr_sma3 if result.get('target_price', 0) == 0 else result['target_price']
+            result['priority_score'] = max(result['priority_score'], 90.0)
 
         result['reason'] = " | ".join(reasons)
 
