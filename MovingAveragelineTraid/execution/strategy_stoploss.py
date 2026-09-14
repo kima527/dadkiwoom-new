@@ -43,7 +43,7 @@ def tema(series: pd.Series, period: int) -> pd.Series:
 # ═══════════════════════════════════════════════════════════════
 # 5분봉 TEMA 기반 손절 신호 분석
 # ═══════════════════════════════════════════════════════════════
-def analyze_stoploss_signals(df: pd.DataFrame) -> dict:
+def analyze_stoploss_signals(df: pd.DataFrame, buy_price: float = 0.0) -> dict:
     """
     5분봉 DataFrame을 받아 TEMA 기반 손절 신호를 생성합니다.
 
@@ -105,6 +105,16 @@ def analyze_stoploss_signals(df: pd.DataFrame) -> dict:
         "tema2": tema2_now,
         "reason": ""
     }
+
+    # ── [최우선] 매수가 대비 -2% 절대적 손절 판단 ──
+    if buy_price > 0 and close_price <= buy_price * 0.98:
+        ret_pct = ((close_price - buy_price) / buy_price) * 100.0
+        result["sell"] = True
+        result["reason"] = (
+            f"🛑 [절대적 매도 조건] 매수가 대비 -2% 손절선 도달! "
+            f"(매수가: {buy_price:,.0f}원 -> 현재가: {close_price:,.0f}원, 손익률: {ret_pct:+.2f}%)"
+        )
+        return result
 
     # ── 손절 판단: 현재가가 손절라인 하향 돌파 ──
     if sl_price > 0 and close_price < sl_price:

@@ -67,10 +67,11 @@ def check_3m_sell_signal(dm, buy_price: float) -> tuple:
         reason = f"3분봉 단기 추세 꺾임 (SMA 20/40 데드크로스) [현재가:{current_price:,.0f}]"
         return True, reason
         
-    # 안전망: 매수가 대비 급락 (-3% 손절 라인, 예시)
+    # 절대적 매도 조건: 매수가 대비 -2% 손절 라인
     current_price = dm.latest_price
-    if buy_price > 0 and current_price <= buy_price * 0.97:
-        reason = f"긴급 안전망 발동 (진입가 대비 -3%) [현재가:{current_price:,.0f}, 평단가:{buy_price:,.0f}]"
+    if buy_price > 0 and current_price <= buy_price * 0.98:
+        ret_pct = ((current_price - buy_price) / buy_price) * 100.0
+        reason = f"🛑 [절대적 매도 조건] 진입가 대비 -2% 손절 [현재가:{current_price:,.0f}, 평단가:{buy_price:,.0f}, 손익률:{ret_pct:+.2f}%]"
         return True, reason
         
     return False, ""

@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Turnaround15mParams:
     """15분봉 및 일봉 수급 변곡 전략 파라미터"""
-    # [수식 4: 일봉 및 15분봉 수급 기준]
+    # [수식 4 & 중소형주 분봉 수급 기준]
     min_daily_supply_money: float = 20.0  # 당일 일봉 최소 거래대금 (기본 20.0 = 20억원)
     body_to_upper_tail_ratio: float = 1.2 # 양봉 몸통 > 윗꼬리 * 1.2
     supply_surge_multiplier: float = 3.0  # 직전 2개봉 평균 대비 수급 폭증 배수 (3배)
+    supply_ma20_multiplier: float = 5.0   # 20봉 평균 수급 대비 폭증 배수 (5배: A >= AvgA * 5)
 
     # [수식 1, 3: 이평 기간]
     sma_fast_m15: int = 3                # 분봉 단기 이평
@@ -82,8 +83,8 @@ def calculate_hwangryong_line(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, p
     b = close.rolling(20, min_periods=20).mean()
     d = close.rolling(60, min_periods=60).mean()
 
-    # 정배열 조건
-    cond_align = (a > b) & (b > d)
+    # 정배열 조건 (a > b && b > d && a > d)
+    cond_align = (a > b) & (b > d) & (a > d)
     k_series = close.where(cond_align).ffill()
     
     k_shift1 = k_series.shift(1)
@@ -99,7 +100,7 @@ def calculate_hwangryong_line(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, p
     f_tema = tema(close, 20)
     g_tema = tema(close, 60)
 
-    cond_align_tema = (e_tema > f_tema) & (f_tema > g_tema)
+    cond_align_tema = (e_tema > f_tema) & (f_tema > g_tema) & (e_tema > g_tema)
     k1_series = close.where(cond_align_tema).ffill()
     k1_shift1 = k1_series.shift(1)
     k1_shift2 = k1_series.shift(2)
@@ -126,7 +127,7 @@ def calc_m_resistance_price(df_15m: pd.DataFrame) -> float:
     b = close.rolling(20, min_periods=20).mean()
     d = close.rolling(60, min_periods=60).mean()
 
-    cond_align = (a > b) & (b > d)
+    cond_align = (a > b) & (b > d) & (a > d)
     k_series = close.where(cond_align).ffill()
     
     k_shift1 = k_series.shift(1)
@@ -203,7 +204,10 @@ def calc_realtime_day_inflections(
 
 
 # ═══════════════════════════════════════════════════════════════
-# [수식 4] 일봉 20억 수급 + 15분봉 수급 급증 계산 로직
+# [수식 4] 중소형주 분봉 수급 폭발봉 + 일봉 20억 수급 계산 로직
+# A = (H+L+O+C)/4*V/100000000;
+# AvgA = ma(A, 20);
+# A >= AvgA * 5 AND O < C AND C - O > (H - C) * 1.2 AND A >= (A(1) + A(2)) / 2 * 3
 # ═══════════════════════════════════════════════════════════════
 
 def calc_formula_4_supply(
@@ -211,25 +215,46 @@ def calc_formula_4_supply(
     params: Turnaround15mParams
 ) -> pd.DataFrame:
     """
-    [수식 4] 일봉 20억 수급 베이스 + 15분봉 수급 폭발봉 계산
-    1. 일봉 기준: 당일 누적 거래대금 >= 20억원 & 당일 시가 위(일봉 양봉)
-    2. 15분봉 기준: 15분봉 양봉 & 몸통 > 윗꼬리*1.2 & 직전 2개 15분봉 평균 수급 대비 3배 폭증
+    [수식 4] 중소형주 분봉 수급 폭발봉 + 일봉 수급 계산
+    1. 15분봉 중소형주 수급 조건:
+       - A = (H+L+O+C)/4 * V / 100,000,000 (억원)
+       - AvgA = ma(A, 20)
+       - A >= AvgA * 5 (20봉 평균 대비 5배 이상)
+       - O < C (양봉)
+       - C - O > (H - C) * 1.2 (몸통 > 윗꼬리 * 1.2)
+       - A >= (A(1) + A(2)) / 2 * 3 (직전 2봉 평균 대비 3배 폭증)
+    2. 일봉 기준: 당일 누적 거래대금 >= 20억원 & 당일 시가 위(일봉 양봉)
     """
     df = df_15m.copy()
     
-    # 15분봉 개별 봉 거래대금 (억원)
+    # A: 15분봉 개별 봉 거래대금 (억원)
     df['m15_money'] = (df['high'] + df['low'] + df['open'] + df['close']) / 4.0 * df['volume'] / 1e8
     
-    # 15분봉 양봉 및 몸통 완성도
+    # AvgA = ma(A, 20)
+    df['m15_avg_money_20'] = df['m15_money'].rolling(window=20, min_periods=1).mean()
+    
+    # 1) A >= AvgA * 5
+    df['is_m15_money_5x_ma20'] = df['m15_money'] >= (df['m15_avg_money_20'] * params.supply_ma20_multiplier)
+    
+    # 2) O < C (양봉)
     df['is_15m_bull'] = df['close'] > df['open']
+    
+    # 3) C - O > (H - C) * 1.2 (몸통 > 윗꼬리 * 1.2)
     df['body_15m'] = df['close'] - df['open']
     df['upper_tail_15m'] = (df['high'] - df['close']).clip(lower=0)
     df['is_15m_strong_body'] = df['is_15m_bull'] & (df['body_15m'] > (df['upper_tail_15m'] * params.body_to_upper_tail_ratio))
 
-    # 15분봉 수급 3배 폭증 (직전 2개봉 평균 대비)
+    # 4) A >= (A(1) + A(2)) / 2 * 3 (직전 2개봉 평균 대비 3배 폭증)
     prev_2_avg_15m = (df['m15_money'].shift(1) + df['m15_money'].shift(2)) / 2.0
     prev_2_avg_15m = prev_2_avg_15m.replace(0, np.nan).fillna(df['m15_money'].rolling(5).mean())
     df['is_15m_supply_surge'] = df['m15_money'] >= (prev_2_avg_15m * params.supply_surge_multiplier)
+
+    # 중소형주 분봉 수급 공식 4조건 동시 만족
+    df['is_smallcap_supply_candle'] = (
+        df['is_m15_money_5x_ma20'] &
+        df['is_15m_strong_body'] &
+        df['is_15m_supply_surge']
+    )
 
     # 당일 누적 일봉 거래대금 계산
     if 'date_key' not in df.columns:
@@ -251,12 +276,11 @@ def calc_formula_4_supply(
     df['is_daily_bull'] = df['close'] >= df['day_open']
 
     # [수식 4 종합 신호]
-    # 일봉 20억 수급 만족 + 15분봉 양봉 & 윗꼬리 짧음 & 3배 수급 폭발
+    # 일봉 20억 수급 만족 + 15분봉 중소형주 수급 폭발봉 완성
     df['sig_f4'] = (
         df['is_daily_money_over'] & 
         df['is_daily_bull'] & 
-        df['is_15m_strong_body'] & 
-        df['is_15m_supply_surge']
+        df['is_smallcap_supply_candle']
     )
     
     return df

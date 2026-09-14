@@ -145,8 +145,8 @@ def evaluate_stock_opportunity(code: str, name: str, df_15m: pd.DataFrame, df_30
 
     current_price = float(df_30m.iloc[-1]['close'])
 
-    # 1주당 30만원 초과 고가주는 예산(종목당 30만원) 초과로 매수 불가하므로 제외
-    if current_price >= 300000:
+    # 1주당 500만원 초과 고가주는 예산(종목당 500만원) 초과로 매수 불가하므로 제외
+    if current_price >= 5000000:
         return None
     
     # 1. 즉시 매수 조건 검사

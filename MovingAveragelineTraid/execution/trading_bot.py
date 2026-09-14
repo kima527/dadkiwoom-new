@@ -30,7 +30,7 @@ import argparse
 from real_api_adapter import RealAPIAdapter
 from utils import TradeState, get_tick_size, calculate_trade_intensity
 from strategy_buy import analyze_buy_signals
-from strategy_sell import analyze_sell_signals
+from strategy_sell import analyze_sell_signals, evaluate_1m_m_breakout
 from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams, calc_m_resistance_price
 from db_logger import TradeDBLogger
 from datetime import datetime, time as dtime
@@ -156,7 +156,7 @@ class MarketIndexGuard:
 # ═══════════════════════════════════════════════════════════════
 class BuyManager:
     """
-    일봉 SMA20 돌파 & HH 돌파 또는 30분봉 SMA260 돌파 & HH 돌파 시 종목당 30만원 매수.
+    일봉 SMA20 돌파 & HH 돌파 또는 30분봉 SMA260 돌파 & HH 돌파 시 종목당 500만원 매수.
     지수 급락 시에는 신규 매수를 일시 보류하여 자산을 보호함.
     """
 
@@ -164,7 +164,7 @@ class BuyManager:
                  trade_states: dict, tracked_orders: dict, watchlist: dict,
                  market_guard: MarketIndexGuard = None,
                  db_logger: TradeDBLogger = None,
-                 buy_amount: int = 300000, max_positions: int = 1):
+                 buy_amount: int = 5000000, max_positions: int = 2):
         self.client = client
         self.api_lock = api_lock
         self.trade_states = trade_states
@@ -172,8 +172,8 @@ class BuyManager:
         self.watchlist = watchlist
         self.market_guard = market_guard
         self.db_logger = db_logger
-        self.buy_amount = buy_amount        # 종목당 매수 금액
-        self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 1종목 집중 매매)
+        self.buy_amount = buy_amount        # 종목당 매수 금액 (500만원)
+        self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 2종목 분산 매매)
         self.params_15m = Turnaround15mParams(min_daily_supply_money=20.0)
 
     async def run(self, holdings: dict, unexecuted: list):
@@ -195,7 +195,7 @@ class BuyManager:
             else:
                 logger.info(f"🌐 [시장 지수 상태] {kospi_str} | {kosdaq_str} -> 정상 (전체 매수 탐색 진행)")
 
-        # 보유 종목 수 제한 (기본 1종목)
+        # 보유 종목 수 제한 (기본 2종목)
         pending_buy_codes = {
             o['code'] for o in self.tracked_orders.values()
             if str(o.get('order_type', '')).startswith('buy')
@@ -203,7 +203,7 @@ class BuyManager:
         total_positions = len(holdings) + len(pending_buy_codes)
         if total_positions >= self.max_positions:
             logger.info(
-                f"🎯 [원픽 집중 매매] 최대 보유 종목 수({self.max_positions}개) 도달. "
+                f"🎯 [2종목 분산 매매] 최대 보유 종목 수({self.max_positions}개) 도달. "
                 f"(보유: {len(holdings)}개, 매수대기: {len(pending_buy_codes)}개) "
                 f"신규 매수 탐색 스킵."
             )
@@ -487,14 +487,14 @@ class SellManager:
             do_sell = False
             sell_reason = ""
 
-            # ── 1. 하드 손절매(-5%) 빠른 감시 ──
+            # ── 1. 절대적 매도 조건 (매수가 대비 -2.0% 손절) 빠른 감시 ──
             # ⚠️ current_price가 0이면 API 오류이므로 빠른 감시를 건너뛰고 15분봉 차트로 넘어감
             if current_price > 0 and buy_price > 0:
-                # [원칙] 매입단가 기준 -5% 하드 손절 (고점과 무관하게 평단가 대비 손실 감시)
-                if calc_return <= -5.0:
+                # [원칙] 매수가 대비 -2.0% 이하 도달 시 무조건 전량 즉시 손절매
+                if calc_return <= -2.0:
                     do_sell = True
                     sell_reason = (
-                        f"⚡ 하드 손절매 도달 (매입단가 대비 -5.0% 이하): "
+                        f"🛑 [절대적 매도 조건 도달] 매수가 대비 -2.0% 손절선 도달: "
                         f"매입단가 {buy_price:,.0f}원 -> 현재가 {current_price:,.0f}원 ({calc_return:+.2f}%)"
                     )
 
@@ -511,6 +511,8 @@ class SellManager:
                         'time': time.time(), 'order_type': 'sell'
                     }
                     state.sold_once = True
+                    state.is_holding = False
+                    state.trade_ended = True
                     logger.info(f"✅ [{name}] 빠른 시장가 매도 주문 전송 (주문번호: {order_no})")
                     # SQLite DB에 매도 손익 정산 기록
                     if self.db_logger:
@@ -524,7 +526,7 @@ class SellManager:
                 continue
 
             # ── 3. 신규 매수 보호 유예 (매수 후 30분 동안 15분봉 데드크로스 매도 유예) ──
-            # (단, -5% 하드 손절 및 -3% 트레일링 스탑은 상단 2단계에서 실시간 감시 완료)
+            # (단, -2% 절대 손절은 상단 1단계에서 실시간 감시 완료)
             buy_t = getattr(state, 'buy_time', 0.0)
             if buy_t > 0 and (now - buy_t < 1800):
                 continue
@@ -543,86 +545,63 @@ class SellManager:
             if df_15m is None or df_15m.empty or len(df_15m) < 45:
                 continue
 
-            signals = analyze_sell_signals(df_15m)
+            signals = analyze_sell_signals(
+                df_15m, buy_price=buy_price, current_price=current_price,
+                touch_high=getattr(state, 'm_touch_high', 0.0)
+            )
 
-            # ── 5. 정배열 최고 정점 저항선 (M선) 50% 분할 익절 및 돌파 실패 시 전량 청산 ──
+            # ── 5. 정배열 최고 정점 저항선 (M선) 돌파 여부 확인 (15분봉 근접 시 1분봉 정밀 판별) ──
             # 수식: a=avg(c,5); b=avg(c,20); d=avg(c,60); K=valuewhen(1,a>b&&b>d&&a>d,C); M=valuewhen(1,K(2)<K(1)&&K(1)>K,K(1))
             m_resistance = calc_m_resistance_price(df_15m)
+            state.m_resistance_line = m_resistance
 
-            # 5-1. [1차 50% 분할 익절] M선 저항 도달 시 (현재가가 M선의 99.5% 이상 도달 시 50% 매도)
-            if m_resistance > 0 and not getattr(state, 'm_partial_sold', False):
-                if current_price >= (m_resistance * 0.995):
-                    half_qty = max(1, qty_sell // 2) if qty_sell > 1 else qty_sell
-                    logger.info(
-                        f"🎯 [{name}] 정배열 최고 정점 저항선 M선({m_resistance:,.0f}원) 도달! "
-                        f"보유 수량의 50%({half_qty}주) 1차 분할 익절 집행 (현재가: {current_price:,.0f}원)"
-                    )
+            # 계좌가 수익 중이고 15분봉 M선에 근접(99.0% 이상) 또는 진입 이력이 있을 때만 1분봉 정밀 돌파 로직 가동!
+            if m_resistance > 0 and calc_return > 0:
+                cur_touch = max(getattr(state, 'm_touch_high', 0.0), current_price)
+                is_near_m = (current_price >= m_resistance * 0.990) or (cur_touch >= m_resistance * 0.990)
+
+                if is_near_m:
+                    # 15분봉 M선 근접 감지 -> 1분봉 캔들 정밀 조회
                     async with self.api_lock:
-                        order_no = await asyncio.to_thread(
-                            self.client.place_sell_order, code, half_qty,
-                            price=current_price if current_price > 0 else buy_price, order_type="03"
-                        )
-                    if order_no:
-                        self.tracked_orders[order_no] = {
-                            'code': code, 'qty': half_qty,
-                            'time': time.time(), 'order_type': 'sell'
-                        }
-                        state.m_partial_sold = True
-                        state.m_resistance_line = m_resistance
-                        state.m_touch_high = current_price
-                        if self.db_logger:
-                            sell_p = current_price if current_price > 0 else buy_price
-                            self.db_logger.log_sell(
-                                code=code, sell_price=sell_p,
-                                sell_qty=half_qty, sell_reason=f"M선({m_resistance:,.0f}원) 1차 50% 분할 익절"
+                        df_1m = await asyncio.to_thread(self.client.get_1m_candles, code)
+                        await asyncio.sleep(0.08)
+
+                    m1_res = evaluate_1m_m_breakout(
+                        df_1m=df_1m,
+                        m_resistance=m_resistance,
+                        buy_price=buy_price,
+                        current_price=current_price,
+                        touch_high=cur_touch
+                    )
+                    state.m_touch_high = m1_res.get('touch_high', cur_touch)
+
+                    if m1_res.get('sell'):
+                        reject_reason = m1_res.get('reason', '1분봉 M선 돌파 실패 및 꺾임')
+                        logger.info(f"🔴 [{name}] {reject_reason} -> 전량 매도하여 수익 100% 확정 후 다음 종목 탐색!")
+                        async with self.api_lock:
+                            order_no = await asyncio.to_thread(
+                                self.client.place_sell_order, code, qty_sell,
+                                price=current_price if current_price > 0 else buy_price, order_type="03"
                             )
-                        # 1주만 보유해서 전량 매도된 경우 즉시 종료
-                        if half_qty >= qty_sell:
+                        if order_no:
+                            self.tracked_orders[order_no] = {
+                                'code': code, 'qty': qty_sell,
+                                'time': time.time(), 'order_type': 'sell'
+                            }
+                            state.sold_once = True
                             state.is_holding = False
                             state.trade_ended = True
+                            if self.db_logger:
+                                sell_p = current_price if current_price > 0 else buy_price
+                                self.db_logger.log_sell(
+                                    code=code, sell_price=sell_p,
+                                    sell_qty=qty_sell, sell_reason=f"1분봉 M선 돌파 실패 전량 매도 ({reject_reason})"
+                                )
                         continue
+                    else:
+                        logger.debug(f"ℹ️ [{name}] {m1_res.get('reason', '1분봉 M선 돌파 안착 관찰 중')}")
 
-            # 5-2. [2차 잔여 50% 전량 청산] 1차 50% 매도 후, M선 돌파 실패 및 꺾임 시 전량 매도
-            elif m_resistance > 0 and getattr(state, 'm_partial_sold', False):
-                # 돌파 실패 조건:
-                # 1) 현재가가 M선의 98.5% 미만으로 하락 이탈 (저항 맞고 꺾임)
-                # 2) 또는 M선 도달 최고점(m_touch_high) 대비 -2.0% 하락
-                # 3) 또는 15분봉 SMA5/SMA40 데드크로스 발생
-                touch_high = max(getattr(state, 'm_touch_high', 0.0), current_price)
-                state.m_touch_high = touch_high
-
-                is_m_rejected = (current_price < m_resistance * 0.985) or (current_price < touch_high * 0.98)
-                
-                if is_m_rejected or signals.get('sell'):
-                    reject_reason = (
-                        f"M선 저항선({m_resistance:,.0f}원) 돌파 실패 및 꺾임 확인 "
-                        f"(현재가 {current_price:,.0f}원, 고점 {touch_high:,.0f}원 대비 하락)"
-                        if is_m_rejected else signals.get('reason', '15분봉 데드크로스')
-                    )
-                    logger.info(f"🔴 [{name}] {reject_reason} -> 잔여 50%({qty_sell}주) 전량 청산하여 수익 100% 확정 후 다음 종목 탐색!")
-                    async with self.api_lock:
-                        order_no = await asyncio.to_thread(
-                            self.client.place_sell_order, code, qty_sell,
-                            price=current_price if current_price > 0 else buy_price, order_type="03"
-                        )
-                    if order_no:
-                        self.tracked_orders[order_no] = {
-                            'code': code, 'qty': qty_sell,
-                            'time': time.time(), 'order_type': 'sell'
-                        }
-                        state.sold_once = True
-                        state.is_holding = False
-                        state.trade_ended = True
-                        state.m_partial_sold = False
-                        if self.db_logger:
-                            sell_p = current_price if current_price > 0 else buy_price
-                            self.db_logger.log_sell(
-                                code=code, sell_price=sell_p,
-                                sell_qty=qty_sell, sell_reason=f"M선 돌파 실패 전량 청산 ({reject_reason})"
-                            )
-                    continue
-
-            # ── 6. 일반 15분봉 지표 기반 매도 신호 (M선 미발생 종목 또는 일반 데드크로스) ──
+            # ── 6. 일반 15분봉 지표 기반 매도 신호 (M선 돌파 실패 / 데드크로스 / 상한가 이탈) ──
             if signals.get('sell'):
                 logger.info(f"🔴 [{name}] 차트 매도 신호! {signals['reason']}")
                 async with self.api_lock:
@@ -656,7 +635,7 @@ class SellManager:
 class TradingBot:
     def __init__(self, condition_name="Traiding",
                  enable_buy=True, enable_sell=True,
-                 buy_amount=300000, max_positions=1):
+                 buy_amount=5000000, max_positions=2):
         self.client = RealAPIAdapter()
         self.condition_name = condition_name
         self.watchlist = {}
@@ -862,29 +841,37 @@ class TradingBot:
 
         # ═══════════════════════════════════════════════════════════
         # 각 매니저별 감시 실행:
-        # 1. NXT 프리마켓: 08:00 ~ 08:50 (NXT 지정가 매매)
-        # 2. KRX 정규장:  09:00 ~ 15:30 (정규장 실시간 매매)
-        # (08:50 ~ 09:00은 정규장 동시호가/개장 준비 구간으로 대기)
+        # 1. NXT 프리마켓:   08:00 ~ 08:50 (NXT 지정가 매매)
+        # 2. KRX 정규장:    09:00 ~ 15:30 (정규장 실시간 매매)
+        # 3. NXT 애프터마켓: 15:40 ~ 20:00 (NXT 지정가 매매, 오후 8시까지 연장 감시)
+        # (08:50~09:00 정규장 준비, 15:30~15:40 애프터마켓 준비 구간은 대기)
         # ═══════════════════════════════════════════════════════════
         now_time = datetime.now().time()
-        nxt_open = dtime(8, 0, 0)
-        nxt_close = dtime(8, 50, 0)
+        nxt_pre_open = dtime(8, 0, 0)
+        nxt_pre_close = dtime(8, 50, 0)
         market_open = dtime(9, 0, 0)
         market_close = dtime(15, 30, 0)
+        nxt_post_open = dtime(15, 40, 0)
+        nxt_post_close = dtime(20, 0, 0)
 
-        is_nxt_session = (nxt_open <= now_time < nxt_close)
+        is_pre_session = (nxt_pre_open <= now_time < nxt_pre_close)
         is_regular_session = (market_open <= now_time <= market_close)
+        is_post_session = (nxt_post_open <= now_time < nxt_post_close)
 
-        if not (is_nxt_session or is_regular_session):
-            if nxt_close <= now_time < market_open:
-                wait_reason = "08:50~09:00 정규장 개장 준비 구간 (NXT 마감)"
-            elif now_time < nxt_open:
+        is_active_session = (is_pre_session or is_regular_session or is_post_session)
+
+        if not is_active_session:
+            if nxt_pre_close <= now_time < market_open:
+                wait_reason = "08:50~09:00 정규장 개장 준비 구간 (NXT 프리마켓 마감)"
+            elif market_close < now_time < nxt_post_open:
+                wait_reason = "15:30~15:40 애프터마켓 개장 준비 구간 (KRX 정규장 마감)"
+            elif now_time < nxt_pre_open:
                 wait_reason = "08:00 NXT 프리마켓 개장 대기"
             else:
-                wait_reason = "15:30 정규장 마감"
+                wait_reason = "20:00 당일 전체 매매 세션(애프터마켓 포함) 마감"
             logger.info(
                 f"⏳ [{wait_reason}] 현재 {now_time.strftime('%H:%M:%S')}. "
-                f"(매매 세션: NXT 08:00~08:50 / KRX 09:00~15:30) 잔고 동기화만 유지합니다."
+                f"(매매 세션: NXT 프리 08:00~08:50 / KRX 정규 09:00~15:30 / NXT 애프터 15:40~20:00) 잔고 동기화만 유지합니다."
             )
             self.save_states()
             return
@@ -922,12 +909,12 @@ class TradingBot:
         logger.info("=" * 60)
         logger.info(" 🚀 [15분봉 수급변곡 최우선 스나이핑 + 30분봉 W자 반등 매수 봇] 시작")
         logger.info(f" 활성 임무: {', '.join(tasks_str)}")
-        logger.info(f" 세션: [NXT 프리마켓] 08:00 ~ 08:50 | [KRX 정규장] 09:00 ~ 15:30")
+        logger.info(f" 세션: [NXT 프리] 08:00~08:50 | [KRX 정규] 09:00~15:30 | [NXT 애프터] 15:40~20:00 (오후 8시까지 감시)")
         logger.info(f" 전략: [1순위] 15분봉 20억 수급 + 3일선 U턴 변곡 스나이퍼 매수 (Combo 3+4)")
         logger.info(f"       [2순위] 30분봉 260이평 W자 반등 종목 우선 매수")
         logger.info(f"       [3순위] 15분봉 3-20 골든크로스 / 3-5 더블 변곡 매수")
-        logger.info(f"       [매도] 15분봉 SMA(5,40) 데드크로스 / 하드손절(-5%) 시장가 매도")
-        logger.info(f" 매매 모드: 🎯 [1종목 집중 원픽 스나이퍼 모드] (종목당: {self.buy_manager.buy_amount if self.buy_manager else 300000:,.0f}원)")
+        logger.info(f"       [매도] M선 돌파 실패 전량 매도 / 매수가 대비 -2% 절대 손절매")
+        logger.info(f" 매매 모드: 🎯 [최대 {self.buy_manager.max_positions if self.buy_manager else 2}종목 분산 모드] (종목당: {self.buy_manager.buy_amount if self.buy_manager else 5000000:,.0f}원 | 총 한도: {(self.buy_manager.buy_amount * self.buy_manager.max_positions) if self.buy_manager else 10000000:,.0f}원)")
         logger.info(f" 오버나잇: 허용 | 시간 제한: 없음")
         logger.info("=" * 60)
 
@@ -955,7 +942,7 @@ class TradingBot:
 # ═══════════════════════════════════════════════════════════════
 async def main():
     parser = argparse.ArgumentParser(
-        description="15분봉 수급변곡 + 30분봉 W자 반등 1종목 집중 트레이딩 봇"
+        description="15분봉 수급변곡 + 30분봉 W자 반등 분산 트레이딩 봇"
     )
     parser.add_argument(
         '--task', nargs='+',
@@ -968,12 +955,12 @@ async def main():
         help="키움증권 조건검색식 이름 (기본: Traiding)"
     )
     parser.add_argument(
-        '--amount', type=int, default=300000,
-        help="종목당 매수 금액 (기본: 300,000원)"
+        '--amount', type=int, default=5000000,
+        help="종목당 매수 금액 (기본: 5,000,000원)"
     )
     parser.add_argument(
-        '--max-positions', type=int, default=1,
-        help="최대 보유 종목 수 (기본: 1 - 원픽 집중 매매)"
+        '--max-positions', type=int, default=2,
+        help="최대 보유 종목 수 (기본: 2 - 2종목 분산 매매)"
     )
 
     args = parser.parse_args()

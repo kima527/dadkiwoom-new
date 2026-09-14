@@ -36,6 +36,7 @@ class Formula4Params:
     min_supply_money: float = 20.0        # 15분봉 최소 수급(거래대금) (기본 20억원)
     body_tail_ratio: float = 1.2          # 캔들 몸통 / 윗꼬리 비율 (기본 1.2배 이상)
     supply_surge_multiplier: float = 3.0  # 직전 2개봉 평균 수급 대비 폭증 배수 (기본 3.0배)
+    supply_ma20_multiplier: float = 5.0   # 20봉 평균 수급 대비 폭증 배수 (5배: A >= AvgA * 5)
     sma_fast: int = 1                     # 단기 이평 (1 = 종가)
     sma_mid: int = 20                     # 중기 이평 (20)
     sma_long: int = 60                    # 장기 이평 (60)
@@ -124,20 +125,24 @@ def analyze_15m_4formulas(
     # 1. 수급 >= 20억
     cond_supply_20 = df['supply'] >= params.min_supply_money
     
-    # 2. 양봉 (o < c)
+    # 2. 20봉 평균 수급 대비 5배 이상 (A >= AvgA * 5)
+    df['supply_ma20'] = df['supply'].rolling(20, min_periods=1).mean()
+    cond_supply_5x_ma20 = df['supply'] >= (df['supply_ma20'] * params.supply_ma20_multiplier)
+
+    # 3. 양봉 (o < c)
     cond_bull = df['close'] > df['open']
     
-    # 3. 몸통 > 윗꼬리 * 1.2 (c - o > (h - c) * 1.2)
+    # 4. 몸통 > 윗꼬리 * 1.2 (c - o > (h - c) * 1.2)
     body = df['close'] - df['open']
     upper_tail = (df['high'] - df['close']).clip(lower=0)
     cond_strong_body = body > (upper_tail * params.body_tail_ratio)
     
-    # 4. 수급 >= (수급(1) + 수급(2)) / 2 * 3
+    # 5. 수급 >= (수급(1) + 수급(2)) / 2 * 3
     prev_2_supply_avg = (df['supply'].shift(1) + df['supply'].shift(2)) / 2.0
     prev_2_supply_avg = prev_2_supply_avg.replace(0, np.nan).fillna(df['supply'].rolling(5).mean())
     cond_supply_surge = df['supply'] >= (prev_2_supply_avg * params.supply_surge_multiplier)
 
-    df['cond_1_supply_candle'] = cond_supply_20 & cond_bull & cond_strong_body & cond_supply_surge
+    df['cond_1_supply_candle'] = cond_supply_20 & cond_supply_5x_ma20 & cond_bull & cond_strong_body & cond_supply_surge
 
     # ─────────────────────────────────────────────────────────────
     # [수식 2] M선, 황룡선, M1선, 룡선 계산

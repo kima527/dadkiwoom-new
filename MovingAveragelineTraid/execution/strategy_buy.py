@@ -240,14 +240,69 @@ def detect_w_rebound_30m(df30: pd.DataFrame, lookback: int = 200) -> tuple[bool,
     return True, w_info
 
 # ═══════════════════════════════════════════════════════════════
+# 중소형주 분봉 수급 폭발 신호 검출
+# A = (H+L+O+C)/4*V/100000000;
+# AvgA = ma(A, 20);
+# A >= AvgA * 5 AND O < C AND C - O > (H - C) * 1.2 AND A >= (A(1) + A(2)) / 2 * 3
+# ═══════════════════════════════════════════════════════════════
+def check_smallcap_supply_signal(df: pd.DataFrame) -> tuple[bool, dict]:
+    """
+    중소형주 분봉 수급 공식 완성 검출
+    """
+    if df is None or len(df) < 22:
+        return False, {}
+    
+    df_c = df.copy()
+    col_map = {c: str(c).lower() for c in df_c.columns if str(c).lower() in ('open', 'high', 'low', 'close', 'volume')}
+    df_c.rename(columns=col_map, inplace=True)
+    
+    if not all(k in df_c.columns for k in ('open', 'high', 'low', 'close', 'volume')):
+        return False, {}
+        
+    df_c['supply'] = (df_c['high'] + df_c['low'] + df_c['open'] + df_c['close']) / 4.0 * df_c['volume'] / 1e8
+    df_c['supply_ma20'] = df_c['supply'].rolling(20, min_periods=1).mean()
+    
+    latest = df_c.iloc[-1]
+    prev1 = df_c.iloc[-2]
+    prev2 = df_c.iloc[-3]
+    
+    a_val = float(latest['supply'])
+    avga_val = float(latest['supply_ma20'])
+    o_val = float(latest['open'])
+    c_val = float(latest['close'])
+    h_val = float(latest['high'])
+    
+    a1_val = float(prev1['supply'])
+    a2_val = float(prev2['supply'])
+    prev_2_avg = (a1_val + a2_val) / 2.0
+    
+    cond_ma20_5x = (a_val >= avga_val * 5.0) if avga_val > 0 else True
+    cond_bull = (c_val > o_val)
+    cond_body_strong = (c_val - o_val) > ((h_val - c_val) * 1.2)
+    cond_prev2_3x = (a_val >= prev_2_avg * 3.0) if prev_2_avg > 0 else True
+    
+    is_signal = bool(cond_ma20_5x and cond_bull and cond_body_strong and cond_prev2_3x)
+    info = {
+        "is_signal": is_signal,
+        "supply_억": round(a_val, 2),
+        "supply_ma20_억": round(avga_val, 2),
+        "surge_ratio_ma20": round(a_val / avga_val, 1) if avga_val > 0 else 0.0,
+        "surge_ratio_prev2": round(a_val / prev_2_avg, 1) if prev_2_avg > 0 else 0.0,
+        "close": c_val
+    }
+    return is_signal, info
+
+# ═══════════════════════════════════════════════════════════════
 # 매수 신호 종합 분석 함수
 # ═══════════════════════════════════════════════════════════════
 def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: pd.DataFrame = None) -> dict:
     """
-    일봉 및 30분봉 조건을 모두 검사하여 최우선 순위(W자 반등 종목)를 고려해 매수 신호 반환
-    - [최우선] 30분봉 260이평 W자 반등(1차상승 ➔ 하락눌림 ➔ 260이평 재돌파) + HH 돌파
-    - [조건 1] 일봉: 당일 단순 20이평선(SMA20) 상향 돌파 + 현재가 > 가중 5-20 고가선(HH)
-    - [조건 2] 30분봉: 당일 단순 260이평선(SMA260) 상향 돌파 + 현재가 > 가중 5-20 고가선(HH)
+    일봉 및 30분봉 조건을 모두 검사하여 최우선 순위를 고려해 매수 신호 반환
+    - [중소형주 수급] 20봉 평균 5배 + 양봉 몸통>윗꼬리*1.2 + 직전2봉 3배 폭증
+    - [최우선] 30분봉 260이평 W자 반등(1차상승 ➔ 하락눌림 ➔ 260이평 재돌파)
+    - [원칙 1] 일봉: 당일 단순 20이평선(SMA20) 상향 돌파
+    - [원칙 2] 30분봉: 당일 단순 260이평선(SMA260) 상향 돌파
+    - [원칙 3] 30분봉: 3일선이 5일선 상향 골든크로스 & 우상향
     """
     result = {
         "buy": False,
@@ -256,8 +311,10 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
         "reason": "",
         "remove_watchlist": False,
         "is_w_rebound": False,
+        "is_supply_surge": False,
         "priority_score": 0.0,
-        "w_info": {}
+        "w_info": {},
+        "supply_info": {}
     }
 
     if df_30m is None or df_30m.empty or len(df_30m) < 20:
@@ -271,12 +328,19 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
     current_price = float(df30.iloc[-1]['close'])
     result['close'] = current_price
 
-    # 30분봉 260이평 W자 반등 패턴 사전 검출
+    # 1. 중소형주 분봉 수급 폭발 신호 검출
+    is_supply_sig, supply_info = check_smallcap_supply_signal(df30)
+    if is_supply_sig:
+        result['is_supply_surge'] = True
+        result['supply_info'] = supply_info
+        result['priority_score'] += 150.0
+
+    # 2. 30분봉 260이평 W자 반등 패턴 사전 검출
     is_w_rebound, w_info = detect_w_rebound_30m(df30)
     if is_w_rebound:
         result['is_w_rebound'] = True
         result['w_info'] = w_info
-        result['priority_score'] = 100.0 + min(w_info.get('rebound_pct', 0.0), 20.0)
+        result['priority_score'] = max(result['priority_score'], 100.0 + min(w_info.get('rebound_pct', 0.0), 20.0))
 
     is_daily_condition_met = False
     daily_reason = ""
@@ -302,8 +366,6 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
             d_prev_close = float(d_prev['close']) if pd.notna(d_prev['close']) else 0.0
 
             if d_sma20_val > 0 and d_prev_sma20 > 0:
-                # 전일 종가 <= 전일 20이평 & 현재가 >= 당일 20이평 (1-20 골든크로스 발발)
-                # 매수 주문 가격: 일봉 20이평선 가격(d_sma20_val) 그 자체로 지정가 매수!
                 if (d_prev_close <= d_prev_sma20) and (current_price >= d_sma20_val):
                     cond1_daily_sma20 = True
                     diff_pct = ((current_price - d_sma20_val) / d_sma20_val) * 100
@@ -337,8 +399,6 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
             prev_day_last_close = float(df30_prev.iloc[-1]['close']) if not df30_prev.empty else 0.0
             prev_day_last_sma260 = float(df30_prev.iloc[-1]['sma260']) if (not df30_prev.empty and pd.notna(df30_prev.iloc[-1]['sma260'])) else 0.0
             
-            # 어제 종가 <= 어제 SMA260 이었거나, 당일 장중 캔들에서 직접 CrossUp 발생했거나, W자 반등 완성
-            # 매수 주문 가격: 30분봉 260이평선 가격(m30_sma260_val) 그 자체로 지정가 매수!
             climbed_from_prev_day = (prev_day_last_close <= prev_day_last_sma260)
             today_crossup = False
             if len(df30_today) >= 2:
@@ -378,8 +438,6 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
             curr_sma5 = float(latest_s['day_sma5']) if pd.notna(latest_s['day_sma5']) else 0.0
             prev_sma3 = float(prev_s['day_sma3']) if pd.notna(prev_s['day_sma3']) else 0.0
 
-            # 3일선이 5일선 위에 위치(정배열)하고, 반드시 3일선이 직전 대비 '우상향(상향 방향)' 중이어야 함
-            # 매수 주문 가격: 실시간 3일선 가격(curr_sma3) 그 자체로 지정가 매수!
             is_s3_above_s5 = (curr_sma3 > curr_sma5)
             is_s3_slope_up = (curr_sma3 >= prev_sma3)
 
@@ -415,16 +473,19 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
                     )
 
     # ─────────────────────────────────────────────────
-    # 매수 신호 판정: 3대 핵심 원칙 (독립적 OR 조건 결합)
-    # [원칙 1] 일봉 1-20 골든크로스 ➔ 일봉 20일선 가격(d_sma20_val)에 지정가 매수
-    # [원칙 2] 30분봉 1-260 골든크로스 ➔ 30분봉 260선 가격(m30_sma260_val)에 지정가 매수
-    # [원칙 3] 30분봉 3이평-5이평 골든크로스 ➔ 3일선 가격(curr_sma3)에 지정가 매수
+    # 매수 신호 판정: 수급 폭발 또는 3대 핵심 원칙 (독립적 OR 조건 결합)
     # ─────────────────────────────────────────────────
-    if cond1_daily_sma20 or cond2_30m_sma260 or cond3_day_sma_cross:
+    if is_supply_sig or cond1_daily_sma20 or cond2_30m_sma260 or cond3_day_sma_cross:
         result['buy'] = True
         
-        # 사유 조합 및 우선순위 점수/지정가 매수 목표가격 산정
         reasons = []
+        if is_supply_sig:
+            reasons.append(
+                f"🚀 [중소형주 수급 폭발봉] 거래대금 {supply_info['supply_억']:.1f}억 (20이평 대비 {supply_info['surge_ratio_ma20']:.1f}배, 직전2봉 대비 {supply_info['surge_ratio_prev2']:.1f}배) + 탄탄한 양봉"
+            )
+            result['target_price'] = current_price
+            result['ll'] = current_price
+
         if cond2_30m_sma260:
             reasons.append(m30_reason)
             result['ll'] = m30_sma260_val

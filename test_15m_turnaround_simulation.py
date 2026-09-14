@@ -49,23 +49,30 @@ def test_unit_formula_logic():
     print(" [테스트 1] 15분봉 및 일봉 수식 1, 2, 3, 4 및 3대 조합 단위 기능 검증")
     print("=" * 70)
 
-    # 1-1. 수식 4 검증 (당일 누적 일봉 20억 수급 + 15분봉 3배 폭증 & 윗꼬리 짧은 양봉)
+    # 1-1. 수식 4 검증 (당일 누적 일봉 20억 수급 + 20봉 평균 5배 폭증 + 직전 2봉 3배 폭증 & 윗꼬리 짧은 양봉)
+    base_opens = [10000] * 20
+    base_highs = [10050] * 20
+    base_lows = [9950] * 20
+    base_closes = [10000] * 20
+    base_vols = [10000] * 20  # 평소 15분봉 거래량: 1만주 (수급 약 1억원)
+
+    # 21번째 돌파봉: open=10000, close=10480 (몸통 480), high=10500 (윗꼬리 20), vol=300000 (수급 약 30.7억원)
     test_15m_data = {
-        'open':   [10000, 10050, 10100, 10000],
-        'high':   [10100, 10150, 10150, 10500],
-        'low':    [9950,  10000, 10050, 9980],
-        'close':  [10050, 10100, 10120, 10480],  # 4번째 봉: open=10000, close=10480 (몸통 480), high=10500 (윗꼬리 20)
-        'volume': [50000, 60000, 50000, 300000], # 당일 누적 거래량: 46만주 -> 누적 거래대금 약 47.3억원 (>=20억)
+        'open':   base_opens + [10000],
+        'high':   base_highs + [10500],
+        'low':    base_lows + [9980],
+        'close':  base_closes + [10480],
+        'volume': base_vols + [300000],
     }
     df_15m = pd.DataFrame(test_15m_data)
-    params = Turnaround15mParams(min_daily_supply_money=20.0, supply_surge_multiplier=3.0)
+    params = Turnaround15mParams(min_daily_supply_money=20.0, supply_surge_multiplier=3.0, supply_ma20_multiplier=5.0)
     
     df_f4 = calc_formula_4_supply(df_15m, params)
     print(f" -> 수식 4 (일봉 20억 수급 베이스 + 15분봉 수급 폭발):")
     print(f"    - 당일 일봉 누적 수급액: {df_f4['day_supply_money'].iloc[-1]:.2f}억원 (기준: >=20억)")
-    print(f"    - 4번째 15분봉 수급액: {df_f4['m15_money'].iloc[-1]:.2f}억원 (직전 대비 3배 폭증 여부: {df_f4['is_15m_supply_surge'].iloc[-1]})")
+    print(f"    - 돌파 15분봉 수급액: {df_f4['m15_money'].iloc[-1]:.2f}억원 (20봉평균 대비: {df_f4['m15_money'].iloc[-1]/df_f4['m15_avg_money_20'].iloc[-1]:.1f}배, 직전대비 3배: {df_f4['is_15m_supply_surge'].iloc[-1]})")
     print(f"    - 15분봉 윗꼬리 대비 몸통 비율: 몸통={df_f4['body_15m'].iloc[-1]}, 윗꼬리={df_f4['upper_tail_15m'].iloc[-1]}")
-    print(f"    - 4번째 봉 수식 4 신호 발생 여부: {df_f4['sig_f4'].iloc[-1]}")
+    print(f"    - 돌파봉 수식 4 신호 발생 여부: {df_f4['sig_f4'].iloc[-1]}")
     assert df_f4['sig_f4'].iloc[-1] == True, "수식 4 신호 검출 실패!"
     print("    [PASS] 수식 4 정상 작동 확인.")
 

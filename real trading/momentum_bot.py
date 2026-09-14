@@ -24,13 +24,13 @@ def get_kst_now():
     return datetime.now(timezone(timedelta(hours=9)))
 
 def is_market_open():
-    """장 운영 시간 확인 (08:00 ~ 15:20)"""
+    """장 운영 시간 확인 (NXT 프리/애프터 포함 08:00 ~ 20:00)"""
     now = get_kst_now()
     if now.weekday() >= 5: # 주말
         return False
     current_time = now.time()
     from datetime import time as dt_time
-    return dt_time(8, 0) <= current_time <= dt_time(15, 20)
+    return dt_time(8, 0) <= current_time <= dt_time(20, 0)
 
 def get_tick_size(price):
     """한국거래소 호가 단위 산출 (주식)"""
