@@ -1,6 +1,8 @@
 """
-strategy_stoploss.py - 5분봉 TEMA 기반 손절 전략
+[DEPRECATED] strategy_stoploss.py - 5분봉 TEMA 기반 손절 전략
 ===========================================================================
+⚠️ 이 파일은 더 이상 사용되지 않습니다 (매도가 15분봉 WMA 3-5 데드크로스로 단일화됨).
+   향후 재활용 가능성이 있어 보관합니다.
 
 손절 로직:
   TEMA(Triple Exponential Moving Average) 계산:

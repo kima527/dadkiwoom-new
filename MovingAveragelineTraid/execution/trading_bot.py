@@ -1,16 +1,16 @@
 """
-trading_bot.py - 30분봉 260이평 W자 반등 우선 매수 + 15분봉 SMA 데드크로스 매도 봇
+trading_bot.py - 30분봉 260이평 W자 반등 우선 매수 + 15분봉 WMA 3-5 데드크로스 단일 매도 봇
 ===========================================================================
 
 구조:
-  1. BuyManager  - 30분봉 260이평 W자 반등 종목 최우선 매수 + 일봉/30분봉 HH 돌파 매수
-  2. SellManager - 15분봉 SMA5/SMA40 데드크로스 매도
+  1. BuyManager  - 15분봉 4대수식/수급변곡 + 30분봉 260이평 W자 반등 최우선 매수
+  2. SellManager - 15분봉 WMA 3-5 데드크로스 단일 매도
 
 전략 요약:
-  - 매수: 조건검색식 편입 종목 중 30분봉 260이평 W자 반등(1차상승 ➔ 눌림 ➔ 260이평 재돌파) 종목 최우선 매수
-  - 매도: 15분봉 SMA5가 SMA40 데드크로스 시 전량 시장가 매도
-  - 오버나잇 허용, 매매 시간 제한 없음
-  - 최대 30종목 보유 가능
+  - 매수: 15분봉 4대 수식 올인원 돌파 최우선 + 30분봉 260이평 W자 반등 매수
+  - 매도: 15분봉 WMA 3-5 데드크로스 발생 시 전량 시장가(03) 매도
+  - 오버나잇 허용, 세션 자동 연동 (NXT 프리 08:00 ~ KRX 정규 ~ NXT 애프터 20:00)
+  - 종목당 500만원 / 최대 2종목 분산 보유 (총 1,000만원 한도)
 
 실행 방법:
   python trading_bot.py                      # 전체 임무 실행
@@ -30,9 +30,11 @@ import argparse
 from real_api_adapter import RealAPIAdapter
 from utils import TradeState, get_tick_size, calculate_trade_intensity
 from strategy_buy import analyze_buy_signals
-from strategy_sell import analyze_sell_signals, evaluate_1m_m_breakout
-from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams, calc_m_resistance_price
+from strategy_sell import analyze_sell_signals
+from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
+from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 from db_logger import TradeDBLogger
+from scan_tomorrow_picks import run_scanner
 from datetime import datetime, time as dtime
 
 # ═══════════════════════════════════════════════════════════════
@@ -111,7 +113,9 @@ class MarketIndexGuard:
                 await asyncio.sleep(0.1)
 
             if df_kospi is not None and not df_kospi.empty and len(df_kospi) >= 20:
-                today_mask = df_kospi.index.date == df_kospi.index[-1].date()
+                last_dt = df_kospi.index[-1]
+                target_date = last_dt.date() if hasattr(last_dt, 'date') else last_dt
+                today_mask = [idx.date() == target_date if hasattr(idx, 'date') else idx == target_date for idx in df_kospi.index]
                 df_today = df_kospi[today_mask]
                 if not df_today.empty:
                     open_p = float(df_today.iloc[0]['open'])
@@ -122,7 +126,9 @@ class MarketIndexGuard:
                         warning_reasons.append(f"코스피 급락({kospi_chg:+.2f}%)")
 
             if df_kosdaq is not None and not df_kosdaq.empty and len(df_kosdaq) >= 20:
-                today_mask = df_kosdaq.index.date == df_kosdaq.index[-1].date()
+                last_dt = df_kosdaq.index[-1]
+                target_date = last_dt.date() if hasattr(last_dt, 'date') else last_dt
+                today_mask = [idx.date() == target_date if hasattr(idx, 'date') else idx == target_date for idx in df_kosdaq.index]
                 df_today = df_kosdaq[today_mask]
                 if not df_today.empty:
                     open_p = float(df_today.iloc[0]['open'])
@@ -175,6 +181,8 @@ class BuyManager:
         self.buy_amount = buy_amount        # 종목당 매수 금액 (500만원)
         self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 2종목 분산 매매)
         self.params_15m = Turnaround15mParams(min_daily_supply_money=20.0)
+        self.params_f4 = Formula4Params(min_supply_money=20.0)
+        self._static_filter_cache = {}     # 당일 시가총액 & 5일 거래대금 정적 필터 캐시 {code: (passed: bool, date: str)}
 
     async def run(self, holdings: dict, unexecuted: list):
         """매수 감시 사이클 실행"""
@@ -225,40 +233,67 @@ class BuyManager:
 
             name = info.get('name', code) if isinstance(info, dict) else str(info)
             weight = info.get('weight', 1.0) if isinstance(info, dict) else 1.0
+            today_str = datetime.now().strftime("%Y-%m-%d")
 
-            # 15분봉(정밀타점) + 30분봉(거시) + 일봉(필터/수급) 데이터 동시 조회
-            async with self.api_lock:
-                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
-                await asyncio.sleep(0.06)
-                df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
-                await asyncio.sleep(0.06)
-                daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
-                await asyncio.sleep(0.06)
+            # ── [정적 필터 캐시 검사 (API 호출 병목 획기적 단축)] ──
+            cached_filter = self._static_filter_cache.get(code)
+            if cached_filter and cached_filter[1] == today_str:
+                if not cached_filter[0]:
+                    if code in self.watchlist:
+                        del self.watchlist[code]
+                    continue
+                # 필터 통과한 종목은 데이터만 조회
+                async with self.api_lock:
+                    df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
+                    await asyncio.sleep(0.04)
+                    df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
+                    await asyncio.sleep(0.04)
+                    daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
+                    await asyncio.sleep(0.04)
+            else:
+                # 최초 1회 정적 필터(시가총액 & 5일 거래대금) 검사 및 캐싱
+                async with self.api_lock:
+                    df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
+                    await asyncio.sleep(0.04)
+                    df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
+                    await asyncio.sleep(0.04)
+                    daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
+                    await asyncio.sleep(0.04)
+
+                if daily_df is None or len(daily_df) < 5:
+                    continue
+
+                # 5일 평균 거래대금 10억 미만 소외주 제외
+                trade_val_5d = (daily_df['close'] * daily_df['volume']).tail(5).mean()
+                if trade_val_5d < 1_000_000_000:
+                    logger.info(f"⏭️ [{name}] 5일 평균 거래대금({trade_val_5d/1e8:.1f}억) 10억 미만으로 감시대상에서 제외합니다.")
+                    self._static_filter_cache[code] = (False, today_str)
+                    if code in self.watchlist:
+                        del self.watchlist[code]
+                    continue
+
+                # 시가총액 10조 이상 초대형주 제외
+                market_cap = await asyncio.to_thread(self.client.get_market_cap, code)
+                if market_cap >= 10_000_000_000_000:
+                    logger.info(f"⏭️ [{name}] 시가총액({market_cap/1e12:.1f}조원) 10조 이상 대형주로 감시대상에서 제외합니다.")
+                    self._static_filter_cache[code] = (False, today_str)
+                    if code in self.watchlist:
+                        del self.watchlist[code]
+                    continue
+
+                self._static_filter_cache[code] = (True, today_str)
 
             if daily_df is None or len(daily_df) < 5:
                 continue
 
-            # 5일 평균 거래대금 10억 미만 소외주 제외
-            trade_val_5d = (daily_df['close'] * daily_df['volume']).tail(5).mean()
-            if trade_val_5d < 1_000_000_000:
-                logger.info(f"⏭️ [{name}] 5일 평균 거래대금({trade_val_5d/1e8:.1f}억) 10억 미만으로 감시대상에서 제외합니다.")
-                if code in self.watchlist:
-                    del self.watchlist[code]
-                continue
+            # ── 1. [최우선 0순위] 15분봉 4대 수식 완성 전략 평가 ──
+            eval_f4 = evaluate_4formula_buy(code, name, df_15m, current_price=None, params=self.params_f4) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
-            # 시가총액 10조 이상 초대형주 제외 (삼성전자, SK하이닉스, NAVER 등)
-            market_cap = await asyncio.to_thread(self.client.get_market_cap, code)
-            if market_cap >= 10_000_000_000_000:
-                logger.info(f"⏭️ [{name}] 시가총액({market_cap/1e12:.1f}조원) 10조 이상 대형주로 감시대상에서 제외합니다.")
-                if code in self.watchlist:
-                    del self.watchlist[code]
-                continue
-
-            # ── 1. [최우선] 15분봉 수급 및 이평 변곡 전략 평가 ──
+            # ── 2. [1순위] 15분봉 수급 및 이평 변곡 전략 평가 ──
             eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, current_price=None, params=self.params_15m) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
-            # ── 2. 30분봉/일봉 이평 돌파 전략 평가 ──
-            signals_30m = analyze_buy_signals(df_30m, None, daily_df) if (df_30m is not None and not df_30m.empty) else {'buy': False}
+            # ── 3. [2순위] 30분봉/일봉 이평 돌파 전략 평가 ──
+            signals_30m = analyze_buy_signals(df_30m, None, daily_df, df_15m=df_15m) if (df_30m is not None and not df_30m.empty) else {'buy': False}
             
             if signals_30m.get('remove_watchlist'):
                 logger.info(f"🗑️ [{name}] 이미 SMA20을 훌쩍 넘긴 종목. 감시대상에서 제외합니다.")
@@ -266,8 +301,31 @@ class BuyManager:
                     del self.watchlist[code]
                 continue
 
-            # 15분봉 신호 우선 채택
-            if eval_15m.get('should_buy'):
+            # 15분봉 4대 수식 올인원 신호 최우선 채택
+            if eval_f4.get('should_buy'):
+                buy_price = eval_f4['price']
+                if buy_price > self.buy_amount:
+                    continue
+                buy_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'state': state,
+                    'signals': {
+                        'buy': True,
+                        'close': eval_f4['price'],
+                        'target_price': eval_f4['price'],
+                        'reason': eval_f4['reason'],
+                        'll': eval_f4['price']
+                    },
+                    'df_30m': df_30m if df_30m is not None else df_15m,
+                    'weight': weight,
+                    'is_15m_4formula': True,
+                    'is_15m_turnaround': False,
+                    'is_w_rebound': False,
+                    'priority_score': 300.0  # 15분봉 4대 수식 완벽 완성 최고 가산점
+                })
+            # 15분봉 수급 변곡 신호 채택
+            elif eval_15m.get('should_buy'):
                 buy_price = eval_15m['limit_price']
                 if buy_price > self.buy_amount:
                     continue
@@ -284,6 +342,7 @@ class BuyManager:
                     },
                     'df_30m': df_30m if df_30m is not None else df_15m,
                     'weight': weight,
+                    'is_15m_4formula': False,
                     'is_15m_turnaround': True,
                     'is_w_rebound': False,
                     'priority_score': eval_15m['priority_score'] + 100.0  # 15분봉 스나이핑 최우선 가산점
@@ -299,6 +358,7 @@ class BuyManager:
                     'signals': signals_30m,
                     'df_30m': df_30m,
                     'weight': weight,
+                    'is_15m_4formula': signals_30m.get('is_4formula_buy', False),
                     'is_15m_turnaround': False,
                     'is_w_rebound': signals_30m.get('is_w_rebound', False),
                     'priority_score': signals_30m.get('priority_score', 0.0)
@@ -307,9 +367,10 @@ class BuyManager:
         if not buy_candidates:
             return
 
-        # ── 최우선 정렬 (15분봉 수급변곡 -> 30분봉 W자 반등 -> 우선순위 점수 -> 테마 가중치) ──
+        # ── 최우선 정렬 (15분봉 4대수식 -> 15분봉 수급변곡 -> 30분봉 W자 반등 -> 우선순위 점수 -> 테마 가중치) ──
         buy_candidates.sort(
             key=lambda x: (
+                1 if x.get('is_15m_4formula') else 0,
                 1 if x.get('is_15m_turnaround') else 0,
                 1 if x.get('is_w_rebound') else 0,
                 x['priority_score'],
@@ -435,11 +496,12 @@ class BuyManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SellManager - 15분봉 SMA5/SMA40 데드크로스 매도
+# SellManager - 15분봉 WMA 3-5 데드크로스 매도 전용
 # ═══════════════════════════════════════════════════════════════
 class SellManager:
     """
-    빠른 손절매(-5%) / 트레일링 스탑(고점대비 -3%) / 15분봉 데드크로스 매도.
+    15분봉 WMA 3이 WMA 5를 하향 돌파(데드크로스)할 때만 시장가 전량 매도.
+    장초반 강력 매수 후 상승 탄력이 꺾이는 꼭지 부근에서 신속히 이익을 확정하고 자금을 회전합니다.
     """
 
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
@@ -451,10 +513,10 @@ class SellManager:
         self.tracked_orders = tracked_orders
         self.watchlist = watchlist
         self.db_logger = db_logger
-        self.last_15m_fetch_time = {} # TR 스로틀링 타이머 {code: float}
+        self.last_15m_fetch_time = {}  # TR 스로틀링 타이머 {code: float}
 
     async def run(self, holdings: dict):
-        """매도 감시 사이클 실행 (보유 종목만 대상)"""
+        """매도 감시 사이클 실행 (보유 종목 대상 15분봉 3-5 WMA 데드크로스 감시)"""
         now = time.time()
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
@@ -476,30 +538,24 @@ class SellManager:
             hold_info = holdings[code]
             buy_price = float(hold_info.get('buy_price', 0)) if isinstance(hold_info, dict) else 0.0
             current_price = float(hold_info.get('current_price', 0)) if isinstance(hold_info, dict) else 0.0
-            return_rate = float(hold_info.get('return_rate', 0.0)) if isinstance(hold_info, dict) else 0.0
             qty_sell = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
 
-            if buy_price > 0 and current_price > 0:
-                calc_return = ((current_price - buy_price) / buy_price) * 100
-            else:
-                calc_return = return_rate
+            # 15분봉 데이터 조회 (보유 2종목 미만이므로 매 사이클 신속 감시)
+            async with self.api_lock:
+                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
+                await asyncio.sleep(0.1)
 
-            do_sell = False
-            sell_reason = ""
+            if df_15m is None or df_15m.empty or len(df_15m) < 5:
+                continue
 
-            # ── 1. 절대적 매도 조건 (매수가 대비 -2.0% 손절) 빠른 감시 ──
-            # ⚠️ current_price가 0이면 API 오류이므로 빠른 감시를 건너뛰고 15분봉 차트로 넘어감
-            if current_price > 0 and buy_price > 0:
-                # [원칙] 매수가 대비 -2.0% 이하 도달 시 무조건 전량 즉시 손절매
-                if calc_return <= -2.0:
-                    do_sell = True
-                    sell_reason = (
-                        f"🛑 [절대적 매도 조건 도달] 매수가 대비 -2.0% 손절선 도달: "
-                        f"매입단가 {buy_price:,.0f}원 -> 현재가 {current_price:,.0f}원 ({calc_return:+.2f}%)"
-                    )
+            # 15분봉 3-5 WMA 데드크로스 신호 판정
+            signals = analyze_sell_signals(
+                df_15m, buy_price=buy_price, current_price=current_price
+            )
 
-            if do_sell:
-                logger.info(f"🔴 [{name}] 즉각 매도 신호! {sell_reason}")
+            # 15분봉 WMA 3 < WMA 5 데드크로스 발생 시에만 전량 시장가 매도 집행
+            if signals.get('sell'):
+                logger.info(f"🔴 [{name}] 15분봉 3-5 WMA 데드크로스 매도 신호 감지! {signals['reason']}")
                 async with self.api_lock:
                     order_no = await asyncio.to_thread(
                         self.client.place_sell_order, code, qty_sell,
@@ -513,127 +569,25 @@ class SellManager:
                     state.sold_once = True
                     state.is_holding = False
                     state.trade_ended = True
-                    logger.info(f"✅ [{name}] 빠른 시장가 매도 주문 전송 (주문번호: {order_no})")
+                    logger.info(f"✅ [{name}] 15분봉 3-5 WMA 데드크로스 시장가 매도 주문 전송 (주문번호: {order_no})")
                     # SQLite DB에 매도 손익 정산 기록
                     if self.db_logger:
                         sell_p = current_price if current_price > 0 else buy_price
                         self.db_logger.log_sell(
                             code=code, sell_price=sell_p,
-                            sell_qty=qty_sell, sell_reason=sell_reason
+                            sell_qty=qty_sell, sell_reason=signals.get('reason', '15분봉 3-5 WMA 데드크로스 매도')
                         )
                 else:
                     logger.warning(f"⚠️ [{name}] 매도 주문 전송 실패! 다음 사이클에서 재시도합니다.")
-                continue
-
-            # ── 3. 신규 매수 보호 유예 (매수 후 30분 동안 15분봉 데드크로스 매도 유예) ──
-            # (단, -2% 절대 손절은 상단 1단계에서 실시간 감시 완료)
-            buy_t = getattr(state, 'buy_time', 0.0)
-            if buy_t > 0 and (now - buy_t < 1800):
-                continue
-
-            # ── 4. 15분봉 TR 스로틀링 (API 과부하 방지: 60초 제한) ──
-            last_fetch = self.last_15m_fetch_time.get(code, 0)
-            if now - last_fetch < 60:
-                continue
-
-            # 15분봉 데이터 조회
-            async with self.api_lock:
-                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
-                self.last_15m_fetch_time[code] = time.time()
-                await asyncio.sleep(0.25)
-
-            if df_15m is None or df_15m.empty or len(df_15m) < 45:
-                continue
-
-            signals = analyze_sell_signals(
-                df_15m, buy_price=buy_price, current_price=current_price,
-                touch_high=getattr(state, 'm_touch_high', 0.0)
-            )
-
-            # ── 5. 정배열 최고 정점 저항선 (M선) 돌파 여부 확인 (15분봉 근접 시 1분봉 정밀 판별) ──
-            # 수식: a=avg(c,5); b=avg(c,20); d=avg(c,60); K=valuewhen(1,a>b&&b>d&&a>d,C); M=valuewhen(1,K(2)<K(1)&&K(1)>K,K(1))
-            m_resistance = calc_m_resistance_price(df_15m)
-            state.m_resistance_line = m_resistance
-
-            # 계좌가 수익 중이고 15분봉 M선에 근접(99.0% 이상) 또는 진입 이력이 있을 때만 1분봉 정밀 돌파 로직 가동!
-            if m_resistance > 0 and calc_return > 0:
-                cur_touch = max(getattr(state, 'm_touch_high', 0.0), current_price)
-                is_near_m = (current_price >= m_resistance * 0.990) or (cur_touch >= m_resistance * 0.990)
-
-                if is_near_m:
-                    # 15분봉 M선 근접 감지 -> 1분봉 캔들 정밀 조회
-                    async with self.api_lock:
-                        df_1m = await asyncio.to_thread(self.client.get_1m_candles, code)
-                        await asyncio.sleep(0.08)
-
-                    m1_res = evaluate_1m_m_breakout(
-                        df_1m=df_1m,
-                        m_resistance=m_resistance,
-                        buy_price=buy_price,
-                        current_price=current_price,
-                        touch_high=cur_touch
-                    )
-                    state.m_touch_high = m1_res.get('touch_high', cur_touch)
-
-                    if m1_res.get('sell'):
-                        reject_reason = m1_res.get('reason', '1분봉 M선 돌파 실패 및 꺾임')
-                        logger.info(f"🔴 [{name}] {reject_reason} -> 전량 매도하여 수익 100% 확정 후 다음 종목 탐색!")
-                        async with self.api_lock:
-                            order_no = await asyncio.to_thread(
-                                self.client.place_sell_order, code, qty_sell,
-                                price=current_price if current_price > 0 else buy_price, order_type="03"
-                            )
-                        if order_no:
-                            self.tracked_orders[order_no] = {
-                                'code': code, 'qty': qty_sell,
-                                'time': time.time(), 'order_type': 'sell'
-                            }
-                            state.sold_once = True
-                            state.is_holding = False
-                            state.trade_ended = True
-                            if self.db_logger:
-                                sell_p = current_price if current_price > 0 else buy_price
-                                self.db_logger.log_sell(
-                                    code=code, sell_price=sell_p,
-                                    sell_qty=qty_sell, sell_reason=f"1분봉 M선 돌파 실패 전량 매도 ({reject_reason})"
-                                )
-                        continue
-                    else:
-                        logger.debug(f"ℹ️ [{name}] {m1_res.get('reason', '1분봉 M선 돌파 안착 관찰 중')}")
-
-            # ── 6. 일반 15분봉 지표 기반 매도 신호 (M선 돌파 실패 / 데드크로스 / 상한가 이탈) ──
-            if signals.get('sell'):
-                logger.info(f"🔴 [{name}] 차트 매도 신호! {signals['reason']}")
-                async with self.api_lock:
-                    order_no = await asyncio.to_thread(
-                        self.client.place_sell_order, code, qty_sell,
-                        price=current_price if current_price > 0 else buy_price, order_type="03"
-                    )
-                if order_no:
-                    self.tracked_orders[order_no] = {
-                        'code': code, 'qty': qty_sell,
-                        'time': time.time(), 'order_type': 'sell'
-                    }
-                    state.sold_once = True
-                    state.is_holding = False
-                    state.trade_ended = True
-                    logger.info(f"✅ [{name}] 차트 기반 시장가 매도 주문 전송 (주문번호: {order_no})")
-                    # SQLite DB에 매도 손익 정산 기록
-                    if self.db_logger:
-                        sell_p = current_price if current_price > 0 else buy_price
-                        self.db_logger.log_sell(
-                            code=code, sell_price=sell_p,
-                            sell_qty=qty_sell, sell_reason=signals.get('reason', '차트 매도')
-                        )
-                else:
-                    logger.warning(f"⚠️ [{name}] 차트 기반 매도 주문 전송 실패! 다음 사이클에서 재시도합니다.")
+            else:
+                logger.debug(f"ℹ️ [{name}] 15분봉 3-5 WMA 정배열/상승 탄력 유지 중 (WMA3: {signals.get('wma3', 0):,.0f} >= WMA5: {signals.get('wma5', 0):,.0f}, 홀딩)")
 
 
 # ═══════════════════════════════════════════════════════════════
 # TradingBot - 통합 메인 클래스
 # ═══════════════════════════════════════════════════════════════
 class TradingBot:
-    def __init__(self, condition_name="Traiding",
+    def __init__(self, condition_name="Traiding,traiding",
                  enable_buy=True, enable_sell=True,
                  buy_amount=5000000, max_positions=2):
         self.client = RealAPIAdapter()
@@ -654,6 +608,8 @@ class TradingBot:
         # ── SQLite 매매일지 로거 생성 ──
         self.db_logger = TradeDBLogger()
         self.cycle_count = 0
+        self.auto_scanned_date = None  # 당일 20:00 자동 스캔 완료 일자 (중복 실행 방지)
+        self.is_scanning = False
 
         # ── 매니저 생성 ──
         self.buy_manager = BuyManager(
@@ -695,11 +651,28 @@ class TradingBot:
     # ─────────────────────────────────────────────────
     # 상태 저장/로드
     # ─────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────
+    # 안전한 Atomic JSON 파일 저장 헬퍼
+    # ─────────────────────────────────────────────────
+    def _atomic_json_dump(self, filepath: str, data: dict, indent: int = 4):
+        """임시 파일 작성 후 원자적(Atomic) 덮어쓰기로 파일 깨짐 및 데이터 유실 방지"""
+        tmp_file = f"{filepath}.tmp"
+        try:
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=indent)
+            os.replace(tmp_file, filepath)
+        except Exception as e:
+            if os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except Exception:
+                    pass
+            raise e
+
     def save_watchlist(self):
         watch_file = os.path.join(os.path.dirname(__file__), "today_picks.json")
         try:
-            with open(watch_file, 'w', encoding='utf-8') as f:
-                json.dump(self.watchlist, f, ensure_ascii=False, indent=4)
+            self._atomic_json_dump(watch_file, self.watchlist, indent=4)
         except Exception as e:
             logger.error(f"관심종목 저장 실패: {e}")
 
@@ -732,10 +705,11 @@ class TradingBot:
         state_file = os.path.join(os.path.dirname(__file__), "trade_states.json")
         try:
             data = {code: state.to_dict() for code, state in self.trade_states.items()}
-            with open(state_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._atomic_json_dump(state_file, data, indent=2)
         except Exception as e:
             logger.error(f"상태 정보 저장 실패: {e}")
+        # watchlist(today_picks.json)도 함께 저장 (삭제된 종목 반영)
+        self.save_watchlist()
 
     # ─────────────────────────────────────────────────
     # 미체결 주문 관리
@@ -745,7 +719,7 @@ class TradingBot:
         current_time = time.time()
         for order_no, info in list(self.tracked_orders.items()):
             if current_time - info['time'] > 180:
-                logger.info(f"⏳ 3분 경과! 미체결 주문 자동 취소 진행 (종목: {info['code']})")
+                logger.info(f"⏳ 3분 경과! 미체결 주문 자동 취소 진행 (종목: {info['code']}, 주문번호: {order_no})")
                 async with self.api_lock:
                     await asyncio.to_thread(
                         self.client.cancel_order, order_no, info['code'], info['qty']
@@ -754,12 +728,13 @@ class TradingBot:
 
                 state = self.trade_states.get(info['code'])
                 if state:
-                    order_type = info.get('order_type', 'buy')
-                    if order_type == 'buy':
+                    order_type = str(info.get('order_type', 'buy'))
+                    if order_type.startswith('buy'):
                         # 매수 취소 → 다시 매수 가능 상태로 복귀
                         state.first_buy_candle_time = None
                         state.first_qty = 0
                         state.buy_step = 0
+                        state.is_holding = False
 
     # ─────────────────────────────────────────────────
     # 메인 사이클
@@ -771,29 +746,39 @@ class TradingBot:
         if self.enable_sell:
             tasks_str.append("매도")
 
-        # 1. 미체결 주문 관리
+        # 1. 미체결 주문 관리 (3분 경과 주문 자동 취소)
         await self.manage_unexecuted_orders()
 
         # 2. 계좌 상태 조회
         holdings = await asyncio.to_thread(self.client.get_account_holdings)
         unexecuted = await asyncio.to_thread(self.client.get_unexecuted_orders)
 
-        # 3. 체결된 주문을 tracked_orders에서 제거 (5초 유예)
-        unexecuted_codes = [u.get('stock_code') for u in unexecuted]
-        current_time = time.time()
+        # 3. 체결 확인 및 tracked_orders 동기화 (잔고에 들어왔을 때만 체결로 확정)
         for order_no, info in list(self.tracked_orders.items()):
-            if info['code'] not in unexecuted_codes and (current_time - info['time'] > 5):
-                logger.info(
-                    f"✅ 주문 체결(또는 취소) 확인됨: 종목 {info['code']}, "
-                    f"주문번호 {order_no}"
-                )
-                del self.tracked_orders[order_no]
+            code = info['code']
+            order_type = str(info.get('order_type', 'buy'))
+            if order_type.startswith('buy'):
+                # 매수 주문: 실제 계좌 잔고(holdings)에 들어왔을 때 체결 확정
+                if code in holdings:
+                    logger.info(
+                        f"✅ 매수 주문 체결 확인됨: 종목 {code}, "
+                        f"주문번호 {order_no}"
+                    )
+                    del self.tracked_orders[order_no]
+            elif order_type.startswith('sell'):
+                # 매도 주문: 계좌 잔고(holdings)에서 사라졌을 때 체결 확정
+                if code not in holdings:
+                    logger.info(
+                        f"✅ 매도 주문 체결 확인됨: 종목 {code}, "
+                        f"주문번호 {order_no}"
+                    )
+                    del self.tracked_orders[order_no]
 
         # 4. 잔고에서 사라진 종목 처리 (매도 체결 완료)
         for code, state in list(self.trade_states.items()):
             if state.is_holding and code not in holdings:
                 is_sell_unexecuted = any(
-                    o['code'] == code and o.get('order_type') == 'sell'
+                    o['code'] == code and str(o.get('order_type', '')).startswith('sell')
                     for o in self.tracked_orders.values()
                 )
                 if not is_sell_unexecuted:
@@ -826,10 +811,6 @@ class TradingBot:
                     state.first_qty = sync_qty
                     state.buy_step = 1  # 재시작 후에는 매수 완료로 간주
                     state.added_on = True
-                    # 트레일링 스탑 기준점 복구: 수익 중이면 현재가, 손실 중이면 매입단가로 설정하여 불필요한 트레일링 조기발동 방지
-                    if state.trailing_high <= 0 and sync_buy_price > 0:
-                        state.trailing_high = max(sync_buy_price, sync_current_price) if sync_current_price > sync_buy_price else sync_buy_price
-                        logger.info(f"🔄 [{code}] trailing_high를 {state.trailing_high:,.0f}원으로 복구 (매입단가: {sync_buy_price:,.0f}원)")
 
         # 6. 매수 완료된 종목 관심종목에서 제외 (더 이상 매수 감시 안 함)
         for code in list(self.watchlist.keys()):
@@ -861,6 +842,25 @@ class TradingBot:
         is_active_session = (is_pre_session or is_regular_session or is_post_session)
 
         if not is_active_session:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+
+            # ── [오후 8시(20:00) 애프터마켓 마감 직후 익일 공략주 자동 스캔 & 장전] ──
+            if now_time >= nxt_post_close and self.auto_scanned_date != today_str and not self.is_scanning:
+                self.auto_scanned_date = today_str
+                self.is_scanning = True
+                logger.info("=" * 65)
+                logger.info(f"🌙 [20:00 애프터마켓 마감] 내일의 주도주/돌파 종목 자동 스캔을 시작합니다 ({today_str})...")
+                logger.info("=" * 65)
+                try:
+                    # 키움 거래대금/등락률 상위 + 테마주 + 4대수식/W자반등 정밀 스캔
+                    await asyncio.to_thread(run_scanner, max_picks=30)
+                    self.load_watchlist()
+                    logger.info(f"✨ [내일 관심종목 자동 장전 완료] 총 {len(self.watchlist)}개 종목이 today_picks.json에 저장되고 봇에 자동 로드되었습니다!")
+                except Exception as e:
+                    logger.error(f"❌ 20:00 자동 스캔 중 에러 발생: {e}")
+                finally:
+                    self.is_scanning = False
+
             if nxt_pre_close <= now_time < market_open:
                 wait_reason = "08:50~09:00 정규장 개장 준비 구간 (NXT 프리마켓 마감)"
             elif market_close < now_time < nxt_post_open:
@@ -868,7 +868,7 @@ class TradingBot:
             elif now_time < nxt_pre_open:
                 wait_reason = "08:00 NXT 프리마켓 개장 대기"
             else:
-                wait_reason = "20:00 당일 전체 매매 세션(애프터마켓 포함) 마감"
+                wait_reason = "20:00 당일 전체 매매 세션(애프터마켓 포함) 마감 (익일 공략주 자동 장전 완료)"
             logger.info(
                 f"⏳ [{wait_reason}] 현재 {now_time.strftime('%H:%M:%S')}. "
                 f"(매매 세션: NXT 프리 08:00~08:50 / KRX 정규 09:00~15:30 / NXT 애프터 15:40~20:00) 잔고 동기화만 유지합니다."
@@ -890,7 +890,7 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"❌ BuyManager 에러: {e}")
 
-        # 사이클 종료 후 상태 저장 (이때 save_watchlist도 함께 호출됨)
+        # 사이클 종료 후 상태 및 관심종목 저장 (save_states → save_watchlist 자동 호출)
         self.save_states()
 
         # 10사이클(약 100초)마다 일일 손익/승률 통계 요약 출력
@@ -913,7 +913,7 @@ class TradingBot:
         logger.info(f" 전략: [1순위] 15분봉 20억 수급 + 3일선 U턴 변곡 스나이퍼 매수 (Combo 3+4)")
         logger.info(f"       [2순위] 30분봉 260이평 W자 반등 종목 우선 매수")
         logger.info(f"       [3순위] 15분봉 3-20 골든크로스 / 3-5 더블 변곡 매수")
-        logger.info(f"       [매도] M선 돌파 실패 전량 매도 / 매수가 대비 -2% 절대 손절매")
+        logger.info(f"       [매도] 15분봉 WMA 3-5 데드크로스 발생 시 전량 시장가(03) 매도")
         logger.info(f" 매매 모드: 🎯 [최대 {self.buy_manager.max_positions if self.buy_manager else 2}종목 분산 모드] (종목당: {self.buy_manager.buy_amount if self.buy_manager else 5000000:,.0f}원 | 총 한도: {(self.buy_manager.buy_amount * self.buy_manager.max_positions) if self.buy_manager else 10000000:,.0f}원)")
         logger.info(f" 오버나잇: 허용 | 시간 제한: 없음")
         logger.info("=" * 60)
@@ -951,8 +951,8 @@ async def main():
         help="활성화할 임무 선택 (기본: all)"
     )
     parser.add_argument(
-        '--condition', type=str, default='Traiding',
-        help="키움증권 조건검색식 이름 (기본: Traiding)"
+        '--condition', type=str, default='Traiding,traiding',
+        help="키움증권 조건검색식 이름 (쉼표로 복수 지정 가능, 기본: Traiding,traiding)"
     )
     parser.add_argument(
         '--amount', type=int, default=5000000,

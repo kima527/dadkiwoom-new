@@ -37,6 +37,8 @@ class Formula4Params:
     body_tail_ratio: float = 1.2          # 캔들 몸통 / 윗꼬리 비율 (기본 1.2배 이상)
     supply_surge_multiplier: float = 3.0  # 직전 2개봉 평균 수급 대비 폭증 배수 (기본 3.0배)
     supply_ma20_multiplier: float = 5.0   # 20봉 평균 수급 대비 폭증 배수 (5배: A >= AvgA * 5)
+    max_bar_gain_pct: float = 7.5         # 단일 15분봉 종가 상승률 상한선 (7.5% 초과 과열 급등봉 추격 금지)
+    max_spread_pct: float = 8.0           # 단일 15분봉 (고가-저가) 변동 편차 상한선 (8.0% 초과 롤러코스터 휩소봉 배제)
     sma_fast: int = 1                     # 단기 이평 (1 = 종가)
     sma_mid: int = 20                     # 중기 이평 (20)
     sma_long: int = 60                    # 장기 이평 (60)
@@ -142,7 +144,15 @@ def analyze_15m_4formulas(
     prev_2_supply_avg = prev_2_supply_avg.replace(0, np.nan).fillna(df['supply'].rolling(5).mean())
     cond_supply_surge = df['supply'] >= (prev_2_supply_avg * params.supply_surge_multiplier)
 
-    df['cond_1_supply_candle'] = cond_supply_20 & cond_supply_5x_ma20 & cond_bull & cond_strong_body & cond_supply_surge
+    # 6. 단일 15분봉 내 과열/8% 급등락 롤러코스터 방어 필터
+    candle_gain_pct = (df['close'] - df['open']) / df['open'] * 100.0
+    candle_spread_pct = (df['high'] - df['low']) / df['open'] * 100.0
+    cond_not_overheated = (candle_gain_pct <= params.max_bar_gain_pct) & (candle_spread_pct <= params.max_spread_pct)
+
+    df['cond_1_supply_candle'] = (
+        cond_supply_20 & cond_supply_5x_ma20 & cond_bull & 
+        cond_strong_body & cond_supply_surge & cond_not_overheated
+    )
 
     # ─────────────────────────────────────────────────────────────
     # [수식 2] M선, 황룡선, M1선, 룡선 계산

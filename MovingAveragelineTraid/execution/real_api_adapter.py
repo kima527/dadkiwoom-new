@@ -306,8 +306,17 @@ class RealAPIAdapter:
         """실전 미체결 주문 목록 조회"""
         try:
             unfilled = self.real_client.get_unfilled_orders()
-            # 봇은 [{'stock_code': code}] 형태를 기대하므로 맞춰줌
-            return [{'stock_code': u.get('code')} for u in unfilled]
+            res = []
+            for u in unfilled:
+                code = str(u.get('code', '')).replace('_AL', '').replace('_NX', '').lstrip('A').strip()
+                if code:
+                    res.append({
+                        'stock_code': code,
+                        'order_no': u.get('order_no', ''),
+                        'side': u.get('side', ''),
+                        'unfilled_qty': u.get('unfilled_qty', 0)
+                    })
+            return res
         except Exception as e:
             logger.error(f"미체결 주문 목록 조회 에러: {e}")
             return []

@@ -42,6 +42,8 @@ if real_trading_dir not in sys.path:
 
 from real_api_adapter import RealAPIAdapter
 from strategy_buy import analyze_buy_signals, calculate_hh, calculate_realtime_day_smas, detect_w_rebound_30m, wma
+from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
+from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from theme_manager import ThemeManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -128,10 +130,12 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
 def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> dict:
     """개별 종목의 30분봉 / 일봉 차트를 조회하여 4대 전략 근접도 평가"""
     try:
+        df_15m = client.get_15m_candles(code)
+        time.sleep(0.04)
         df_30m = client.get_30m_candles(code)
-        time.sleep(0.05)
+        time.sleep(0.04)
         daily_df = client.get_daily_candles(code)
-        time.sleep(0.05)
+        time.sleep(0.04)
 
         if df_30m is None or df_30m.empty or len(df_30m) < 30:
             return None
@@ -154,6 +158,17 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
         curr_close = float(df_30m['close'].iloc[-1])
         if curr_close <= 0:
             return None
+
+        # ── 0. 15분봉 4대 수식 올인원 완성 검출 ──
+        eval_f4 = evaluate_4formula_buy(code, name, df_15m, current_price=curr_close) if (df_15m is not None and len(df_15m) >= 60) else {"should_buy": False, "details": {}}
+        is_f4_complete = eval_f4.get("should_buy", False)
+        f4_details = eval_f4.get("details", {})
+        f4_m_line = f4_details.get("M선_저항가", 0.0)
+        diff_f4_m = ((curr_close - f4_m_line) / f4_m_line * 100) if f4_m_line > 0 else 999.0
+
+        # ── 0-1. 15분봉 20억 수급 및 3일선 U턴 변곡 검출 ──
+        eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, current_price=curr_close) if (df_15m is not None and not df_15m.empty) else {"should_buy": False}
+        is_15m_turnaround = eval_15m.get("should_buy", False)
 
         # ── 1. 30분봉 260이평 W자 반등 검출 ──
         is_w, w_info = detect_w_rebound_30m(df_30m)
@@ -187,13 +202,29 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
         sma3_is_rising = day_sma3 >= day_sma3_prev
 
         # ── 종합 신호 분석 (현재 시점 바로 매수 타점인지 확인) ──
-        live_signals = analyze_buy_signals(df_30m, None, daily_df)
+        live_signals = analyze_buy_signals(df_30m, None, daily_df, df_15m=df_15m)
         is_live_buy = live_signals.get('buy', False)
 
         # ── 근접 조건 점수(Score) 산출 ──
         score = 0.0
         tags = []
         notes = []
+
+        # [15분봉 4대 수식 올인원]
+        if is_f4_complete:
+            score += 150.0
+            tags.append("🎯 [15분봉 4대수식 완성]")
+            notes.append(eval_f4.get('reason', '15분봉 4대수식 완성'))
+        elif f4_details.get('수식1_수급_캔들완성') and f4_details.get('수식3_1_20_60_첫정배열') and (-2.0 <= diff_f4_m <= 0.8):
+            score += 85.0
+            tags.append("⚡ [15분봉 4대수식 돌파 임박]")
+            notes.append(f"15분봉 M선({f4_m_line:,.0f}원) 대비 {diff_f4_m:+.2f}% 사정권")
+
+        # [15분봉 20억 수급 변곡]
+        if is_15m_turnaround:
+            score += 120.0
+            tags.append("🚀 [15분봉 20억 수급변곡 완성]")
+            notes.append(eval_15m.get('reason', '15분봉 20억 수급변곡'))
 
         # [W자 반등]
         if is_w:

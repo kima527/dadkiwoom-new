@@ -17,6 +17,7 @@ strategy_buy.py - 30분봉 260이평 W자 반등 우선 적용 및 일봉/30분�
 import pandas as pd
 import numpy as np
 import logging
+from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 
 logger = logging.getLogger(__name__)
 
@@ -295,9 +296,10 @@ def check_smallcap_supply_signal(df: pd.DataFrame) -> tuple[bool, dict]:
 # ═══════════════════════════════════════════════════════════════
 # 매수 신호 종합 분석 함수
 # ═══════════════════════════════════════════════════════════════
-def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: pd.DataFrame = None) -> dict:
+def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame = None, daily_df: pd.DataFrame = None, df_15m: pd.DataFrame = None) -> dict:
     """
-    일봉 및 30분봉 조건을 모두 검사하여 최우선 순위를 고려해 매수 신호 반환
+    일봉 및 30분봉, 15분봉 조건을 모두 검사하여 최우선 순위를 고려해 매수 신호 반환
+    - [15분봉 4대 수식] 수급 20억 + 황룡선/M선 + 1-20-60 첫 정배열 + M선 상향 돌파 (최우선)
     - [중소형주 수급] 20봉 평균 5배 + 양봉 몸통>윗꼬리*1.2 + 직전2봉 3배 폭증
     - [최우선] 30분봉 260이평 W자 반등(1차상승 ➔ 하락눌림 ➔ 260이평 재돌파)
     - [원칙 1] 일봉: 당일 단순 20이평선(SMA20) 상향 돌파
@@ -312,9 +314,11 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
         "remove_watchlist": False,
         "is_w_rebound": False,
         "is_supply_surge": False,
+        "is_4formula_buy": False,
         "priority_score": 0.0,
         "w_info": {},
-        "supply_info": {}
+        "supply_info": {},
+        "formula4_info": {}
     }
 
     if df_30m is None or df_30m.empty or len(df_30m) < 20:
@@ -327,6 +331,18 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
         
     current_price = float(df30.iloc[-1]['close'])
     result['close'] = current_price
+
+    # 0. 15분봉 4대 수식 올인원 돌파 신호 검출
+    is_f4_sig = False
+    f4_info = {}
+    if df_15m is not None and not df_15m.empty and len(df_15m) >= 60:
+        f4_res = evaluate_4formula_buy(code="", name="", df_15m=df_15m, current_price=current_price)
+        if f4_res.get("should_buy"):
+            is_f4_sig = True
+            f4_info = f4_res
+            result['is_4formula_buy'] = True
+            result['formula4_info'] = f4_info
+            result['priority_score'] = max(result['priority_score'], 200.0)
 
     # 1. 중소형주 분봉 수급 폭발 신호 검출
     is_supply_sig, supply_info = check_smallcap_supply_signal(df30)
@@ -473,23 +489,29 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame, daily_df: p
                     )
 
     # ─────────────────────────────────────────────────
-    # 매수 신호 판정: 수급 폭발 또는 3대 핵심 원칙 (독립적 OR 조건 결합)
+    # 매수 신호 판정: 15분봉 4대 수식, 수급 폭발 또는 3대 핵심 원칙 (독립적 OR 조건 결합)
     # ─────────────────────────────────────────────────
-    if is_supply_sig or cond1_daily_sma20 or cond2_30m_sma260 or cond3_day_sma_cross:
+    if is_f4_sig or is_supply_sig or cond1_daily_sma20 or cond2_30m_sma260 or cond3_day_sma_cross:
         result['buy'] = True
         
         reasons = []
+        if is_f4_sig:
+            reasons.append(f4_info.get('reason', '🎯 [15분봉 4대 수식 완성] 15분봉 수급폭증 + 1-20-60 첫정배열 + M선 골든크로스'))
+            result['target_price'] = current_price
+            result['ll'] = current_price
+            result['priority_score'] = max(result['priority_score'], 200.0)
+
         if is_supply_sig:
             reasons.append(
                 f"🚀 [중소형주 수급 폭발봉] 거래대금 {supply_info['supply_억']:.1f}억 (20이평 대비 {supply_info['surge_ratio_ma20']:.1f}배, 직전2봉 대비 {supply_info['surge_ratio_prev2']:.1f}배) + 탄탄한 양봉"
             )
-            result['target_price'] = current_price
-            result['ll'] = current_price
+            result['target_price'] = current_price if result.get('target_price', 0) == 0 else result['target_price']
+            result['ll'] = current_price if result['ll'] == 0 else result['ll']
 
         if cond2_30m_sma260:
             reasons.append(m30_reason)
-            result['ll'] = m30_sma260_val
-            result['target_price'] = m30_sma260_val
+            result['ll'] = m30_sma260_val if result['ll'] == 0 else result['ll']
+            result['target_price'] = m30_sma260_val if result.get('target_price', 0) == 0 else result['target_price']
             base_score = 100.0 + min(w_info.get('rebound_pct', 0.0), 20.0) if is_w_rebound else 85.0
             result['priority_score'] = max(result['priority_score'], base_score)
 

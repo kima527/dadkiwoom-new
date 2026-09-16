@@ -34,6 +34,8 @@ class Turnaround15mParams:
     body_to_upper_tail_ratio: float = 1.2 # 양봉 몸통 > 윗꼬리 * 1.2
     supply_surge_multiplier: float = 3.0  # 직전 2개봉 평균 대비 수급 폭증 배수 (3배)
     supply_ma20_multiplier: float = 5.0   # 20봉 평균 수급 대비 폭증 배수 (5배: A >= AvgA * 5)
+    max_bar_gain_pct: float = 7.5         # 단일 15분봉 종가 상승률 상한선 (7.5% 초과 과열 급등봉 추격 금지)
+    max_spread_pct: float = 8.0           # 단일 15분봉 (고가-저가) 변동 편차 상한선 (8.0% 초과 롤러코스터 휩소봉 배제)
 
     # [수식 1, 3: 이평 기간]
     sma_fast_m15: int = 3                # 분봉 단기 이평
@@ -249,11 +251,17 @@ def calc_formula_4_supply(
     prev_2_avg_15m = prev_2_avg_15m.replace(0, np.nan).fillna(df['m15_money'].rolling(5).mean())
     df['is_15m_supply_surge'] = df['m15_money'] >= (prev_2_avg_15m * params.supply_surge_multiplier)
 
-    # 중소형주 분봉 수급 공식 4조건 동시 만족
+    # 5) 단일 15분봉 내 과열/8% 급등락 롤러코스터 방어 필터
+    candle_gain_pct = (df['close'] - df['open']) / df['open'] * 100.0
+    candle_spread_pct = (df['high'] - df['low']) / df['open'] * 100.0
+    df['is_15m_not_overheated'] = (candle_gain_pct <= params.max_bar_gain_pct) & (candle_spread_pct <= params.max_spread_pct)
+
+    # 중소형주 분봉 수급 공식 5조건 동시 만족
     df['is_smallcap_supply_candle'] = (
         df['is_m15_money_5x_ma20'] &
         df['is_15m_strong_body'] &
-        df['is_15m_supply_surge']
+        df['is_15m_supply_surge'] &
+        df['is_15m_not_overheated']
     )
 
     # 당일 누적 일봉 거래대금 계산

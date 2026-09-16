@@ -16,16 +16,23 @@ os.environ["KIWOOM_USE_SANDBOX"] = "false"
 SOCKET_URL = 'wss://api.kiwoom.com:10000/api/dostk/websocket'
 
 class KiwoomWebSocketClient:
-    def __init__(self, target_condition_name: str, on_insert: Callable, on_delete: Callable, on_real_tick: Callable = None):
+    def __init__(self, target_condition_name: str | list, on_insert: Callable, on_delete: Callable, on_real_tick: Callable = None):
         self.uri = SOCKET_URL
         self.websocket = None
         self.connected = False
         self.keep_running = True
         self.token_manager = TokenManager()
         
-        self.target_condition_name = target_condition_name
-        self.target_condition_sn = None
-        self.target_condition_index = None
+        # 다중 조건검색식 지원 (쉼표 구분 문자열 또는 리스트 처리)
+        if isinstance(target_condition_name, str):
+            self.target_condition_names = [n.strip() for n in target_condition_name.split(',') if n.strip()]
+        elif isinstance(target_condition_name, list):
+            self.target_condition_names = [str(n).strip() for n in target_condition_name if str(n).strip()]
+        else:
+            self.target_condition_names = [str(target_condition_name).strip()]
+
+        self.target_condition_map = {}      # {cond_sn: cond_name}
+        self.target_condition_indices = set() # {cond_sn_str, ...}
         
         self.on_insert = on_insert
         self.on_delete = on_delete
@@ -106,30 +113,37 @@ class KiwoomWebSocketClient:
                     cond_list = response.get('data', [])
                     logger.info(f"조건검색식 목록 수신: {len(cond_list)}개")
                     
-                    found = False
+                    self.target_condition_map.clear()
+                    self.target_condition_indices.clear()
+                    
+                    # 대소문자 무시 매칭을 위한 타겟 목록
+                    targets_lower = {t.lower(): t for t in self.target_condition_names}
+
                     for cond in cond_list:
                         if len(cond) >= 2:
-                            cond_sn = cond[0]
+                            cond_sn = str(cond[0])
                             cond_name = cond[1].strip()
-                            if cond_name == self.target_condition_name:
-                                self.target_condition_sn = cond_sn
-                                self.target_condition_index = cond_sn
-                                found = True
-                                logger.info(f"목표 조건식 '{self.target_condition_name}' 발견! (일련번호: {cond_sn})")
-                                break
                             
-                    if found:
-                        # 실시간 조건검색 등록 요청 (CNSRREQ)
-                        req = {
-                            "trnm": "CNSRREQ",
-                            "seq": str(self.target_condition_sn),
-                            "search_type": "1",
-                            "stex_tp": "K"
-                        }
-                        logger.info(f"실시간 조건검색 등록 시도: CNSRREQ with seq={self.target_condition_sn}")
-                        asyncio.create_task(self.send_message(req))
+                            # 정확 매칭 또는 대소문자 무시 매칭
+                            if cond_name.lower() in targets_lower or cond_name in self.target_condition_names:
+                                self.target_condition_map[cond_sn] = cond_name
+                                self.target_condition_indices.add(cond_sn)
+                                logger.info(f"🎯 목표 조건식 '{cond_name}' 발견! (일련번호: {cond_sn})")
+                                
+                                # 각 조건식마다 실시간 조건검색 등록 요청 (CNSRREQ) 전송
+                                req = {
+                                    "trnm": "CNSRREQ",
+                                    "seq": str(cond_sn),
+                                    "search_type": "1",
+                                    "stex_tp": "K"
+                                }
+                                logger.info(f"실시간 조건검색 등록 시도: CNSRREQ with seq={cond_sn} ({cond_name})")
+                                asyncio.create_task(self.send_message(req))
+                            
+                    if self.target_condition_map:
+                        logger.info(f"✅ 총 {len(self.target_condition_map)}개 목표 조건식 등록 완료: {list(self.target_condition_map.values())}")
                     else:
-                        logger.error(f"조건식 목록에서 '{self.target_condition_name}'을(를) 찾을 수 없습니다!")
+                        logger.error(f"조건식 목록에서 목표 조건식({self.target_condition_names})을 찾을 수 없습니다!")
                 
                 elif trnm == 'CNSRREQ':
                     # 초기 조건검색 포착 종목 리스트
@@ -154,16 +168,17 @@ class KiwoomWebSocketClient:
                         if name == '조건검색':
                             code = values.get('9001', '').replace('A', '')
                             evt_tp = values.get('843', '') # I: 편입, D: 이탈
-                            cond_idx = values.get('841', '')
+                            cond_idx = str(values.get('841', ''))
                             
-                            if str(cond_idx) == str(self.target_condition_index):
-                                logger.info(f"조건검색 실시간 신호: 종목코드={code}, 타입={evt_tp}")
+                            if cond_idx in self.target_condition_indices:
+                                cond_name = self.target_condition_map.get(cond_idx, f"seq:{cond_idx}")
+                                logger.info(f"🔔 [{cond_name}] 실시간 조건검색 신호: 종목코드={code}, 이벤트={evt_tp}")
                                 if evt_tp == 'I':
                                     if asyncio.iscoroutinefunction(self.on_insert):
                                         asyncio.create_task(self.on_insert(code))
                                     else:
                                         self.on_insert(code)
-                                    # 실시간 체결 콜백이 등록되어 있을 때만 체결 데이터 구독 (불필요한 웹소켓 과부하 원천 방지)
+                                    # 실시간 체결 콜백이 등록되어 있을 때만 체결 데이터 구독
                                     if self.on_real_tick:
                                         asyncio.create_task(self.subscribe_real_tick(code))
                                         
