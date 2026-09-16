@@ -35,6 +35,7 @@ from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 from db_logger import TradeDBLogger
 from scan_tomorrow_picks import run_scanner
+from theme_manager import ThemeManager
 from datetime import datetime, time as dtime
 
 # ═══════════════════════════════════════════════════════════════
@@ -84,7 +85,8 @@ logger = logging.getLogger(__name__)
 class MarketIndexGuard:
     """
     KODEX 200(069500) 및 KODEX 코스닥150(229200)의 15분봉 및 당일 등락률을 모니터링하여,
-    지수 급락(-1.5% 이하) 또는 폭락 시 신규 매수를 일시 중단(Pause)하는 안전장치.
+    지수 마지노선 이탈(코스피 시가 대비 -0.5% 이하, 코스닥 시가 대비 -0.8% 이하) 발생 시
+    신규 매수를 선제적으로 일시 중단(Pause)하는 안전장치.
     """
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock):
         self.client = client
@@ -121,9 +123,9 @@ class MarketIndexGuard:
                     open_p = float(df_today.iloc[0]['open'])
                     curr_p = float(df_today.iloc[-1]['close'])
                     kospi_chg = ((curr_p - open_p) / open_p) * 100
-                    if kospi_chg <= -2.5:
+                    if kospi_chg <= -0.5:
                         kospi_safe = False
-                        warning_reasons.append(f"코스피 급락({kospi_chg:+.2f}%)")
+                        warning_reasons.append(f"코스피 마지노선 이탈({kospi_chg:+.2f}% <= -0.5%)")
 
             if df_kosdaq is not None and not df_kosdaq.empty and len(df_kosdaq) >= 20:
                 last_dt = df_kosdaq.index[-1]
@@ -134,9 +136,9 @@ class MarketIndexGuard:
                     open_p = float(df_today.iloc[0]['open'])
                     curr_p = float(df_today.iloc[-1]['close'])
                     kosdaq_chg = ((curr_p - open_p) / open_p) * 100
-                    if kosdaq_chg <= -3.0:
+                    if kosdaq_chg <= -0.8:
                         kosdaq_safe = False
-                        warning_reasons.append(f"코스닥 급락({kosdaq_chg:+.2f}%)")
+                        warning_reasons.append(f"코스닥 마지노선 이탈({kosdaq_chg:+.2f}% <= -0.8%)")
 
             is_safe = kospi_safe and kosdaq_safe
             reason = "정상 (매수 허용)" if is_safe else ", ".join(warning_reasons) + " 발생 (매수 보류)"
@@ -301,11 +303,18 @@ class BuyManager:
                     del self.watchlist[code]
                 continue
 
+            # 당일 최근 일봉 기준 수급(거래대금) 보너스 산출 (100억원당 +10점, 최대 +50점)
+            latest_trade_val = (daily_df.iloc[-1]['close'] * daily_df.iloc[-1]['volume']) if (daily_df is not None and not daily_df.empty) else 0.0
+            supply_money_100m = latest_trade_val / 100_000_000.0  # 억원 단위
+            supply_bonus = min(supply_money_100m / 10.0, 50.0)    # 500억 이상이면 +50점 상한
+
             # 15분봉 4대 수식 올인원 신호 최우선 채택
             if eval_f4.get('should_buy'):
                 buy_price = eval_f4['price']
                 if buy_price > self.buy_amount:
                     continue
+                base_score = 300.0
+                final_score = (base_score + supply_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
@@ -322,13 +331,18 @@ class BuyManager:
                     'is_15m_4formula': True,
                     'is_15m_turnaround': False,
                     'is_w_rebound': False,
-                    'priority_score': 300.0  # 15분봉 4대 수식 완벽 완성 최고 가산점
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'final_score': final_score,
+                    'priority_score': final_score
                 })
             # 15분봉 수급 변곡 신호 채택
             elif eval_15m.get('should_buy'):
                 buy_price = eval_15m['limit_price']
                 if buy_price > self.buy_amount:
                     continue
+                base_score = eval_15m['priority_score'] + 100.0
+                final_score = (base_score + supply_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
@@ -345,12 +359,17 @@ class BuyManager:
                     'is_15m_4formula': False,
                     'is_15m_turnaround': True,
                     'is_w_rebound': False,
-                    'priority_score': eval_15m['priority_score'] + 100.0  # 15분봉 스나이핑 최우선 가산점
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'final_score': final_score,
+                    'priority_score': final_score
                 })
             elif signals_30m.get('buy'):
                 buy_price = signals_30m['close']
                 if buy_price > self.buy_amount:
                     continue
+                base_score = signals_30m.get('priority_score', 0.0)
+                final_score = (base_score + supply_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
@@ -361,20 +380,22 @@ class BuyManager:
                     'is_15m_4formula': signals_30m.get('is_4formula_buy', False),
                     'is_15m_turnaround': False,
                     'is_w_rebound': signals_30m.get('is_w_rebound', False),
-                    'priority_score': signals_30m.get('priority_score', 0.0)
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'final_score': final_score,
+                    'priority_score': final_score
                 })
 
         if not buy_candidates:
             return
 
-        # ── 최우선 정렬 (15분봉 4대수식 -> 15분봉 수급변곡 -> 30분봉 W자 반등 -> 우선순위 점수 -> 테마 가중치) ──
+        # ── 최우선 정렬 (통합 가중 점수: 전략 Base + 거래대금 수급 가산점 * 테마 가중치) ──
         buy_candidates.sort(
             key=lambda x: (
                 1 if x.get('is_15m_4formula') else 0,
                 1 if x.get('is_15m_turnaround') else 0,
                 1 if x.get('is_w_rebound') else 0,
-                x['priority_score'],
-                x['weight']
+                x['final_score']
             ),
             reverse=True
         )
@@ -384,6 +405,11 @@ class BuyManager:
             if total_positions >= self.max_positions:
                 logger.info(f"⚠️ 매수 진행 중 최대 보유 종목 수({self.max_positions}개) 도달. 잔여 후보 매수 중단.")
                 break
+
+            logger.info(
+                f"🏆 [최종 매수 선정 {candidate['name']}] 최종점수: {candidate['final_score']:.1f}점 "
+                f"(기본: {candidate['base_score']:.1f}점 + 수급보너스: +{candidate['supply_bonus']:.1f}점, 테마배율: {candidate['weight']}x)"
+            )
 
             code = candidate['code']
             name = candidate['name']
@@ -611,6 +637,10 @@ class TradingBot:
         self.auto_scanned_date = None  # 당일 20:00 자동 스캔 완료 일자 (중복 실행 방지)
         self.is_scanning = False
 
+        # ── 실시간 테마 관리자 생성 ──
+        self.theme_manager = ThemeManager()
+        self.last_theme_refresh_time = 0
+
         # ── 매니저 생성 ──
         self.buy_manager = BuyManager(
             self.client, self.api_lock,
@@ -710,6 +740,35 @@ class TradingBot:
             logger.error(f"상태 정보 저장 실패: {e}")
         # watchlist(today_picks.json)도 함께 저장 (삭제된 종목 반영)
         self.save_watchlist()
+
+    # ─────────────────────────────────────────────────
+    # 장중 실시간 핫 테마 수집 및 가중치 동적 갱신
+    # ─────────────────────────────────────────────────
+    async def refresh_realtime_themes(self, force: bool = False):
+        """장중 실시간 핫 테마 수집 및 관심종목 가중치(Top1~3: 1.35x, Top4~10: 1.25x, Top11~30: 1.15x) 동적 갱신 (15분 주기)"""
+        now = time.time()
+        if not force and (now - self.last_theme_refresh_time < 900):  # 15분(900초) 주기
+            return
+
+        try:
+            logger.info("🔄 [장중 실시간 테마 갱신] 네이버증권 실시간 핫 테마 순위 재수집 중...")
+            await asyncio.to_thread(self.theme_manager.load_top_themes, 30)
+            self.last_theme_refresh_time = now
+
+            # 관심종목 리스트 내 종목 가중치 즉시 동적 반영
+            updated_count = 0
+            for code, info in self.watchlist.items():
+                if isinstance(info, dict):
+                    new_w = self.theme_manager.get_stock_weight(code)
+                    if info.get('weight') != new_w:
+                        info['weight'] = new_w
+                        updated_count += 1
+
+            logger.info(
+                f"✅ [실시간 테마 갱신 완료] 총 {len(self.watchlist)}개 관심종목 가중치 갱신 (가중치 변경: {updated_count}개 종목)"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ 실시간 테마 갱신 중 예외 발생: {e}")
 
     # ─────────────────────────────────────────────────
     # 미체결 주문 관리
@@ -886,6 +945,8 @@ class TradingBot:
         # [매수 봇] - 매도 처리 후 실행
         if self.buy_manager:
             try:
+                # 장중 실시간 핫 테마 수집 및 종목별 차등 가중치 동적 갱신 (15분 주기)
+                await self.refresh_realtime_themes()
                 await self.buy_manager.run(holdings, unexecuted)
             except Exception as e:
                 logger.error(f"❌ BuyManager 에러: {e}")

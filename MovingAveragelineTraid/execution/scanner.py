@@ -33,8 +33,8 @@ class ConditionScanner:
             name = self.client.get_stock_name(code)
             themes = tm.get_stock_themes(code) # 네이버 테마 리스트 확인
             
-            # Assign weights based on the classified theme (핫테마면 1.2배)
-            weight = 1.2 if themes else 1.0
+            # Assign weights based on Naver Theme rank (Top 1~3: 1.35x, Top 4~10: 1.25x, Top 11~30: 1.15x)
+            weight = tm.get_stock_weight(code)
             theme_str = ", ".join(themes) if themes else "개별이슈"
                 
             sub_watchlist[code] = {

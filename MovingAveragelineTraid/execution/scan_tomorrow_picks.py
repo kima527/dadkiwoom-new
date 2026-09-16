@@ -20,6 +20,7 @@ import logging
 from datetime import datetime
 import pandas as pd
 import numpy as np
+from theme_manager import ThemeManager
 
 # Windows 콘솔 인코딩 설정
 if sys.platform.startswith("win"):
@@ -127,8 +128,8 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
     return universe
 
 
-def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> dict:
-    """개별 종목의 30분봉 / 일봉 차트를 조회하여 4대 전략 근접도 평가"""
+def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter, tm: ThemeManager = None) -> dict:
+    """개별 종목의 30분봉 / 일봉 차트를 조회하여 4대 전략 근접도 및 테마 순위 가중치 평가"""
     try:
         df_15m = client.get_15m_candles(code)
         time.sleep(0.04)
@@ -273,10 +274,11 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter) -> di
         status_text = " | ".join(tags)
         note_text = " // ".join(notes)
 
+        theme_w = tm.get_stock_weight(code) if tm else (1.2 if is_w else 1.0)
         return {
             "code": code,
             "name": name,
-            "weight": 1.2 if is_w else 1.0,
+            "weight": theme_w,
             "status": status_text,
             "close": curr_close,
             "target_price": max(hh_val, daily_sma20, sma260_val),
@@ -301,6 +303,10 @@ def run_scanner(max_picks: int = 30):
     logger.info(f" 🚀 [내일의 주도주/돌파 임박 종목 자동 스캐너] 가동 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
     logger.info("=" * 65)
 
+    # 네이버증권 실시간 핫 테마 수집 (1~3위 1.35x, 4~10위 1.25x, 11~30위 1.15x)
+    tm = ThemeManager()
+    tm.load_top_themes(limit=30)
+
     client = RealAPIAdapter()
     universe = build_candidate_universe(client)
 
@@ -312,16 +318,16 @@ def run_scanner(max_picks: int = 30):
         if idx % 20 == 0 or idx == total:
             logger.info(f"⏳ 진행률: [{idx}/{total}] ({(idx/total)*100:.1f}%) | 발굴된 근접 후보: {len(results)}개")
 
-        eval_res = evaluate_stock_proximity(code, name, client)
+        eval_res = evaluate_stock_proximity(code, name, client, tm=tm)
         if eval_res:
             results.append(eval_res)
-            logger.info(f" ✨ 포착: [{name}({code})] {eval_res['status']} (점수: {eval_res['priority_score']}점)")
+            logger.info(f" ✨ 포착: [{name}({code})] {eval_res['status']} (점수: {eval_res['priority_score']}점, 테마배율: {eval_res['weight']}x)")
 
-    # 정렬: W자 반등 여부 -> 우선순위 점수 -> 현재가
+    # 정렬: W자 반등 여부 -> (우선순위 점수 * 테마 차등 가중치)
     results.sort(
         key=lambda x: (
             1 if x['is_w_rebound'] else 0,
-            x['priority_score']
+            x['priority_score'] * x['weight']
         ),
         reverse=True
     )
