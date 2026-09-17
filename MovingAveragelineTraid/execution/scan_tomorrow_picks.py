@@ -41,8 +41,11 @@ if current_dir not in sys.path:
 if real_trading_dir not in sys.path:
     sys.path.insert(0, real_trading_dir)
 
-from real_api_adapter import RealAPIAdapter
-from strategy_buy import analyze_buy_signals, calculate_hh, calculate_realtime_day_smas, detect_w_rebound_30m, wma
+from strategy_buy import (
+    analyze_buy_signals, calculate_hh, calculate_realtime_day_smas,
+    detect_w_rebound_30m, wma, evaluate_user_master_strategy,
+    calculate_daily_tema_line, check_recent_5bar_surge
+)
 from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from theme_manager import ThemeManager
@@ -61,12 +64,25 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
         "TIMEFOLIO", "WOORI", "히어로즈", "PLUS", "WON", "2X", "KRX", "합병", "RISE"
     ]
 
+    blacklist_path = os.path.join(current_dir, "blacklist.json")
+    blacklist_codes = set()
+    if os.path.exists(blacklist_path):
+        try:
+            with open(blacklist_path, 'r', encoding='utf-8') as f:
+                blacklist_codes = set(json.load(f))
+            logger.info(f"🚫 블랙리스트 매수금지 종목 {len(blacklist_codes)}개 로드 완료: {blacklist_codes}")
+        except Exception:
+            pass
+
     logger.info("🔍 1. 키움 API 거래대금 상위 150종목 수집 중...")
     try:
         raw_top = client.real_client.get_top_trading_value_stocks(limit=150)
         for code_raw in raw_top:
             try:
                 code = code_raw.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+                if code in blacklist_codes:
+                    logger.info(f"🚫 [{code}] 블랙리스트 등록 종목으로 스캔 유니버스에서 원천 제외")
+                    continue
                 if len(code) == 6 and code.isalnum():
                     name = client.get_stock_name(code) or ""
                     if not name or any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
@@ -118,7 +134,8 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
         "348370": "엔켐", "178320": "서진시스템", "047080": "한빛소프트",
         "052460": "아이크래프트", "213420": "덕산네오룩스", "108490": "로보티즈",
         "052300": "오션인더블유", "0039P0": "매드업", "080220": "제주반도체",
-        "153890": "져스텍", "002620": "제일파마홀딩스", "043360": "디지아이"
+        "153890": "져스텍", "002620": "제일파마홀딩스", "043360": "디지아이",
+        "043260": "성호전자", "330860": "네패스아크"
     }
     for c, n in core_stocks.items():
         if c not in universe:
@@ -160,14 +177,19 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter, tm: T
         if curr_close <= 0:
             return None
 
-        # ── 0. 15분봉 4대 수식 올인원 완성 검출 ──
+        # ── 0. 유저 지정 4대 수식 & 타점 평가 ──
+        is_naver_theme = tm.has_hot_theme(code) if tm else True
+        eval_master = evaluate_user_master_strategy(df_15m, df_30m, daily_df, is_naver_theme=is_naver_theme) if (df_15m is not None and daily_df is not None) else {"should_buy": False}
+        is_master_complete = eval_master.get("should_buy", False)
+
+        # ── 0-1. 15분봉 4대 수식 올인원 완성 검출 ──
         eval_f4 = evaluate_4formula_buy(code, name, df_15m, current_price=curr_close) if (df_15m is not None and len(df_15m) >= 60) else {"should_buy": False, "details": {}}
         is_f4_complete = eval_f4.get("should_buy", False)
         f4_details = eval_f4.get("details", {})
         f4_m_line = f4_details.get("M선_저항가", 0.0)
         diff_f4_m = ((curr_close - f4_m_line) / f4_m_line * 100) if f4_m_line > 0 else 999.0
 
-        # ── 0-1. 15분봉 20억 수급 및 3일선 U턴 변곡 검출 ──
+        # ── 0-2. 15분봉 20억 수급 및 3일선 U턴 변곡 검출 ──
         eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, current_price=curr_close) if (df_15m is not None and not df_15m.empty) else {"should_buy": False}
         is_15m_turnaround = eval_15m.get("should_buy", False)
 
@@ -189,8 +211,9 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter, tm: T
             daily_sma20 = float(daily_sma20_series.iloc[-1]) if not daily_sma20_series.dropna().empty else 0.0
             diff_daily_sma20 = ((curr_close - daily_sma20) / daily_sma20 * 100) if daily_sma20 > 0 else 999.0
 
-        # ── 3. 가중 5-20 고가선(HH) 돌파 검출 ──
-        hh_series = calculate_hh(df_30m)
+        # ── 3. 일봉 기반 가중 5-20 고가선(HH) 돌파 및 안착 검출 ──
+        hh_df_target = daily_df if (daily_df is not None and len(daily_df) >= 20) else df_30m
+        hh_series = calculate_hh(hh_df_target)
         hh_val = float(hh_series.dropna().iloc[-1]) if not hh_series.dropna().empty else curr_close
         diff_hh = ((curr_close - hh_val) / hh_val * 100) if hh_val > 0 else 0.0
 
@@ -202,14 +225,16 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter, tm: T
         diff_3_5 = ((day_sma3 - day_sma5) / day_sma5 * 100) if day_sma5 > 0 else 999.0
         sma3_is_rising = day_sma3 >= day_sma3_prev
 
-        # ── 종합 신호 분석 (현재 시점 바로 매수 타점인지 확인) ──
-        live_signals = analyze_buy_signals(df_30m, None, daily_df, df_15m=df_15m)
-        is_live_buy = live_signals.get('buy', False)
-
         # ── 근접 조건 점수(Score) 산출 ──
         score = 0.0
         tags = []
         notes = []
+
+        # [유저 정의 4대 수식 완벽 부합]
+        if is_master_complete:
+            score += 350.0
+            tags.append("🔥 [유저 4대수식 완벽 부합]")
+            notes.append(eval_master.get('reason', '유저 정의 수식 완벽 부합 타점'))
 
         # [15분봉 4대 수식 올인원]
         if is_f4_complete:
@@ -249,19 +274,30 @@ def evaluate_stock_proximity(code: str, name: str, client: RealAPIAdapter, tm: T
             tags.append("⚡ [3-5선 수렴 돌파 임박]")
             notes.append(f"3일선({day_sma3:,.0f}) 5일선({day_sma5:,.0f}) 초수렴 ({diff_3_5:+.2f}%)")
 
-        # [가중 고가선 HH 안착 및 돌파 사정권 (핵심 강화)]
-        if -0.8 <= diff_hh <= 0.6 and hh_val > 0:
-            score += 65.0  # 고가선에 바짝 안착한 종목 단독 합격권 부여!
-            tags.append("🎯 [5-20 고가선(HH) 완벽 안착]")
-            notes.append(f"가중고가선({hh_val:,.0f}원) 완벽안착({diff_hh:+.2f}%)")
-        elif -1.8 <= diff_hh <= 1.2 and hh_val > 0:
-            score += 50.0  # 고가선 사정권
+        # [가중 고가선 HH 수급 돌파 & 숨고르기 지지 안착 (핵심 강화)]
+        if -1.8 <= diff_hh <= 2.0 and hh_val > 0:
+            score += 100.0  # 일봉 HH선 돌파 후 숨고르기 지지 안착 종목 최우선 고득점 부여!
+            tags.append("🎯 [일봉 HH선 숨고르기 안착 / 2차 폭발 임박]")
+            notes.append(f"일봉 가중고가선({hh_val:,.0f}원) 완벽 안착({diff_hh:+.2f}%) ➔ 숨고르기 후 2차 급등 사정권")
+        elif -3.0 <= diff_hh <= 3.5 and hh_val > 0:
+            score += 65.0  # 고가선 사정권
             tags.append("🎯 [고가선(HH) 돌파 사정권]")
             notes.append(f"가중고가선({hh_val:,.0f}원) 대비 {diff_hh:+.2f}%")
 
         if is_live_buy:
             score += 50.0
             tags.insert(0, "🚀 [즉시 매수 타점]")
+
+        # ── [신용한도초과 감지 및 경고 태그 부여] ──
+        if hasattr(client, 'get_stock_credit_info'):
+            try:
+                credit_info = client.get_stock_credit_info(code)
+                if credit_info.get('is_limit_exceeded'):
+                    tags.append("⚠️ [신용한도초과]")
+                    notes.append(f"신용한도초과 (신용비율 {credit_info.get('crd_rt', 0):.1f}%)")
+                    score -= 30.0  # 신용 과열 종목 감점
+            except Exception:
+                pass
 
         # 필터: 유의미한 신호나 사정권(Score >= 50)에 든 종목만 반환
         if score < 50.0 and not is_live_buy:

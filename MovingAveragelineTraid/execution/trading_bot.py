@@ -29,7 +29,7 @@ import logging
 import argparse
 from real_api_adapter import RealAPIAdapter
 from utils import TradeState, get_tick_size, calculate_trade_intensity
-from strategy_buy import analyze_buy_signals
+from strategy_buy import analyze_buy_signals, evaluate_hh_rebound
 from strategy_sell import analyze_sell_signals
 from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
@@ -285,6 +285,25 @@ class BuyManager:
 
                 self._static_filter_cache[code] = (True, today_str)
 
+            # 블랙리스트(매수금지) 종목 선제 매수 차단
+            blacklist_path = os.path.join(os.path.dirname(__file__), "blacklist.json")
+            if os.path.exists(blacklist_path):
+                try:
+                    with open(blacklist_path, 'r', encoding='utf-8') as f:
+                        b_codes = set(json.load(f))
+                        if code in b_codes:
+                            logger.info(f"🚫 [{name}] 블랙리스트 등록 종목으로 매수 탐색을 원천 차단합니다.")
+                            if code in self.watchlist:
+                                del self.watchlist[code]
+                            continue
+                except Exception:
+                    pass
+
+            # 신용한도초과 종목 선제 매수 차단
+            if hasattr(self.client, 'is_credit_limit_exceeded') and self.client.is_credit_limit_exceeded(code):
+                logger.info(f"⏭️ [{name}] 신용한도초과 종목으로 매수 탐색을 선제 차단합니다.")
+                continue
+
             if daily_df is None or len(daily_df) < 5:
                 continue
 
@@ -294,7 +313,10 @@ class BuyManager:
             # ── 2. [1순위] 15분봉 수급 및 이평 변곡 전략 평가 ──
             eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, current_price=None, params=self.params_15m) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
-            # ── 3. [2순위] 30분봉/일봉 이평 돌파 전략 평가 ──
+            # ── 3. [1.5순위] HH선 수급 돌파 및 숨고르기 지지 안착 재반등 평가 ──
+            eval_hh = evaluate_hh_rebound(df_15m, daily_df) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
+
+            # ── 4. [2순위] 30분봉/일봉 이평 돌파 전략 평가 ──
             signals_30m = analyze_buy_signals(df_30m, None, daily_df, df_15m=df_15m) if (df_30m is not None and not df_30m.empty) else {'buy': False}
             
             if signals_30m.get('remove_watchlist'):
@@ -364,27 +386,38 @@ class BuyManager:
                     'final_score': final_score,
                     'priority_score': final_score
                 })
-            elif signals_30m.get('buy'):
-                buy_price = signals_30m['close']
+            # HH선(가중 5-20 고가선) 수급 돌파 및 숨고르기 지지 안착 재반등 신호 채택
+            elif eval_hh.get('should_buy'):
+                buy_price = eval_hh['hh_price']
                 if buy_price > self.buy_amount:
                     continue
-                base_score = signals_30m.get('priority_score', 0.0)
+                base_score = eval_hh['priority_score']
                 final_score = (base_score + supply_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
                     'state': state,
-                    'signals': signals_30m,
-                    'df_30m': df_30m,
+                    'signals': {
+                        'buy': True,
+                        'close': buy_price,
+                        'target_price': eval_hh['hh_price'],
+                        'reason': eval_hh['reason'],
+                        'll': eval_hh['hh_price']
+                    },
+                    'df_30m': df_30m if df_30m is not None else df_15m,
                     'weight': weight,
-                    'is_15m_4formula': signals_30m.get('is_4formula_buy', False),
-                    'is_15m_turnaround': False,
-                    'is_w_rebound': signals_30m.get('is_w_rebound', False),
+                    'is_15m_4formula': False,
+                    'is_15m_turnaround': True,
+                    'is_w_rebound': False,
                     'base_score': base_score,
                     'supply_bonus': supply_bonus,
                     'final_score': final_score,
                     'priority_score': final_score
                 })
+            else:
+                # ── [옵션 B 전용 매수 적용] ──
+                # 15분봉 4대 수식, 수급 변곡 및 HH선 숨고르기 미충족 시 매수 대상 전량 제외 (무수급 이평선 돌파 매수 차단)
+                logger.debug(f"⏭️ [{name}] 15분봉 4대 수식 / 수급 변곡 / HH선 숨고르기 미충족 - 매수 스킵")
 
         if not buy_candidates:
             return
@@ -519,6 +552,68 @@ class BuyManager:
                             trade_intensity=intensity_ratio * 100,
                             is_aggressive=is_aggressive
                         )
+
+    async def evaluate_single_stock(self, code: str):
+        """
+        [0.1초 비동기 즉시 매수 스나이핑]
+        키움 실시간 조건검색(on_insert) 편입 즉시 대기 없이 전속력 매수 검증 및 주문 전송!
+        """
+        try:
+            state = self.trade_states.setdefault(code, TradeState())
+            if state.buy_step >= 1 or state.trade_ended or state.is_holding:
+                return
+
+            # 중복 주문 방지
+            is_unexecuted = any(o['code'] == code for o in self.tracked_orders.values())
+            if is_unexecuted:
+                return
+
+            name = self.watchlist.get(code, {}).get('name') or await asyncio.to_thread(self.client.get_stock_name, code)
+
+            async with self.api_lock:
+                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
+                await asyncio.sleep(0.04)
+                df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
+                await asyncio.sleep(0.04)
+                daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
+                await asyncio.sleep(0.04)
+
+            if df_15m is None or df_15m.empty or daily_df is None or len(daily_df) < 5:
+                return
+
+            is_naver_theme = self.theme_manager.has_hot_theme(code)
+            eval_master = evaluate_user_master_strategy(df_15m, df_30m, daily_df, is_naver_theme=is_naver_theme)
+
+            if eval_master.get('should_buy'):
+                buy_price = eval_master.get('limit_price', eval_master['price'])
+                tick = get_tick_size(int(buy_price))
+                price_limit = int((int(buy_price) // tick) * tick)
+                qty = self.buy_amount // price_limit
+
+                if qty > 0 and not state.is_holding:
+                    logger.info(f"⚡ [0.1초 편입 스나이핑] [{name}({code})] 편입 즉시 지정가 매수 전송! {eval_master['reason']}")
+                    async with self.api_lock:
+                        order_no = await asyncio.to_thread(
+                            self.client.place_buy_order, code, qty,
+                            price=price_limit, order_type="00"
+                        )
+                        await asyncio.sleep(0.25)
+                    if order_no:
+                        self.tracked_orders[order_no] = {
+                            'code': code, 'qty': qty,
+                            'time': time.time(), 'order_type': 'buy'
+                        }
+                        state.buy_step = 1
+                        state.is_holding = True
+                        state.first_qty = qty
+                        state.buy_time = time.time()
+                        if self.db_logger:
+                            self.db_logger.log_buy(
+                                code=code, name=name, buy_price=price_limit,
+                                buy_qty=qty, buy_reason=f"[0.1초 편입 스나이핑] {eval_master['reason']}"
+                            )
+        except Exception as e:
+            logger.warning(f"⚠️ evaluate_single_stock 에러 ({code}): {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -671,6 +766,10 @@ class TradingBot:
             if code not in self.trade_states:
                 self.trade_states[code] = TradeState()
 
+        # ⚡ [0.1초 즉시 매수 스나이핑] 편입 소식이 들려오는 즉시 10초 루프 대기 없이 현장에서 0.1초 매수 검증!
+        if self.buy_manager:
+            asyncio.create_task(self.buy_manager.evaluate_single_stock(code))
+
     async def on_delete(self, code: str):
         logger.info(f"🔴 [조건검색 이탈] 종목코드: {code}")
         if code in self.watchlist:
@@ -707,16 +806,9 @@ class TradingBot:
             logger.error(f"관심종목 저장 실패: {e}")
 
     def load_watchlist(self):
-        watch_file = os.path.join(os.path.dirname(__file__), "today_picks.json")
-        if os.path.exists(watch_file):
-            try:
-                with open(watch_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.watchlist.clear()
-                    self.watchlist.update(data)
-                logger.info(f"📂 저장된 관심종목 리스트를 불러왔습니다. ({len(self.watchlist)}개 종목)")
-            except Exception as e:
-                logger.error(f"관심종목 로드 실패: {e}")
+        # 실시간 조건검색식(on_insert) 전용 운영: 어제 사전 관심종목 파일 로드 차단
+        self.watchlist.clear()
+        logger.info("📂 [실시간 조건검색식 전용] 사전 관심종목 파일(today_picks.json)을 로드하지 않고 장중 실시간 조건검색 편입 종목만 감시합니다.")
 
     def load_states(self):
         self.load_watchlist()
@@ -903,22 +995,8 @@ class TradingBot:
         if not is_active_session:
             today_str = datetime.now().strftime("%Y-%m-%d")
 
-            # ── [오후 8시(20:00) 애프터마켓 마감 직후 익일 공략주 자동 스캔 & 장전] ──
-            if now_time >= nxt_post_close and self.auto_scanned_date != today_str and not self.is_scanning:
-                self.auto_scanned_date = today_str
-                self.is_scanning = True
-                logger.info("=" * 65)
-                logger.info(f"🌙 [20:00 애프터마켓 마감] 내일의 주도주/돌파 종목 자동 스캔을 시작합니다 ({today_str})...")
-                logger.info("=" * 65)
-                try:
-                    # 키움 거래대금/등락률 상위 + 테마주 + 4대수식/W자반등 정밀 스캔
-                    await asyncio.to_thread(run_scanner, max_picks=30)
-                    self.load_watchlist()
-                    logger.info(f"✨ [내일 관심종목 자동 장전 완료] 총 {len(self.watchlist)}개 종목이 today_picks.json에 저장되고 봇에 자동 로드되었습니다!")
-                except Exception as e:
-                    logger.error(f"❌ 20:00 자동 스캔 중 에러 발생: {e}")
-                finally:
-                    self.is_scanning = False
+            # [사용자 요청] 장후 관심종목 자동 스캔 및 어제 관심종목 사전 장전 기능은 전면 비활성화되었습니다.
+            # 봇은 장중 키움 실시간 조건검색식(on_insert) 편입 종목만 100% 실시간 감시/매수합니다.
 
             if nxt_pre_close <= now_time < market_open:
                 wait_reason = "08:50~09:00 정규장 개장 준비 구간 (NXT 프리마켓 마감)"

@@ -103,9 +103,39 @@ def analyze_sell_signals(
     wma3_now = float(latest['wma3']) if pd.notna(latest['wma3']) else 0.0
     wma5_now = float(latest['wma5']) if pd.notna(latest['wma5']) else 0.0
 
+    # ─────────────────────────────────────────────────────────────
+    # [1단계] 수익 +4.0% 이상 달성 시 단계별 마지노선 익절 보존 스탑로스 (Step Trailing Lock)
+    # ─────────────────────────────────────────────────────────────
+    max_price = max(touch_high, curr_p)
+    max_profit_pct = ((max_price - buy_price) / buy_price * 100.0) if buy_price > 0 else profit_pct
+
+    if max_profit_pct >= 4.0:
+        # 수익률이 +4% 이상 올라서면 1.0% 딱 뒤따라가며 익절 스탑로스 설정 (+5% ➔ +4% 스탑, +6% ➔ +5% 스탑, +7% ➔ +6% 스탑, +8% ➔ +7% 스탑)
+        floor_profit_pct = max_profit_pct - 1.0
+        step_label = f"+{max_profit_pct:.1f}% 도달 ➔ +{floor_profit_pct:.1f}% 마지노선 스탑"
+
+        if profit_pct < floor_profit_pct:
+            return {
+                "sell": True,
+                "close": curr_p,
+                "buy_price": buy_price,
+                "profit_pct": profit_pct,
+                "m_resistance": 0.0,
+                "wma3": wma3_now,
+                "wma5": wma5_now,
+                "sma5": wma3_now,
+                "sma20": wma5_now,
+                "sma40": 0.0,
+                "reason": (
+                    f"🛡️ [단계별 익절 보존 스탑로스 가동] {step_label} 이탈! "
+                    f"최고 수익률(+{max_profit_pct:.2f}%) 대비 현재 수익률({profit_pct:+.2f}%)이 마지노선(+{floor_profit_pct:.1f}%) 하회 ➔ 익절 확정"
+                ),
+                "exit_type": "STEP_TRAILING_STOP"
+            }
+
     if wma3_now > 0 and wma5_now > 0:
         # ─────────────────────────────────────────────────────────────
-        # [단일 매도 원칙] 15분봉 WMA 3-5 데드크로스 발생 시 전량 매도
+        # [2단계] 15분봉 WMA 3-5 데드크로스 발생 시 전량 매도
         # ─────────────────────────────────────────────────────────────
         if wma3_now < wma5_now:
             diff_pct = ((wma3_now - wma5_now) / wma5_now) * 100.0
@@ -127,6 +157,25 @@ def analyze_sell_signals(
                 "exit_type": "DEAD_CROSS_3_5_WMA"
             }
 
+    # ─────────────────────────────────────────────────────────────
+    # [3단계] -2.5% strict stop-loss 방어
+    # ─────────────────────────────────────────────────────────────
+    if profit_pct <= -2.5:
+        return {
+            "sell": True,
+            "close": curr_p,
+            "buy_price": buy_price,
+            "profit_pct": profit_pct,
+            "m_resistance": 0.0,
+            "wma3": wma3_now,
+            "wma5": wma5_now,
+            "sma5": wma3_now,
+            "sma20": wma5_now,
+            "sma40": 0.0,
+            "reason": f"🚨 [Strict 손절] 손실률({profit_pct:+.2f}%) <= -2.5% 마지노선 이탈 ➔ 손절 매도",
+            "exit_type": "STRICT_STOP_LOSS"
+        }
+
     return {
         "sell": False,
         "close": curr_p,
@@ -138,7 +187,7 @@ def analyze_sell_signals(
         "sma5": wma3_now,
         "sma20": wma5_now,
         "sma40": 0.0,
-        "reason": f"15분봉 WMA3({wma3_now:,.0f}원) >= WMA5({wma5_now:,.0f}원) 정배열/상승 탄력 유지 중 (홀딩)",
+        "reason": f"15분봉 WMA3({wma3_now:,.0f}원) >= WMA5({wma5_now:,.0f}원) 정배열/상승 탄력 유지 중 (현재 수익률: {profit_pct:+.2f}%, 최고: +{max_profit_pct:.2f}%)",
         "exit_type": ""
     }
 

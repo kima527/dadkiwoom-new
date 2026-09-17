@@ -360,3 +360,40 @@ class RealAPIAdapter:
 
         return 0.0
 
+    def get_stock_credit_info(self, stock_code: str) -> dict:
+        """
+        종목의 신용 정보(신용비율, 신용한도초과 여부)를 조회합니다. (캐시 활용)
+        """
+        if not hasattr(self, '_credit_info_cache'):
+            self._credit_info_cache = {}
+
+        code = stock_code.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+        if code in self._credit_info_cache:
+            return self._credit_info_cache[code]
+
+        res_info = {'code': code, 'crd_rt': 0.0, 'is_limit_exceeded': False, 'margin_status': '정상'}
+        try:
+            res = self.real_client.stock_info_api.basic_stock_information_request_ka10001(stock_code=code)
+            if res and res.get('return_code') == 0:
+                crd_str = str(res.get('crd_rt', '0.0')).replace('+', '').replace('-', '').strip()
+                crd_val = float(crd_str) if crd_str else 0.0
+                res_info['crd_rt'] = crd_val
+
+                state_str = str(res.get('stk_state', '')) + str(res.get('return_msg', ''))
+                if crd_val >= 10.0 or '신용한도초과' in state_str or '신용불가' in state_str:
+                    res_info['is_limit_exceeded'] = True
+                    res_info['margin_status'] = '신용한도초과'
+
+                self._credit_info_cache[code] = res_info
+                return res_info
+        except Exception as e:
+            logger.debug(f"신용정보 조회 에러 ({stock_code}): {e}")
+
+        self._credit_info_cache[code] = res_info
+        return res_info
+
+    def is_credit_limit_exceeded(self, stock_code: str) -> bool:
+        """종목의 신용 한도 초과 여부를 반환합니다."""
+        info = self.get_stock_credit_info(stock_code)
+        return info.get('is_limit_exceeded', False)
+

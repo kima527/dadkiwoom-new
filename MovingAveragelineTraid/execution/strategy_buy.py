@@ -54,6 +54,226 @@ def calculate_hh(df: pd.DataFrame) -> pd.Series:
     return df['hh_line']
 
 # ═══════════════════════════════════════════════════════════════
+# HH선(가중 5-20 고가선) 수급 돌파 & 숨고르기 지지 재반등 평가
+# ═══════════════════════════════════════════════════════════════
+def evaluate_hh_rebound(df_15m: pd.DataFrame, daily_df: pd.DataFrame = None) -> dict:
+    """
+    MM=MA(C,5,가중); MN=MA(C,20,가중); 조건=CrossUp(MM,MN); HH=ValueWhen(1,조건,H)
+    HH선 상향 돌파 후 HH선 부근(-0.8% ~ +1.8%) 숨고르기 지지 안착 후 15분봉 수급 양봉 재반등 검출
+    """
+    res = {'should_buy': False, 'hh_price': 0.0, 'reason': '', 'priority_score': 0.0}
+    if df_15m is None or len(df_15m) < 20:
+        return res
+
+    # 1. 일봉 또는 15분봉 기준 HH선 계산
+    target_df = daily_df if (daily_df is not None and len(daily_df) >= 20) else df_15m
+    hh_series = calculate_hh(target_df)
+    valid_hh = hh_series.dropna()
+    if valid_hh.empty:
+        return res
+
+    hh_val = float(valid_hh.iloc[-1])
+    if hh_val <= 0:
+        return res
+
+    # 2. 현재가 및 15분봉 상태 분석
+    df15 = df_15m.copy()
+    df15.rename(columns={col: col.lower() for col in df15.columns}, inplace=True)
+    latest_15m = df15.iloc[-1]
+    curr_c = float(latest_15m['close'])
+    curr_o = float(latest_15m['open'])
+    curr_v = float(latest_15m['volume'])
+
+    # HH선 대비 현재가 이격도 (-0.8% ~ +1.8% 이내 완벽 안착/숨고르기)
+    diff_pct = ((curr_c - hh_val) / hh_val) * 100.0
+    is_hh_touch = (-0.8 <= diff_pct <= 1.8)
+
+    # 15분봉 양봉 (Close > Open) 및 거래량 수급 반응 (15분봉 거래대금 5억 이상 또는 수급 재반등)
+    supply_15m = (latest_15m['high'] + latest_15m['low'] + curr_o + curr_c) / 4.0 * curr_v / 1e8
+    is_bull = (curr_c > curr_o)
+    is_supply_react = (supply_15m >= 5.0)  # 15분봉 수급 5억 이상 반응
+
+    if is_hh_touch and is_bull and is_supply_react:
+        res['should_buy'] = True
+        res['hh_price'] = hh_val
+        res['priority_score'] = 250.0  # 15분봉 변곡 급 고득점
+        res['reason'] = (
+            f"🎯 [HH선 숨고르기 지지 안착 재반등] "
+            f"HH선({hh_val:,.0f}원) 부근 안착({diff_pct:+.2f}%) + 15분봉 수급({supply_15m:.1f}억) 양봉 재반등 포착"
+        )
+
+    return res
+
+# ═══════════════════════════════════════════════════════════════
+# TEMA 5-20 수식선 및 최근 5봉 10% 급등 유저 정의 전략 모듈
+# ═══════════════════════════════════════════════════════════════
+def calculate_tema(series: pd.Series, period: int) -> pd.Series:
+    """삼중지수이동평균(TEMA) 계산: 3*EMA1 - 3*EMA2 + EMA3"""
+    ema1 = series.ewm(span=period, adjust=False).mean()
+    ema2 = ema1.ewm(span=period, adjust=False).mean()
+    ema3 = ema2.ewm(span=period, adjust=False).mean()
+    return 3.0 * ema1 - 3.0 * ema2 + ema3
+
+def calculate_daily_tema_line(daily_df: pd.DataFrame) -> pd.Series:
+    """
+    일봉 TEMA1(5), TEMA2(20) 상향 돌파 시점의 TEMA1 수식선 계산:
+    TEMA1=3*eavg(c,5)-3*eavg(eavg(c,5),5)+eavg(eavg(eavg(c,5),5),5);
+    TEMA2=3*eavg(c,20)-3*eavg(eavg(c,20),20)+eavg(eavg(eavg(c,20),20),20);
+    조건=CrossUp(TEMA1,TEMA2); ValueWhen(1,조건,TEMA1)
+    """
+    if daily_df is None or len(daily_df) < 20:
+        return pd.Series([np.nan] * (len(daily_df) if daily_df is not None else 0))
+
+    df_d = daily_df.copy()
+    df_d.rename(columns={col: col.lower() for col in df_d.columns}, inplace=True)
+
+    t1 = calculate_tema(df_d['close'], 5)
+    t2 = calculate_tema(df_d['close'], 20)
+
+    cond_crossup = (t1.shift(1) <= t2.shift(1)) & (t1 > t2)
+    df_d['tema_line'] = t1.where(cond_crossup).ffill()
+    return df_d['tema_line']
+
+def check_recent_5bar_surge(daily_df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    최근 5봉(5일) 이내 전일 종가 대비 고가가 +10.0% 이상 급등했던 적이 1회 이상 존재하는지 검증
+    """
+    if daily_df is None or len(daily_df) < 6:
+        return False, "일봉 데이터 수량 부족"
+
+    df_d = daily_df.copy()
+    df_d.rename(columns={col: col.lower() for col in df_d.columns}, inplace=True)
+
+    recent = df_d.tail(6)
+    for i in range(1, len(recent)):
+        curr_h = float(recent.iloc[i]['high'])
+        prev_c = float(recent.iloc[i-1]['close'])
+        if prev_c > 0:
+            gain_pct = ((curr_h - prev_c) / prev_c) * 100.0
+            if gain_pct >= 10.0:
+                return True, f"최근 5봉 이내 10%+ 폭등 경험 있음({gain_pct:+.1f}%)"
+    return False, "최근 5봉 이내 10% 이상 고가 급등 경험 없음"
+
+def evaluate_user_master_strategy(
+    df_15m: pd.DataFrame,
+    df_30m: pd.DataFrame = None,
+    daily_df: pd.DataFrame = None,
+    is_naver_theme: bool = True
+) -> dict:
+    """
+    [유저 지정 핵심 4대 수식 & 타점 통합 전략]
+    1. 일봉 종가 >= TEMA 5-20 수식선 위 위치
+    2. 최근 5봉 이내 전일대비 고가 10% 이상 급등 경험 1회 이상
+    3. NAVER 증권 당일 테마주 포함 종목
+    4. MM(WMA5)-MN(WMA20) 돌파 관찰
+    5. [최종 매수 타점]: 15분봉 WMA3이 WMA5를 상향 돌파 (CrossUp(WMA3, WMA5)) 시 지정가 매수!
+    """
+    res = {'should_buy': False, 'price': 0.0, 'reason': '', 'priority_score': 0.0, 'limit_price': 0.0}
+
+    # 0. 네이버 테마주 검증
+    if not is_naver_theme:
+        res['reason'] = "❌ 네이버 증권 당일 테마주 미포함"
+        return res
+
+    if daily_df is None or len(daily_df) < 20 or df_15m is None or len(df_15m) < 20:
+        res['reason'] = "❌ 차트 데이터 수량 부족"
+        return res
+
+    # 1. 일봉 TEMA 5-20 수식선 위 위치 검증
+    tema_line_series = calculate_daily_tema_line(daily_df)
+    valid_tema = tema_line_series.dropna()
+    if valid_tema.empty:
+        res['reason'] = "❌ 일봉 TEMA 수식선 생성 불가"
+        return res
+
+    tema_val = float(valid_tema.iloc[-1])
+    curr_daily_close = float(daily_df.iloc[-1]['close'])
+
+    if curr_daily_close < tema_val:
+        res['reason'] = f"❌ 일봉 종가({curr_daily_close:,.0f}원) < TEMA 수식선({tema_val:,.0f}원) 이탈"
+        return res
+
+    # 2. 최근 5봉 이내 고가 10%+ 1회 이상 경험 검증
+    has_5bar_surge, surge_msg = check_recent_5bar_surge(daily_df)
+    if not has_5bar_surge:
+        res['reason'] = f"❌ {surge_msg}"
+        return res
+
+    # 3. 15분봉 차트 기준 WMA3, WMA5, WMA20 및 5대 정밀 수급 수식 계산
+    df15 = df_15m.copy()
+    df15.rename(columns={col: col.lower() for col in df15.columns}, inplace=True)
+
+    df15['wma3'] = wma(df15['close'], 3)
+    df15['wma5'] = wma(df15['close'], 5)
+    df15['wma20'] = wma(df15['close'], 20)
+
+    # A = (H + L + O + C) / 4 * V / 100,000,000 (15분봉 거래대금 (억원))
+    # AvgA = ma(A, 20)
+    df15['a'] = (df15['high'] + df15['low'] + df15['open'] + df15['close']) / 4.0 * df15['volume'] / 1e8
+    df15['avga'] = df15['a'].rolling(20, min_periods=1).mean()
+
+    latest = df15.iloc[-1]
+    prev = df15.iloc[-2] if len(df15) >= 2 else latest
+    prev2 = df15.iloc[-3] if len(df15) >= 3 else prev
+
+    curr_c = float(latest['close'])
+    curr_o = float(latest['open'])
+    curr_h = float(latest['high'])
+
+    wma3_curr = float(latest['wma3'])
+    wma5_curr = float(latest['wma5'])
+    wma20_curr = float(latest['wma20'])
+
+    wma3_prev = float(prev['wma3'])
+    wma5_prev = float(prev['wma5'])
+
+    a_val = float(latest['a'])
+    avga_val = float(latest['avga'])
+    a1_val = float(prev['a'])
+    a2_val = float(prev2['a'])
+    prev_2_avg = (a1_val + a2_val) / 2.0
+
+    # 유저 지정 15분봉 4대 수급 수식 검증
+    # 1. A >= AvgA * 5 (20봉 평균 수급 대비 5배 폭증)
+    cond1_avga_5x = (a_val >= avga_val * 5.0) if avga_val > 0 else True
+    # 2. O < C (양봉)
+    cond2_bull = (curr_c > curr_o)
+    # 3. C - O > (H - C) * 1.2 (양봉 몸통 > 윗꼬리 * 1.2배 탄탄한 양봉)
+    cond3_body_strong = (curr_c - curr_o) > ((curr_h - curr_c) * 1.2)
+    # 4. A >= (A(1) + A(2)) / 2 * 3 (직전 2개봉 평균 대비 3배 폭증)
+    cond4_prev2_3x = (a_val >= prev_2_avg * 3.0) if prev_2_avg > 0 else True
+
+    is_supply_formula_met = cond1_avga_5x and cond2_bull and cond3_body_strong and cond4_prev2_3x
+
+    # 4. MM(WMA5) >= MN(WMA20) 돌파 관찰 조건
+    is_wma5_above_20 = (wma5_curr >= wma20_curr * 0.995)
+
+    # 5. [최종 매수 타점] CrossUp(WMA3, WMA5) - 3일선이 5일선 상향 돌파
+    is_crossup_3_5 = (wma3_prev <= wma5_prev) and (wma3_curr > wma5_curr)
+    is_3_5_tight = (wma3_curr >= wma5_curr) and (((wma3_curr - wma5_curr) / wma5_curr) <= 0.005)
+
+    if is_supply_formula_met and is_wma5_above_20 and (is_crossup_3_5 or is_3_5_tight):
+        # 꼭대기 추격 매수 방지: WMA5 대비 +1.5% 초과 치솟은 꼭대기는 거부
+        diff_from_wma5 = ((curr_c - wma5_curr) / wma5_curr) * 100.0
+        if diff_from_wma5 > 1.5:
+            res['reason'] = f"⚠️ WMA5 대비 +{diff_from_wma5:.2f}% 상단 초과 (꼭대기 추격 매수 방지 차단)"
+            return res
+
+        res['should_buy'] = True
+        res['price'] = curr_c
+        res['limit_price'] = wma5_curr
+        res['priority_score'] = 400.0  # 유저 수식 100% 완벽 충족 최고점
+        res['reason'] = (
+            f"🔥 [유저 15분봉 수급+TEMA 수식 완벽 매수 타점] "
+            f"일봉 TEMA선({tema_val:,.0f}원) 위 + 5봉내 10% 급등 + "
+            f"15분봉 거래대금 A({a_val:.1f}억 >= AvgA의 5배) + 양봉 몸통>윗꼬리*1.2 + "
+            f"WMA3({wma3_curr:,.0f}원) > WMA5({wma5_curr:,.0f}원) 골든크로스 터짐!"
+        )
+
+    return res
+
+
+# ═══════════════════════════════════════════════════════════════
 # 30분봉 실시간 3일선 / 5일선 계산 (키움증권 분봉 수식)
 # ═══════════════════════════════════════════════════════════════
 def calculate_realtime_day_smas(df_30m: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:

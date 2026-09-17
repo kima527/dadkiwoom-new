@@ -38,11 +38,24 @@ class KiwoomWebSocketClient:
         self.on_delete = on_delete
         self.on_real_tick = on_real_tick
 
+    async def refresh_token_preflight(self):
+        """08:00 프리마켓 가동 전 강제 토큰 갱신 (Token Pre-flight Refresh)"""
+        try:
+            logger.info("🔑 [TokenManager] 08:00 프리마켓 가동 전 토큰 강제 사전 갱신 진행 중...")
+            token = self.token_manager.get_token(force_refresh=True)
+            if token:
+                logger.info("✅ [TokenManager] 신규 Access Token 사전 발급 완료 (유효기간 3시간 보장)")
+            return token
+        except Exception as e:
+            logger.error(f"❌ [TokenManager] 사전 토큰 갱신 실패: {e}")
+            return None
+
     async def connect(self):
         try:
-            self.websocket = await websockets.connect(self.uri)
+            await self.refresh_token_preflight()
+            self.websocket = await websockets.connect(self.uri, ping_interval=20, ping_timeout=20)
             self.connected = True
-            logger.info("웹소켓 서버에 연결되었습니다.")
+            logger.info("웹소켓 서버에 연결되었습니다. (ping_interval=20s 유지)")
 
             access_token = self.token_manager.get_token()
             if not access_token:
@@ -69,6 +82,56 @@ class KiwoomWebSocketClient:
             if not isinstance(message, str):
                 message = json.dumps(message)
             await self.websocket.send(message)
+
+    async def subscribe_nxt_premarket(self, codes: list):
+        """
+        08:00 ~ 08:50 대체거래소(NXT) 프리마켓 실시간 구독 등록
+        종목코드 뒤에 _NX를 붙여서 '0B'(주식체결), '0D'(주식호가잔량) 구독 요청
+        """
+        if not codes:
+            return
+        nxt_items = [f"{str(c).lstrip('A')}_NX" if not str(c).endswith('_NX') else str(c) for c in codes]
+        msg = {
+            "trnm": "REG",
+            "grp_no": "1",
+            "refresh": "1",
+            "data": [
+                {
+                    "item": nxt_items,
+                    "type": ["0B", "0D"]
+                }
+            ]
+        }
+        logger.info(f"⚡ [NXT 프리마켓] 대체거래소 실시간 구독 패킷 전송: {nxt_items}")
+        await self.send_message(msg)
+
+    async def switch_to_regular_session(self, codes: list):
+        """
+        09:00 정규장 개장 직후 세션 스위칭:
+        1. _NX 대체거래소 웹소켓 해제 (UNREG)
+        2. 일반 6자리 코드("078350") 정규장 웹소켓 재구독 (REG)
+        """
+        if not codes:
+            return
+        nxt_items = [f"{str(c).lstrip('A')}_NX" if not str(c).endswith('_NX') else str(c) for c in codes]
+        unreg_msg = {
+            "trnm": "UNREG",
+            "grp_no": "1",
+            "data": [{"item": nxt_items, "type": ["0B", "0D"]}]
+        }
+        logger.info(f"🔄 [09:00 세션 스위칭] NXT 프리마켓 웹소켓 해제 전송: {nxt_items}")
+        await self.send_message(unreg_msg)
+        await asyncio.sleep(0.5)
+
+        raw_codes = [str(c).replace('_NX', '').lstrip('A') for c in codes]
+        reg_msg = {
+            "trnm": "REG",
+            "grp_no": "2",
+            "refresh": "1",
+            "data": [{"item": raw_codes, "type": ["0B", "0D"]}]
+        }
+        logger.info(f"🚀 [09:00 세션 스위칭] KRX 정규장 웹소켓 재구독 전송: {raw_codes}")
+        await self.send_message(reg_msg)
 
     async def subscribe_real_tick(self, code: str):
         """
