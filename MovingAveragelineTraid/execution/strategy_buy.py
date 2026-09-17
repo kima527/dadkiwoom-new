@@ -18,6 +18,7 @@ import pandas as pd
 import numpy as np
 import logging
 from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
+from strategy_15m_squeeze_alignment import evaluate_15m_squeeze_alignment, SqueezeAlignmentParams
 
 logger = logging.getLogger(__name__)
 
@@ -552,6 +553,18 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame = None, dail
     current_price = float(df30.iloc[-1]['close'])
     result['close'] = current_price
 
+    # 0-B. 👑 [최우선 1순위] 15분봉 20/40/60 이평선 수평 응축 + 3-5-20-40-60 정배열 수급 돌파 (전략 B)
+    is_squeeze_b_sig = False
+    squeeze_b_info = {}
+    if df_15m is not None and not df_15m.empty and len(df_15m) >= 60:
+        sq_res = evaluate_15m_squeeze_alignment(code="", name="", df_15m=df_15m, daily_df=daily_df)
+        if sq_res.get("is_buy_signal"):
+            is_squeeze_b_sig = True
+            squeeze_b_info = sq_res
+            result['is_squeeze_b_buy'] = True
+            result['squeeze_b_info'] = squeeze_b_info
+            result['priority_score'] = max(result['priority_score'], 300.0)
+
     # 0. 15분봉 4대 수식 올인원 돌파 신호 검출
     is_f4_sig = False
     f4_info = {}
@@ -709,16 +722,22 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame = None, dail
                     )
 
     # ─────────────────────────────────────────────────
-    # 매수 신호 판정: 15분봉 4대 수식, 수급 폭발 또는 3대 핵심 원칙 (독립적 OR 조건 결합)
+    # 매수 신호 판정: 15분 이평 응축 정배열(전략B), 15분봉 4대 수식, 수급 폭발 또는 3대 핵심 원칙
     # ─────────────────────────────────────────────────
-    if is_f4_sig or is_supply_sig or cond1_daily_sma20 or cond2_30m_sma260 or cond3_day_sma_cross:
+    if is_squeeze_b_sig or is_f4_sig or is_supply_sig or cond1_daily_sma20 or cond2_30m_sma260 or cond3_day_sma_cross:
         result['buy'] = True
         
         reasons = []
-        if is_f4_sig:
-            reasons.append(f4_info.get('reason', '🎯 [15분봉 4대 수식 완성] 15분봉 수급폭증 + 1-20-60 첫정배열 + M선 골든크로스'))
+        if is_squeeze_b_sig:
+            reasons.append(squeeze_b_info.get('reason', '👑 [1순위: 15분 이평 응축 정배열 수급 돌파] 20-40-60 응축 + 3-5-20-40-60 정배열 + 수급 폭발'))
             result['target_price'] = current_price
             result['ll'] = current_price
+            result['priority_score'] = max(result['priority_score'], 300.0)
+
+        if is_f4_sig:
+            reasons.append(f4_info.get('reason', '🎯 [15분봉 4대 수식 완성] 15분봉 수급폭증 + 1-20-60 첫정배열 + M선 골든크로스'))
+            result['target_price'] = current_price if result.get('target_price', 0) == 0 else result['target_price']
+            result['ll'] = current_price if result['ll'] == 0 else result['ll']
             result['priority_score'] = max(result['priority_score'], 200.0)
 
         if is_supply_sig:

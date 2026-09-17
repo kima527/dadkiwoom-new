@@ -33,6 +33,7 @@ from strategy_buy import analyze_buy_signals, evaluate_hh_rebound
 from strategy_sell import analyze_sell_signals
 from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
+from strategy_15m_squeeze_alignment import evaluate_15m_squeeze_alignment, SqueezeAlignmentParams
 from db_logger import TradeDBLogger
 from scan_tomorrow_picks import run_scanner
 from theme_manager import ThemeManager
@@ -184,6 +185,7 @@ class BuyManager:
         self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 2종목 분산 매매)
         self.params_15m = Turnaround15mParams(min_daily_supply_money=20.0)
         self.params_f4 = Formula4Params(min_supply_money=20.0)
+        self.params_squeeze = SqueezeAlignmentParams(min_supply_money_15m=15.0)
         self._static_filter_cache = {}     # 당일 시가총액 & 5일 거래대금 정적 필터 캐시 {code: (passed: bool, date: str)}
 
     async def run(self, holdings: dict, unexecuted: list):
@@ -307,16 +309,19 @@ class BuyManager:
             if daily_df is None or len(daily_df) < 5:
                 continue
 
-            # ── 1. [최우선 0순위] 15분봉 4대 수식 완성 전략 평가 ──
+            # ── 0. 👑 [최우선 1순위] 15분봉 20/40/60 이평선 응축 + 3-5-20-40-60 정배열 수급 돌파 (전략 B) ──
+            eval_squeeze = evaluate_15m_squeeze_alignment(code, name, df_15m, daily_df, params=self.params_squeeze) if (df_15m is not None and not df_15m.empty) else {'is_buy_signal': False}
+
+            # ── 1. [2순위] 15분봉 4대 수식 완성 전략 평가 ──
             eval_f4 = evaluate_4formula_buy(code, name, df_15m, current_price=None, params=self.params_f4) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
-            # ── 2. [1순위] 15분봉 수급 및 이평 변곡 전략 평가 ──
+            # ── 2. [3순위] 15분봉 수급 및 이평 변곡 전략 평가 ──
             eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, current_price=None, params=self.params_15m) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
-            # ── 3. [1.5순위] HH선 수급 돌파 및 숨고르기 지지 안착 재반등 평가 ──
+            # ── 3. [4순위] HH선 수급 돌파 및 숨고르기 지지 안착 재반등 평가 ──
             eval_hh = evaluate_hh_rebound(df_15m, daily_df) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
-            # ── 4. [2순위] 30분봉/일봉 이평 돌파 전략 평가 ──
+            # ── 4. [5순위] 30분봉/일봉 이평 돌파 전략 평가 ──
             signals_30m = analyze_buy_signals(df_30m, None, daily_df, df_15m=df_15m) if (df_30m is not None and not df_30m.empty) else {'buy': False}
             
             if signals_30m.get('remove_watchlist'):
@@ -330,8 +335,37 @@ class BuyManager:
             supply_money_100m = latest_trade_val / 100_000_000.0  # 억원 단위
             supply_bonus = min(supply_money_100m / 10.0, 50.0)    # 500억 이상이면 +50점 상한
 
-            # 15분봉 4대 수식 올인원 신호 최우선 채택
-            if eval_f4.get('should_buy'):
+            # 👑 1순위: 15분봉 이평 응축 + 정배열 수급 돌파 (전략 B) 최우선 채택
+            if eval_squeeze.get('is_buy_signal'):
+                buy_price = eval_squeeze['current_price']
+                if buy_price > self.buy_amount:
+                    continue
+                base_score = 400.0  # 👑 1순위 최고점 부여 (400점)
+                final_score = (base_score + supply_bonus) * weight
+                buy_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'state': state,
+                    'signals': {
+                        'buy': True,
+                        'close': eval_squeeze['current_price'],
+                        'target_price': eval_squeeze['current_price'],
+                        'reason': eval_squeeze['reason'],
+                        'll': eval_squeeze['current_price']
+                    },
+                    'df_30m': df_30m if df_30m is not None else df_15m,
+                    'weight': weight,
+                    'is_15m_squeeze': True,
+                    'is_15m_4formula': False,
+                    'is_15m_turnaround': False,
+                    'is_w_rebound': False,
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'final_score': final_score,
+                    'priority_score': final_score
+                })
+            # 15분봉 4대 수식 올인원 신호 채택
+            elif eval_f4.get('should_buy'):
                 buy_price = eval_f4['price']
                 if buy_price > self.buy_amount:
                     continue
