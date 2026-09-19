@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple
 import pandas as pd
 import numpy as np
+from strategy_15m_turnaround import calc_m_resistance_price
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ class SqueezeAlignmentParams:
     min_supply_money_15m: float = 15.0    # 15분봉 돌파봉 최소 거래대금 (15억원 이상)
     supply_surge_multiplier: float = 3.0  # 직전 2봉 평균 대비 수급 폭증 배수 (3배)
     supply_ma20_multiplier: float = 5.0   # 20봉 평균 대비 수급 폭증 배수 (5배: A >= AvgA * 5)
-    max_bar_gain_pct: float = 7.5         # 단일 15분봉 종가 상승률 상한선 (7.5% 초과 추격 금지)
+    max_bar_gain_pct: float = 4.5         # 단일 15분봉 종가 상승률 상한선 (4.5% 초과 과열 추격 금지)
     max_daily_gain_pct: float = 20.0      # 당일 등락률 상한선 (20% 초과 late-afternoon 과열주 방지)
     min_body_ratio: float = 1.0           # 양봉 몸통 / 윗꼬리 비율 (최소 1.0배 이상)
     min_bars_15m: int = 135               # 130이평 계산을 위한 최소 요구 15분봉 데이터 개수
@@ -53,13 +54,14 @@ def calculate_15m_squeeze_indicators(df_15m: pd.DataFrame) -> pd.DataFrame:
     open_p = df['open']
     volume = df['volume']
 
-    # 15분봉 이평선 (130이평선 추가)
+    # 15분봉 이평선 (130이평선 & 260이평선 추가)
     df['ma3'] = close.rolling(3, min_periods=3).mean()
     df['ma5'] = close.rolling(5, min_periods=5).mean()
     df['ma20'] = close.rolling(20, min_periods=20).mean()
     df['ma40'] = close.rolling(40, min_periods=40).mean()
     df['ma60'] = close.rolling(60, min_periods=60).mean()
     df['ma130'] = close.rolling(130, min_periods=130).mean()
+    df['ma260'] = close.rolling(260, min_periods=20).mean()
 
     # 15분봉 거래대금 (억원 단위)
     df['m15_money'] = (close * volume) / 100_000_000.0
@@ -137,6 +139,13 @@ def evaluate_15m_squeeze_alignment(
         res["daily_gain_pct"] = ((res["current_price"] - prev_close) / prev_close) * 100.0
     else:
         res["daily_gain_pct"] = float(curr['bar_gain_pct'])
+
+    # 0. [사용자 절대 룰] 15분봉 260이평선 아래에 급등관문 고가선이 위치한 경우 스킵 (장기 매물대 저항 차단)
+    m_resistance = calc_m_resistance_price(df_15m)
+    ma260_curr = float(curr['ma260']) if ('ma260' in curr and pd.notna(curr['ma260'])) else 0.0
+    if m_resistance > 0 and ma260_curr > 0 and m_resistance < ma260_curr:
+        res["reason"] = f"🛑 급등관문 고가선({m_resistance:,.0f}원)이 15분봉 260이평선({ma260_curr:,.0f}원) 아래에 위치 ➔ 매수 스킵 (장기 매물대 저항)"
+        return res
 
     # 1. 최근 N봉 이내 20, 40, 60, 130 이평선 응축 조건 검증
     recent_squeeze_series = df['squeeze_pct'].iloc[-params.squeeze_lookback_bars:]

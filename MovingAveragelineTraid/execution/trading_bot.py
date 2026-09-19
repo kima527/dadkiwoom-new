@@ -185,7 +185,7 @@ class BuyManager:
         self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 2종목 분산 매매)
         self.params_15m = Turnaround15mParams(min_daily_supply_money=20.0)
         self.params_f4 = Formula4Params(min_supply_money=20.0)
-        self.params_squeeze = SqueezeAlignmentParams(min_supply_money_15m=15.0)
+        self.params_squeeze = SqueezeAlignmentParams(min_supply_money_15m=15.0, max_squeeze_pct=1.5, max_bar_gain_pct=4.5)
         self._static_filter_cache = {}     # 당일 시가총액 & 5일 거래대금 정적 필터 캐시 {code: (passed: bool, date: str)}
 
     async def run(self, holdings: dict, unexecuted: list):
