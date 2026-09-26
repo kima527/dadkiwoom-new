@@ -67,7 +67,7 @@ def calculate_sma_breakout_signals(
 
         # --- 필터 B: 체결 강도 (Trade Intensity) ---
         intensity = calculate_trade_intensity(tick_data or [])
-        intensity_ok = intensity["is_strong"]  # ratio >= 1.5
+        intensity_ok = intensity["is_strong"]  # ratio >= 1.02
 
         # [재돌파 매수 판단]
         if state.sold_once:
@@ -92,7 +92,7 @@ def calculate_sma_breakout_signals(
         if candle_confirmed and intensity_ok:
             reason_parts = [
                 f"양봉확인(C{close_price:,.0f}>O{open_price:,.0f})",
-                f"체결강도 {intensity['ratio']}배(매수{intensity['buy_vol']}≥매도{intensity['sell_vol']}×1.5)",
+                f"체결강도 {intensity['ratio']}배(매수{intensity['buy_vol']}≥매도{intensity['sell_vol']}×1.02)",
             ]
             logger.info(
                 f"📊 [매수필터 통과] 120봉최고={highest_120:,.0f} | "

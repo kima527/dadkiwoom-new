@@ -28,3 +28,5 @@ MovingAveragelineTraid/execution/trade_states.json
 .idea/
 .gemini/
 .tmp/
+.venv/
+venv/

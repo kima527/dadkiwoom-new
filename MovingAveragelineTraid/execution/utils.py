@@ -128,7 +128,7 @@ def calculate_trade_intensity(tick_data: list) -> dict:
                 sell_vol += vol * 0.5
 
     ratio = (buy_vol / sell_vol) if sell_vol > 0 else 999.0
-    is_strong = ratio >= 1.5
+    is_strong = ratio >= 1.02
 
     return {
         "buy_vol": int(buy_vol),

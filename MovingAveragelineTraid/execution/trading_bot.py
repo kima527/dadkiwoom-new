@@ -29,14 +29,17 @@ import logging
 import argparse
 from real_api_adapter import RealAPIAdapter
 from utils import TradeState, get_tick_size, calculate_trade_intensity
-from strategy_buy import analyze_buy_signals, evaluate_hh_rebound
+from strategy_buy import analyze_buy_signals, evaluate_hh_rebound, evaluate_pivot_breakout, evaluate_user_master_strategy
 from strategy_sell import analyze_sell_signals
 from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 from strategy_15m_squeeze_alignment import evaluate_15m_squeeze_alignment, SqueezeAlignmentParams
+from strategy_5d2v_surge_breakout import evaluate_5d2v_surge_breakout
 from db_logger import TradeDBLogger
 from scan_tomorrow_picks import run_scanner
 from theme_manager import ThemeManager
+from news_agent import RealtimeNewsAgent
+from premarket_scanner import PremarketThemeScanner
 from datetime import datetime, time as dtime
 
 # ═══════════════════════════════════════════════════════════════
@@ -173,6 +176,8 @@ class BuyManager:
                  trade_states: dict, tracked_orders: dict, watchlist: dict,
                  market_guard: MarketIndexGuard = None,
                  db_logger: TradeDBLogger = None,
+                 theme_manager = None,
+                 news_agent: RealtimeNewsAgent = None,
                  buy_amount: int = 5000000, max_positions: int = 2):
         self.client = client
         self.api_lock = api_lock
@@ -183,6 +188,8 @@ class BuyManager:
         self.db_logger = db_logger
         self.buy_amount = buy_amount        # 종목당 매수 금액 (500만원)
         self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 2종목 분산 매매)
+        self.theme_manager = theme_manager  # 실시간 테마 관리자 (대장주 차등 가중치)
+        self.news_agent = news_agent        # 실시간 뉴스/모멘텀 AI 스코어러 (호재 가산 및 악재 차단)
         self.params_15m = Turnaround15mParams(min_daily_supply_money=20.0)
         self.params_f4 = Formula4Params(min_supply_money=20.0)
         self.params_squeeze = SqueezeAlignmentParams(min_supply_money_15m=15.0, max_squeeze_pct=1.5, max_bar_gain_pct=4.5)
@@ -191,9 +198,14 @@ class BuyManager:
     async def run(self, holdings: dict, unexecuted: list):
         """매수 감시 사이클 실행"""
 
-        # ── 1. 시장 지수 급락 안전장치 검사 ──
+        # ── 1. 시장 지수 급락 안전장치 검사 (정규장 세션 09:00~15:30에서만 적용, 프리/애프터마켓은 주가지수 적용 해제) ──
         is_market_in_danger = False
-        if self.market_guard:
+        now_time = datetime.now().time()
+        is_regular_session = (dtime(9, 0, 0) <= now_time <= dtime(15, 30, 0))
+
+        if not is_regular_session:
+            logger.info("🌅 [프리/애프터마켓 세션] 주가지수 적용 해제 (정규장 외 세션 - 주가지수 급락 방어 미적용)")
+        elif self.market_guard:
             market_status = await self.market_guard.check_market_health()
             kospi_str = f"KOSPI: {market_status['kospi_chg']:+.2f}%"
             kosdaq_str = f"KOSDAQ: {market_status['kosdaq_chg']:+.2f}%"
@@ -202,7 +214,7 @@ class BuyManager:
                 is_market_in_danger = True
                 logger.warning(
                     f"🛑 [지수 급락 방어 모드] {kospi_str} | {kosdaq_str} -> "
-                    f"{market_status['reason']}. 체결강도 150% 이상 강력 주도주 및 W자 반등 대장주만 선별 매수합니다."
+                    f"{market_status['reason']}. 체결강도 102% 이상 강력 주도주 및 W자 반등 대장주만 선별 매수합니다."
                 )
             else:
                 logger.info(f"🌐 [시장 지수 상태] {kospi_str} | {kosdaq_str} -> 정상 (전체 매수 탐색 진행)")
@@ -312,6 +324,12 @@ class BuyManager:
             # ── 0. 👑 [최우선 1순위] 15분봉 20/40/60 이평선 응축 + 3-5-20-40-60 정배열 수급 돌파 (전략 B) ──
             eval_squeeze = evaluate_15m_squeeze_alignment(code, name, df_15m, daily_df, params=self.params_squeeze) if (df_15m is not None and not df_15m.empty) else {'is_buy_signal': False}
 
+            # ── 0-B. 🚀 [우선 1.5순위] 5거래일 중 2회 거래량 130% 폭증 ➔ 수급봉 최고가 돌파 전략 ──
+            eval_5d2v = evaluate_5d2v_surge_breakout(code, name, daily_df, df_15m=df_15m) if (daily_df is not None and not daily_df.empty) else {'should_buy': False}
+
+            # ── 0-C. 🎯 [우선 1.6순위] 15분봉 피봇 돌파 + 20봉 평균 거래량 130% 돌파 전략 ──
+            eval_pivot = evaluate_pivot_breakout(df_15m, daily_df) if (df_15m is not None and not df_15m.empty and daily_df is not None and not daily_df.empty) else {'should_buy': False}
+
             # ── 1. [2순위] 15분봉 4대 수식 완성 전략 평가 ──
             eval_f4 = evaluate_4formula_buy(code, name, df_15m, current_price=None, params=self.params_f4) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
@@ -335,13 +353,22 @@ class BuyManager:
             supply_money_100m = latest_trade_val / 100_000_000.0  # 억원 단위
             supply_bonus = min(supply_money_100m / 10.0, 50.0)    # 500억 이상이면 +50점 상한
 
+            # ── [Step 2] 실시간 뉴스 모멘텀 점수 반영 및 긴급 악재(CB/횡령/유증) 차단 ──
+            news_info = self.news_agent.fetch_news_score(code, name) if self.news_agent else {'bonus': 0.0, 'is_emergency_block': False, 'score': 50, 'catalyst': '뉴스 미반영'}
+            if news_info.get('is_emergency_block'):
+                logger.warning(f"🚫 [{name}({code})] 치명적 악재(CB/횡령/유증 등) 뉴스 감지로 매수 차단: {news_info.get('catalyst')}")
+                continue
+            news_bonus = news_info.get('bonus', 0.0)
+            news_catalyst = news_info.get('catalyst', '')
+            news_score = news_info.get('score', 50)
+
             # 👑 1순위: 15분봉 이평 응축 + 정배열 수급 돌파 (전략 B) 최우선 채택
             if eval_squeeze.get('is_buy_signal'):
                 buy_price = eval_squeeze['current_price']
                 if buy_price > self.buy_amount:
                     continue
                 base_score = 400.0  # 👑 1순위 최고점 부여 (400점)
-                final_score = (base_score + supply_bonus) * weight
+                final_score = (base_score + supply_bonus + news_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
@@ -361,6 +388,76 @@ class BuyManager:
                     'is_w_rebound': False,
                     'base_score': base_score,
                     'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
+                    'final_score': final_score,
+                    'priority_score': final_score
+                })
+            # 👑 1.5순위: 5거래일 중 2회 거래량 130% 폭증 ➔ 수급봉 최고가 돌파 채택
+            elif eval_5d2v.get('should_buy'):
+                buy_price = eval_5d2v['price']
+                if buy_price > self.buy_amount:
+                    continue
+                base_score = 380.0
+                final_score = (base_score + supply_bonus + news_bonus) * weight
+                buy_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'state': state,
+                    'signals': {
+                        'buy': True,
+                        'close': eval_5d2v['price'],
+                        'target_price': eval_5d2v['price'],
+                        'reason': eval_5d2v['reason'],
+                        'll': eval_5d2v['price']
+                    },
+                    'df_30m': df_30m if df_30m is not None else df_15m,
+                    'weight': weight,
+                    'is_15m_squeeze': False,
+                    'is_5d2v_surge': True,
+                    'is_15m_4formula': False,
+                    'is_15m_turnaround': False,
+                    'is_w_rebound': False,
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
+                    'final_score': final_score,
+                    'priority_score': final_score
+                })
+            # 🎯 1.6순위: 15분봉 피봇 돌파 + 20봉 평균 거래량 130% 돌파 채택
+            elif eval_pivot.get('should_buy'):
+                buy_price = eval_pivot['current_price']
+                if buy_price > self.buy_amount:
+                    continue
+                base_score = 360.0
+                final_score = (base_score + supply_bonus + news_bonus) * weight
+                buy_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'state': state,
+                    'signals': {
+                        'buy': True,
+                        'close': eval_pivot['current_price'],
+                        'target_price': eval_pivot['target_price'],
+                        'reason': eval_pivot['reason'],
+                        'll': eval_pivot['current_price']
+                    },
+                    'df_30m': df_30m if df_30m is not None else df_15m,
+                    'weight': weight,
+                    'is_15m_squeeze': False,
+                    'is_5d2v_surge': False,
+                    'is_15m_pivot': True,
+                    'is_15m_4formula': False,
+                    'is_15m_turnaround': False,
+                    'is_w_rebound': False,
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
                     'final_score': final_score,
                     'priority_score': final_score
                 })
@@ -370,7 +467,7 @@ class BuyManager:
                 if buy_price > self.buy_amount:
                     continue
                 base_score = 300.0
-                final_score = (base_score + supply_bonus) * weight
+                final_score = (base_score + supply_bonus + news_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
@@ -389,6 +486,9 @@ class BuyManager:
                     'is_w_rebound': False,
                     'base_score': base_score,
                     'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
                     'final_score': final_score,
                     'priority_score': final_score
                 })
@@ -398,7 +498,7 @@ class BuyManager:
                 if buy_price > self.buy_amount:
                     continue
                 base_score = eval_15m['priority_score'] + 100.0
-                final_score = (base_score + supply_bonus) * weight
+                final_score = (base_score + supply_bonus + news_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
@@ -417,6 +517,9 @@ class BuyManager:
                     'is_w_rebound': False,
                     'base_score': base_score,
                     'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
                     'final_score': final_score,
                     'priority_score': final_score
                 })
@@ -426,7 +529,7 @@ class BuyManager:
                 if buy_price > self.buy_amount:
                     continue
                 base_score = eval_hh['priority_score']
-                final_score = (base_score + supply_bonus) * weight
+                final_score = (base_score + supply_bonus + news_bonus) * weight
                 buy_candidates.append({
                     'code': code,
                     'name': name,
@@ -445,6 +548,9 @@ class BuyManager:
                     'is_w_rebound': False,
                     'base_score': base_score,
                     'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
                     'final_score': final_score,
                     'priority_score': final_score
                 })
@@ -456,16 +562,8 @@ class BuyManager:
         if not buy_candidates:
             return
 
-        # ── 최우선 정렬 (통합 가중 점수: 전략 Base + 거래대금 수급 가산점 * 테마 가중치) ──
-        buy_candidates.sort(
-            key=lambda x: (
-                1 if x.get('is_15m_4formula') else 0,
-                1 if x.get('is_15m_turnaround') else 0,
-                1 if x.get('is_w_rebound') else 0,
-                x['final_score']
-            ),
-            reverse=True
-        )
+        # ── 최우선 정렬 (final_score 단일 기준: 전략별 Base 점수가 이미 우선순위를 반영) ──
+        buy_candidates.sort(key=lambda x: x['final_score'], reverse=True)
 
         # ── 정렬된 우선순위 순서대로 매수 집행 ──
         for candidate in buy_candidates:
@@ -473,9 +571,10 @@ class BuyManager:
                 logger.info(f"⚠️ 매수 진행 중 최대 보유 종목 수({self.max_positions}개) 도달. 잔여 후보 매수 중단.")
                 break
 
+            role_icon = "👑대장주" if candidate.get('weight', 1.0) >= 1.30 else ("🥈부대장주" if candidate.get('weight', 1.0) >= 1.10 else ("🥉후발주" if candidate.get('weight', 1.0) < 1.0 else "일반"))
             logger.info(
-                f"🏆 [최종 매수 선정 {candidate['name']}] 최종점수: {candidate['final_score']:.1f}점 "
-                f"(기본: {candidate['base_score']:.1f}점 + 수급보너스: +{candidate['supply_bonus']:.1f}점, 테마배율: {candidate['weight']}x)"
+                f"🏆 [최종 매수 선정 {candidate['name']} ({role_icon})] 최종점수: {candidate['final_score']:.1f}점 "
+                f"(기본: {candidate['base_score']:.1f}점 + 수급: +{candidate['supply_bonus']:.1f}점, 뉴스: {candidate.get('news_bonus', 0.0):+.1f}점[{candidate.get('news_catalyst', '')}], 테마배율: {candidate['weight']}x)"
             )
 
             code = candidate['code']
@@ -503,9 +602,9 @@ class BuyManager:
             except Exception:
                 pass
 
-            # 지수 급락 방어 모드일 때는 W자 반등 대장주이거나 체결강도 150% 이상인 종목만 예외 매수 허용
+            # 지수 급락 방어 모드일 때는 W자 반등 대장주이거나 체결강도 102% 이상인 종목만 예외 매수 허용
             if is_market_in_danger:
-                can_buy_in_danger = is_w or (is_strong and intensity_ratio >= 1.5)
+                can_buy_in_danger = is_w or (is_strong and intensity_ratio >= 1.02)
                 if not can_buy_in_danger:
                     logger.info(
                         f"⏸️ [{name}] 지수 급락 방어 중 - 체결강도({intensity_ratio * 100:.0f}%) 또는 W자 반등 기준 미달로 매수 보류"
@@ -517,7 +616,7 @@ class BuyManager:
                     )
 
             is_aggressive = False
-            if is_strong and intensity_ratio >= 1.5:
+            if is_strong and intensity_ratio >= 1.02:
                 price_limit = price_limit + tick
                 is_aggressive = True
                 logger.info(
@@ -615,17 +714,25 @@ class BuyManager:
             if df_15m is None or df_15m.empty or daily_df is None or len(daily_df) < 5:
                 return
 
-            is_naver_theme = self.theme_manager.has_hot_theme(code)
+            is_naver_theme = self.theme_manager.has_hot_theme(code) if self.theme_manager else True
             eval_master = evaluate_user_master_strategy(df_15m, df_30m, daily_df, is_naver_theme=is_naver_theme)
 
             if eval_master.get('should_buy'):
+                # [Step 2] 0.1초 스나이핑 전 긴급 악재 뉴스 검사
+                if self.news_agent:
+                    news_eval = self.news_agent.fetch_news_score(code, name)
+                    if news_eval.get('is_emergency_block'):
+                        logger.warning(f"🚫 [0.1초 스나이핑 차단] [{name}({code})] 긴급 악재 뉴스 감지: {news_eval.get('catalyst')}")
+                        return
+
                 buy_price = eval_master.get('limit_price', eval_master['price'])
                 tick = get_tick_size(int(buy_price))
                 price_limit = int((int(buy_price) // tick) * tick)
                 qty = self.buy_amount // price_limit
 
                 if qty > 0 and not state.is_holding:
-                    logger.info(f"⚡ [0.1초 편입 스나이핑] [{name}({code})] 편입 즉시 지정가 매수 전송! {eval_master['reason']}")
+                    role_tag = self.theme_manager.get_stock_role(code) if self.theme_manager else "NONE"
+                    logger.info(f"⚡ [0.1초 편입 스나이핑] [{name}({code}) | {role_tag}] 편입 즉시 지정가 매수 전송! {eval_master['reason']}")
                     async with self.api_lock:
                         order_no = await asyncio.to_thread(
                             self.client.place_buy_order, code, qty,
@@ -644,7 +751,7 @@ class BuyManager:
                         if self.db_logger:
                             self.db_logger.log_buy(
                                 code=code, name=name, buy_price=price_limit,
-                                buy_qty=qty, buy_reason=f"[0.1초 편입 스나이핑] {eval_master['reason']}"
+                                buy_qty=qty, buy_reason=f"[0.1초 편입 스나이핑 | {role_tag}] {eval_master['reason']}"
                             )
         except Exception as e:
             logger.warning(f"⚠️ evaluate_single_stock 에러 ({code}): {e}")
@@ -766,8 +873,11 @@ class TradingBot:
         self.auto_scanned_date = None  # 당일 20:00 자동 스캔 완료 일자 (중복 실행 방지)
         self.is_scanning = False
 
-        # ── 실시간 테마 관리자 생성 ──
+        # ── 실시간 테마 관리자 및 뉴스/장전 에이전트 생성 ──
         self.theme_manager = ThemeManager()
+        self.news_agent = RealtimeNewsAgent()
+        self.premarket_scanner = PremarketThemeScanner()
+        self.premarket_scanned_date = None
         self.last_theme_refresh_time = 0
 
         # ── 매니저 생성 ──
@@ -776,6 +886,8 @@ class TradingBot:
             self.trade_states, self.tracked_orders, self.watchlist,
             market_guard=self.market_guard,
             db_logger=self.db_logger,
+            theme_manager=self.theme_manager,
+            news_agent=self.news_agent,
             buy_amount=buy_amount, max_positions=max_positions
         ) if enable_buy else None
 
@@ -793,8 +905,12 @@ class TradingBot:
         if code not in self.watchlist:
             async with self.api_lock:
                 name = await asyncio.to_thread(self.client.get_stock_name, code)
-            self.watchlist[code] = {'name': name, 'weight': 1.0}
-            logger.info(f"✅ 관심종목 추가 완료: {name} ({code})")
+            
+            # 테마 매니저를 통해 대장주 가중치 및 역할 즉시 부여 (Step 1 연동)
+            weight = self.theme_manager.get_stock_weight(code) if self.theme_manager else 1.0
+            role = self.theme_manager.get_stock_role(code) if self.theme_manager else "NONE"
+            self.watchlist[code] = {'name': name, 'weight': weight, 'role': role}
+            logger.info(f"✅ 관심종목 추가 완료: {name} ({code}) [역할: {role}, 테마가중치: {weight}x]")
             self.save_watchlist()
 
             if code not in self.trade_states:
@@ -840,9 +956,25 @@ class TradingBot:
             logger.error(f"관심종목 저장 실패: {e}")
 
     def load_watchlist(self):
-        # 실시간 조건검색식(on_insert) 전용 운영: 어제 사전 관심종목 파일 로드 차단
+        today_picks_path = os.path.join(os.path.dirname(__file__), "today_picks.json")
+        today_str = datetime.now().strftime("%Y-%m-%d")
         self.watchlist.clear()
-        logger.info("📂 [실시간 조건검색식 전용] 사전 관심종목 파일(today_picks.json)을 로드하지 않고 장중 실시간 조건검색 편입 종목만 감시합니다.")
+        if os.path.exists(today_picks_path):
+            try:
+                mtime = os.path.getmtime(today_picks_path)
+                mdate = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+                if mdate == today_str:
+                    with open(today_picks_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    for c, info in data.items():
+                        self.watchlist[c] = info
+                        if c not in self.trade_states:
+                            self.trade_states[c] = TradeState()
+                    logger.info(f"📂 [당일 캡틴 주도주 로드] 오늘({today_str}) 장전 발굴된 {len(self.watchlist)}개 종목을 감시 리스트에 탑재했습니다.")
+                    return
+            except Exception as e:
+                logger.error(f"today_picks.json 로드 실패: {e}")
+        logger.info("📂 [실시간 조건검색식 전용] 당일 생성된 today_picks.json이 없어 실시간 조건검색 편입 종목을 대기합니다.")
 
     def load_states(self):
         self.load_watchlist()
@@ -871,21 +1003,28 @@ class TradingBot:
     # 장중 실시간 핫 테마 수집 및 가중치 동적 갱신
     # ─────────────────────────────────────────────────
     async def refresh_realtime_themes(self, force: bool = False):
-        """장중 실시간 핫 테마 수집 및 관심종목 가중치(Top1~3: 1.35x, Top4~10: 1.25x, Top11~30: 1.15x) 동적 갱신 (15분 주기)"""
+        """장중 실시간 핫 테마 수집 및 관심종목 가중치(Top1~3 대장주: 1.40x, 부대장: 1.20x, 후발주: 0.85x) 동적 갱신 (15분 주기)"""
         now = time.time()
         if not force and (now - self.last_theme_refresh_time < 900):  # 15분(900초) 주기
             return
 
         try:
-            logger.info("🔄 [장중 실시간 테마 갱신] 네이버증권 실시간 핫 테마 순위 재수집 중...")
+            logger.info("🔄 [장중 실시간 테마 갱신] 네이버증권 실시간 핫 테마 및 대장주 재수집 중...")
             await asyncio.to_thread(self.theme_manager.load_top_themes, 30)
             self.last_theme_refresh_time = now
 
-            # 관심종목 리스트 내 종목 가중치 즉시 동적 반영
+            # 상위 3개 테마 및 대장주 요약 로깅
+            top3 = self.theme_manager.get_top_themes_summary()[:3]
+            for t in top3:
+                logger.info(f"   🔥 [주도 테마 {t['rank']}위] {t['name']} (+{t['change_rate']}%) | 👑대장주: {t['leader_name']}({t['leader_code']})")
+
+            # 관심종목 리스트 내 종목 가중치 및 역할 즉시 동적 반영
             updated_count = 0
             for code, info in self.watchlist.items():
                 if isinstance(info, dict):
                     new_w = self.theme_manager.get_stock_weight(code)
+                    new_role = self.theme_manager.get_stock_role(code)
+                    info['role'] = new_role
                     if info.get('weight') != new_w:
                         info['weight'] = new_w
                         updated_count += 1
@@ -1026,8 +1165,19 @@ class TradingBot:
 
         is_active_session = (is_pre_session or is_regular_session or is_post_session)
 
+        # ── [Step 3] 08:30~08:55 장전 주도 테마 및 캡틴 대장주 자동 스캔 & 워치리스트 동기화 ──
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if dtime(8, 30, 0) <= now_time < dtime(8, 55, 0) and self.premarket_scanned_date != today_str:
+            logger.info("🌅 [08:35 장전 자동화] 오늘의 주도 테마 및 캡틴 대장주 자동 발굴을 시작합니다...")
+            try:
+                await asyncio.to_thread(self.premarket_scanner.run_premarket_scan, 3, True)
+                self.premarket_scanned_date = today_str
+                self.load_watchlist()
+                logger.info(f"✅ [08:35 장전 자동화] 당일 캡틴 주도주 워치리스트 탑재 완료! ({len(self.watchlist)}개 종목)")
+            except Exception as e:
+                logger.error(f"⚠️ 장전 테마 스캔 중 예외 발생: {e}")
+
         if not is_active_session:
-            today_str = datetime.now().strftime("%Y-%m-%d")
 
             # [사용자 요청] 장후 관심종목 자동 스캔 및 어제 관심종목 사전 장전 기능은 전면 비활성화되었습니다.
             # 봇은 장중 키움 실시간 조건검색식(on_insert) 편입 종목만 100% 실시간 감시/매수합니다.

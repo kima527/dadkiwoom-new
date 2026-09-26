@@ -769,3 +769,92 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame = None, dail
         result['reason'] = " | ".join(reasons)
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# 15분봉 피봇 돌파 및 20봉 평균 거래량 130% 돌파 전략
+# ═══════════════════════════════════════════════════════════════
+def evaluate_pivot_breakout(df_15m: pd.DataFrame, daily_df: pd.DataFrame) -> dict:
+    """
+    15분봉 피봇 돌파 매수 전략 평가
+    - 목표가 공식: (dayopen - predayclose) + (predayhigh + predaylow + predayclose) / 3
+    - 돌파 조건: 15분봉 종가(현재가) > 목표가
+    - 거래량 조건: 15분봉 직전 20봉 평균 거래량 대비 130% 이상 (현재봉 제외)
+    - 양봉 조건: 현재봉 Close > Open (양봉)
+    - 과열 방지: 단일 15분봉 등락률 7.0% 이하 (추격 과열 금지)
+    """
+    res = {
+        'should_buy': False,
+        'target_price': 0.0,
+        'current_price': 0.0,
+        'vol_ratio': 0.0,
+        'reason': '',
+        'priority_score': 0.0
+    }
+
+    if df_15m is None or df_15m.empty or len(df_15m) < 21:
+        return res
+    if daily_df is None or daily_df.empty or len(daily_df) < 2:
+        return res
+
+    try:
+        df15 = df_15m.copy()
+        df15.rename(columns={col: col.lower() for col in df15.columns}, inplace=True)
+        ddf = daily_df.copy()
+        ddf.rename(columns={col: col.lower() for col in ddf.columns}, inplace=True)
+
+        # 전일 고가, 저가, 종가 및 당일 시가 구하기
+        preday = ddf.iloc[-2]
+        preday_high = float(preday['high'])
+        preday_low = float(preday['low'])
+        preday_close = float(preday['close'])
+
+        today_daily = ddf.iloc[-1]
+        day_open = float(today_daily['open'])
+
+        # 피봇 포인트 및 목표가 계산
+        pivot = (preday_high + preday_low + preday_close) / 3.0
+        target_price = (day_open - preday_close) + pivot
+
+        # 15분봉 최신봉 상태
+        curr_bar = df15.iloc[-1]
+        curr_close = float(curr_bar['close'])
+        curr_open = float(curr_bar['open'])
+        curr_vol = float(curr_bar['volume'])
+
+        # [양봉 필터] 음봉 돌파봉은 제외 (수급 이탈 우려)
+        if curr_close <= curr_open:
+            return res
+
+        # [과열 방지] 단일 15분봉 등락률 7.0% 초과 시 추격 매수 금지
+        bar_gain_pct = ((curr_close - curr_open) / curr_open) * 100.0
+        if bar_gain_pct > 7.0:
+            return res
+
+        # 직전 20개 15분봉 평균 거래량 (현재봉 제외 - 현재봉 포함 시 폭증 거래량이 평균 왜곡)
+        prev_20_vol = df15['volume'].iloc[-21:-1]
+        vol_20_avg = prev_20_vol.mean()
+        if vol_20_avg <= 0:
+            return res
+
+        vol_ratio = (curr_vol / vol_20_avg) * 100.0
+
+        is_breakout = curr_close > target_price
+        is_vol_surge = curr_vol >= (vol_20_avg * 1.30)
+
+        if is_breakout and is_vol_surge:
+            res['should_buy'] = True
+            res['target_price'] = target_price
+            res['current_price'] = curr_close
+            res['vol_ratio'] = vol_ratio
+            res['priority_score'] = 350.0  # 고득점 매수 권한 부여
+            res['reason'] = (
+                f"🎯 [15분봉 피봇 돌파] 현재가({curr_close:,.0f}원) > "
+                f"피봇목표가({target_price:,.0f}원) | 15분봉 거래량({curr_vol:,.0f}주, "
+                f"직전20봉평균 대비 {vol_ratio:.1f}% >= 130%) | 양봉+{bar_gain_pct:.1f}%"
+            )
+    except Exception as e:
+        logger.warning(f"15분봉 피봇 돌파 평가 중 예외 발생: {e}")
+
+    return res
+

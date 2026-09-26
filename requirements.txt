@@ -8,3 +8,12 @@ schedule
 pandas-ta
 flask
 google-generativeai
+colorama==0.4.6
+decorator==5.3.1
+ImageIO==2.37.4
+imageio-ffmpeg==0.6.0
+moviepy==2.2.1
+opencv-python==5.0.0.93
+pillow==11.3.0
+proglog==0.1.12
+tqdm==4.70.1

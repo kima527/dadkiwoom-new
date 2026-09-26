@@ -131,8 +131,11 @@
     },
     "356680": {
         "name": "엑스게이트",
-        "weight": 1.0,
-        "source": "500pick.csv"
+        "weight": 1.4,
+        "theme": "양자암호/양자컴퓨팅",
+        "role": "LEADER",
+        "catalyst": "📰[NLP] 일반 시황/중립",
+        "source": "premarket_scanner"
     },
     "476060": {
         "name": "온코닉테라퓨틱스",
@@ -258,5 +261,37 @@
         "name": "흥아해운",
         "weight": 1.0,
         "source": "500pick.csv"
+    },
+    "0010S0": {
+        "name": "와이즈플래닛컴퍼니",
+        "weight": 1.4,
+        "theme": "2026 하반기 신규상장",
+        "role": "LEADER",
+        "catalyst": "⚪ 최근 뉴스 없음 (중립)",
+        "source": "premarket_scanner"
+    },
+    "0161M0": {
+        "name": "네오사피엔스",
+        "weight": 1.2,
+        "theme": "2026 하반기 신규상장",
+        "role": "SECOND",
+        "catalyst": "⚪ 최근 뉴스 없음 (중립)",
+        "source": "premarket_scanner"
+    },
+    "0039P0": {
+        "name": "매드업",
+        "weight": 1.2,
+        "theme": "광고",
+        "role": "SECOND",
+        "catalyst": "📰[NLP] ✨돌파",
+        "source": "premarket_scanner"
+    },
+    "046970": {
+        "name": "우리로",
+        "weight": 1.2,
+        "theme": "양자암호/양자컴퓨팅",
+        "role": "SECOND",
+        "catalyst": "📰[NLP] 일반 시황/중립",
+        "source": "premarket_scanner"
     }
 }
