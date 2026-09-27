@@ -34,7 +34,7 @@ class Turnaround15mParams:
     body_to_upper_tail_ratio: float = 1.2 # 양봉 몸통 > 윗꼬리 * 1.2
     supply_surge_multiplier: float = 3.0  # 직전 2개봉 평균 대비 수급 폭증 배수 (3배)
     supply_ma20_multiplier: float = 5.0   # 20봉 평균 수급 대비 폭증 배수 (5배: A >= AvgA * 5)
-    max_bar_gain_pct: float = 7.5         # 단일 15분봉 종가 상승률 상한선 (7.5% 초과 과열 급등봉 추격 금지)
+    max_bar_gain_pct: float = 2.5         # 단일 15분봉 종가 상승률 상한선 (2.5% 초과 과열 급등봉 추격 금지, 돌파 찰나 포착)
     max_spread_pct: float = 8.0           # 단일 15분봉 (고가-저가) 변동 편차 상한선 (8.0% 초과 롤러코스터 휩소봉 배제)
 
     # [수식 1, 3: 이평 기간]
@@ -474,36 +474,43 @@ def evaluate_15m_entry(
         }
         return result
 
-    # 진입 타점 및 우선순위 스코어 결정
+    # 진입 타점 및 우선순위 스코어 결정 (사용자 3순위: 340점)
     reasons = []
-    priority_score = 100.0
+    base_priority = 340.0
     combo_type = ""
     limit_price = curr_p
 
     if is_c34:
         combo_type = "Combo_3_4 (일봉20억수급 + 15분봉 3일선변곡)"
         reasons.append(f"일봉20억수급({latest['day_supply_money']:.1f}억)/15분봉수급폭발({latest['m15_money']:.1f}억) + 15분봉 3일선U턴")
-        priority_score += 150.0
-        limit_price = curr_p
+        limit_price = float(latest['m15_sma3']) if latest['m15_sma3'] > 0 else curr_p
 
     elif is_c23:
         combo_type = "Combo_2_3 (일봉 3-20 골든크로스 + 15분봉 3일선변곡)"
         reasons.append("일봉 3-20 골든크로스 + 15분봉 3일선U턴")
-        priority_score += 120.0
         limit_price = float(latest['d_sma20_val']) if latest['d_sma20_val'] > 0 else curr_p
 
     elif is_c13:
         combo_type = "Combo_1_3 (3일+5일 더블변곡 + 황룡선)"
         reasons.append("일봉 3일/5일 동시 U턴 변곡 + TEMA황룡선")
-        priority_score += 100.0
         limit_price = float(latest['d_sma3_val']) if latest['d_sma3_val'] > 0 else curr_p
+
+    # [핵심] 돌파하는 그 찰나(Golden Moment: 기준선 대비 -0.2% ~ +0.8% 이내) 스나이핑
+    disp = ((curr_p - limit_price) / limit_price * 100.0) if limit_price > 0 else 0.0
+    if limit_price > 0 and (curr_p < limit_price * 0.998 or curr_p > limit_price * 1.008):
+        if curr_p > limit_price * 1.008:
+            result["reason"] = f"⏭️ [돌파 찰나 경과] 기준선({limit_price:,.0f}원) 대비 이미 +{disp:.2f}% 급등하여 돌파 찰나 경과 (+0.8% 초과) ➔ 상투 추격 매수 방지"
+        else:
+            result["reason"] = f"기준선({limit_price:,.0f}원) 돌파 대기 (현재가: {curr_p:,.0f}원, 이격: {disp:+.2f}%)"
+        return result
 
     result.update({
         "should_buy": True,
         "combo_type": combo_type,
         "limit_price": round(limit_price, 0),
-        "priority_score": priority_score,
-        "reason": " / ".join(reasons),
+        "target_price": round(limit_price, 0),
+        "priority_score": base_priority,  # 👑 3순위 (340점)
+        "reason": f"⚡ [15분봉 수급변곡 ➔ 돌파 찰나 스나이핑] " + " / ".join(reasons) + f" (기준선:{limit_price:,.0f}원, 현재가:{curr_p:,.0f}원, 이격:{disp:+.2f}%)",
         "details": {
             "day_supply_money_억": round(float(latest.get('day_supply_money', 0)), 2),
             "m15_money_억": round(float(latest.get('m15_money', 0)), 2),

@@ -300,6 +300,7 @@ def calculate_realtime_day_smas(df_30m: pd.DataFrame, daily_df: pd.DataFrame) ->
         df_d['dt'] = pd.date_range(end=pd.Timestamp.today().date(), periods=len(df_d)).date
 
     df_d.sort_values('dt', inplace=True)
+    df_d.drop_duplicates(subset=['dt'], keep='last', inplace=True)
 
     df_d['c_d1'] = df_d['close'].shift(1)  # npredayclose(1)
     df_d['c_d2'] = df_d['close'].shift(2)  # npredayclose(2)
@@ -378,9 +379,9 @@ def detect_w_rebound_30m(df30: pd.DataFrame, lookback: int = 200) -> tuple[bool,
     curr_sma = sma260s[-1]
 
     # [핵심 1] 기준선 이격도 엄격 제한:
-    # W자 패턴 완성 타점은 260이평선(기준선) 바로 위/근처(+0.0% ~ +3.5% 이내)여야 함!
-    # 이미 260선에서 +10%, +20% 폭등해 있는 고점 종목(예: 성광벤드)은 원천 탈락!
-    if curr_c < curr_sma * 0.995 or curr_c > curr_sma * 1.035:
+    # W자 패턴 완성 타점은 260이평선(기준선) 바로 위/근처(-0.2% ~ +1.0% 이내 돌파 찰나)여야 함!
+    # 이미 260선에서 +1.0%를 초과하여 급등한 종목은 상투 추격 매수 방지를 위해 탈락!
+    if curr_c < curr_sma * 0.998 or curr_c > curr_sma * 1.010:
         return empty_res
 
     # [핵심 2] 당일/최근 260선 기준선 상향 돌파 또는 지지 반등 확인
@@ -589,7 +590,7 @@ def analyze_buy_signals(df_30m: pd.DataFrame, df_120t: pd.DataFrame = None, dail
     if is_w_rebound:
         result['is_w_rebound'] = True
         result['w_info'] = w_info
-        result['priority_score'] = max(result['priority_score'], 100.0 + min(w_info.get('rebound_pct', 0.0), 20.0))
+        result['priority_score'] = max(result['priority_score'], 330.0)  # W자 반등 260선 돌파 찰나 330점 부여
 
     is_daily_condition_met = False
     daily_reason = ""
@@ -812,47 +813,60 @@ def evaluate_pivot_breakout(df_15m: pd.DataFrame, daily_df: pd.DataFrame) -> dic
         today_daily = ddf.iloc[-1]
         day_open = float(today_daily['open'])
 
-        # 피봇 포인트 및 목표가 계산
+        # 피봇 포인트 및 1차 저항선 계산
         pivot = (preday_high + preday_low + preday_close) / 3.0
-        target_price = (day_open - preday_close) + pivot
+        pivot_r1 = (2.0 * pivot) - preday_low  # 피봇 1차 저항선
+        target_price = pivot                     # 매수 목표가 = 피봇 기준선 가격 자체!
 
         # 15분봉 최신봉 상태
         curr_bar = df15.iloc[-1]
         curr_close = float(curr_bar['close'])
         curr_open = float(curr_bar['open'])
+        curr_low = float(curr_bar['low'])
         curr_vol = float(curr_bar['volume'])
 
+        # [조건 1: 피봇 1차 저항선 아래 위치]
+        # 차트 원칙: 피봇 1차 저항선 아래 구간에 있어야 상투 저항에 부딪히지 않음
+        is_below_r1 = curr_close < pivot_r1
+
+        # [조건 2: 피봇 기준선 돌파 그 찰나 포착 (Golden Breakout Moment: -0.2% ~ +0.8% 이내)]
+        # 기준선(피봇선)을 막 돌파하는 바로 그 찰나에만 진입하며, +0.8% 초과 시 이미 날아간 상투이므로 원천 차단!
+        disp_from_pivot = ((curr_close - pivot) / pivot) * 100.0
+        is_breakout_moment = (pivot * 0.998 <= curr_close <= pivot * 1.008)
+
         # [양봉 필터] 음봉 돌파봉은 제외 (수급 이탈 우려)
-        if curr_close <= curr_open:
+        if curr_close < curr_open:
             return res
 
-        # [과열 방지] 단일 15분봉 등락률 7.0% 초과 시 추격 매수 금지
+        # [과열 방지] 단일 15분봉 등락률 4.0% 초과 시 추격 매수 금지
         bar_gain_pct = ((curr_close - curr_open) / curr_open) * 100.0
-        if bar_gain_pct > 7.0:
+        if bar_gain_pct > 4.0:
             return res
 
-        # 직전 20개 15분봉 평균 거래량 (현재봉 제외 - 현재봉 포함 시 폭증 거래량이 평균 왜곡)
+        # 직전 20개 15분봉 평균 거래량 (현재봉 제외)
         prev_20_vol = df15['volume'].iloc[-21:-1]
         vol_20_avg = prev_20_vol.mean()
         if vol_20_avg <= 0:
             return res
 
         vol_ratio = (curr_vol / vol_20_avg) * 100.0
-
-        is_breakout = curr_close > target_price
         is_vol_surge = curr_vol >= (vol_20_avg * 1.30)
 
-        if is_breakout and is_vol_surge:
+        if is_below_r1 and is_breakout_moment and is_vol_surge:
             res['should_buy'] = True
-            res['target_price'] = target_price
+            res['target_price'] = pivot          # 피봇 기준선 지정가 매수!
             res['current_price'] = curr_close
+            res['pivot'] = pivot
+            res['pivot_r1'] = pivot_r1
             res['vol_ratio'] = vol_ratio
-            res['priority_score'] = 350.0  # 고득점 매수 권한 부여
+            res['priority_score'] = 360.0        # 👑 1.6순위 (360점) 피봇 돌파 찰나 스나이핑
             res['reason'] = (
-                f"🎯 [15분봉 피봇 돌파] 현재가({curr_close:,.0f}원) > "
-                f"피봇목표가({target_price:,.0f}원) | 15분봉 거래량({curr_vol:,.0f}주, "
-                f"직전20봉평균 대비 {vol_ratio:.1f}% >= 130%) | 양봉+{bar_gain_pct:.1f}%"
+                f"⚡ [피봇 돌파 찰나 스나이핑] 피봇 1차 저항({pivot_r1:,.0f}원) 아래 피봇 기준선({pivot:,.0f}원) "
+                f"돌파 찰나 포착 (현재가: {curr_close:,.0f}원, 돌파 이격: {disp_from_pivot:+.2f}%) ➔ "
+                f"피봇 기준선({pivot:,.0f}원) 지정가 매수 | 거래량 {vol_ratio:.0f}% 달성"
             )
+        elif is_below_r1 and (curr_close > pivot * 1.008):
+            logger.debug(f"⏭️ 피봇 기준선 대비 이미 +{disp_from_pivot:.2f}% 급등하여 돌파 찰나 경과 (+0.8% 초과) ➔ 상투 추격 매수 방지")
     except Exception as e:
         logger.warning(f"15분봉 피봇 돌파 평가 중 예외 발생: {e}")
 

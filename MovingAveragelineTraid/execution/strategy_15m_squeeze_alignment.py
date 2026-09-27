@@ -37,7 +37,7 @@ class SqueezeAlignmentParams:
     min_supply_money_15m: float = 15.0    # 15분봉 돌파봉 최소 거래대금 (15억원 이상)
     supply_surge_multiplier: float = 3.0  # 직전 2봉 평균 대비 수급 폭증 배수 (3배)
     supply_ma20_multiplier: float = 5.0   # 20봉 평균 대비 수급 폭증 배수 (5배: A >= AvgA * 5)
-    max_bar_gain_pct: float = 4.5         # 단일 15분봉 종가 상승률 상한선 (4.5% 초과 과열 추격 금지)
+    max_bar_gain_pct: float = 2.5         # 단일 15분봉 종가 상승률 상한선 (2.5% 초과 과열 추격 금지, 돌파 찰나 포착)
     max_daily_gain_pct: float = 20.0      # 당일 등락률 상한선 (20% 초과 late-afternoon 과열주 방지)
     min_body_ratio: float = 1.0           # 양봉 몸통 / 윗꼬리 비율 (최소 1.0배 이상)
     min_bars_15m: int = 135               # 130이평 계산을 위한 최소 요구 15분봉 데이터 개수
@@ -61,7 +61,7 @@ def calculate_15m_squeeze_indicators(df_15m: pd.DataFrame) -> pd.DataFrame:
     df['ma40'] = close.rolling(40, min_periods=40).mean()
     df['ma60'] = close.rolling(60, min_periods=60).mean()
     df['ma130'] = close.rolling(130, min_periods=130).mean()
-    df['ma260'] = close.rolling(260, min_periods=20).mean()
+    df['ma260'] = close.rolling(260, min_periods=130).mean()
 
     # 15분봉 거래대금 (억원 단위)
     df['m15_money'] = (close * volume) / 100_000_000.0
@@ -197,12 +197,32 @@ def evaluate_15m_squeeze_alignment(
         res["reason"] = f"당일 과열 종목 추격 배제 ({res['daily_gain_pct']:.2f}% > {params.max_daily_gain_pct}%)"
         return res
 
-    # 5. 모든 조건 100% 충족 -> 최종 매수 신호 발화
+    # 5. [핵심] 돌파하는 그 찰나(Golden Moment) 스나이핑
+    # 응축된 이평선 군(20, 40, 60, 130)의 최상단선을 막 돌파하는 찰나(이격도 -0.2% ~ +0.8% 이내)만 허용!
+    # 이미 +0.8%를 초과하여 급등한 종목은 상투 추격 매수 방지를 위해 원천 차단!
+    curr_c = float(curr['close'])
+    max_ma = max(float(curr['ma20']), float(curr['ma40']), float(curr['ma60']), float(curr['ma130']))
+    disp_pct = ((curr_c - max_ma) / max_ma) * 100.0
+    is_breakout_moment = (max_ma * 0.998 <= curr_c <= max_ma * 1.008)
+
+    if not is_breakout_moment:
+        if curr_c > max_ma * 1.008:
+            res["reason"] = (
+                f"⏭️ [돌파 찰나 경과] 응축 상단선({max_ma:,.0f}원) 대비 이미 +{disp_pct:.2f}% 급등하여 돌파 찰나 경과 (+0.8% 초과) ➔ 상투 추격 매수 방지"
+            )
+        else:
+            res["reason"] = f"응축 상단선({max_ma:,.0f}원) 돌파 대기 (현재가: {curr_c:,.0f}원, 이격: {disp_pct:+.2f}%)"
+        return res
+
+    # 6. 모든 조건 100% 충족 -> 👑 1순위 (380점) 매수 신호 발화
     res["is_buy_signal"] = True
+    res["target_price"] = max_ma  # 응축 상단 이평선 지정가 매수!
+    res["priority_score"] = 380.0
     res["reason"] = (
-        f"🎯 [수급 130이평 응축 정배열 돌파 완료] "
-        f"응축도={recent_squeeze_series.min():.2f}%, 3-5-20-40-60-130 정배열, "
-        f"15분 수급={curr_money:.2f}억원(20봉평균 대비 {curr_money/avg_20:.1f}배)"
+        f"⚡ [15분봉 이평 응축 정배열 ➔ 돌파 찰나 스나이핑] "
+        f"응축도={recent_squeeze_series.min():.2f}%, 3-5-20-40-60-130 정배열 찰나 포착 "
+        f"(응축상단: {max_ma:,.0f}원, 현재가: {curr_c:,.0f}원, 이격: {disp_pct:+.2f}%) ➔ "
+        f"상단선({max_ma:,.0f}원) 지정가 매수 | 15분 수급={curr_money:.2f}억"
     )
     res["details"] = {
         "ma3": float(curr['ma3']),
@@ -211,6 +231,7 @@ def evaluate_15m_squeeze_alignment(
         "ma40": float(curr['ma40']),
         "ma60": float(curr['ma60']),
         "ma130": float(curr['ma130']),
+        "max_ma": max_ma,
         "squeeze_pct_min": float(recent_squeeze_series.min()),
         "money_multiplier_20": float(curr_money / avg_20) if avg_20 > 0 else 0.0
     }

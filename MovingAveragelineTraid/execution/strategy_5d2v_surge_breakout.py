@@ -87,20 +87,31 @@ def evaluate_5d2v_surge_breakout(
     # 현재가 판별
     curr_p = float(current_price) if current_price and current_price > 0 else float(df[close_col].iloc[-1])
     res["price"] = curr_p
+    res["target_price"] = surge_high
 
-    # 돌파 조건 검증: 현재가가 수급 폭증 봉 최고가(Surge_High)를 상향 돌파
-    if curr_p > surge_high:
-        priority_score = 380.0  # 강력 수급 돌파 패턴 고점수 부여
+    # [핵심] 돌파하는 그 찰나(Golden Moment: 수급봉 최고가 대비 -0.2% ~ +0.8% 이내) 스나이핑
+    # 이미 +0.8%를 초과하여 급등한 종목은 상투 추격 매수 방지를 위해 원천 차단!
+    disp_pct = ((curr_p - surge_high) / surge_high) * 100.0
+    is_breakout_moment = (surge_high * 0.998 <= curr_p <= surge_high * 1.008)
+
+    if is_breakout_moment:
+        priority_score = 370.0  # 👑 1.5순위 (370점)
         res["should_buy"] = True
         res["priority_score"] = priority_score
+        res["target_price"] = surge_high  # 수급봉 최고가 지정가 매수!
         res["reason"] = (
-            f"🔥 [5일 내 130% 수급 2회 폭증 돌파] 5일간 폭증 {surge_count}회 발생! "
-            f"수급봉 최고가({surge_high:,.0f}원) 돌파 (현재가: {curr_p:,.0f}원)"
+            f"⚡ [5일 내 수급 2회 폭증 ➔ 돌파 찰나 스나이핑] 5일간 폭증 {surge_count}회 발생! "
+            f"수급봉 최고가({surge_high:,.0f}원) 돌파 찰나 포착 (현재가: {curr_p:,.0f}원, 이격: {disp_pct:+.2f}%) ➔ "
+            f"수급봉 최고가({surge_high:,.0f}원) 지정가 매수"
+        )
+    elif curr_p > surge_high * 1.008:
+        res["reason"] = (
+            f"⏭️ [돌파 찰나 경과] 수급봉 최고가({surge_high:,.0f}원) 대비 이미 +{disp_pct:.2f}% 급등하여 돌파 찰나 경과 (+0.8% 초과) ➔ 상투 추격 매수 방지"
         )
     else:
         res["reason"] = (
             f"👀 [수급 폭증후 돌파 대기] 5일간 130% 폭증 {surge_count}회 완료! "
-            f"수급봉 최고가({surge_high:,.0f}원) 미돌파 (현재가: {curr_p:,.0f}원)"
+            f"수급봉 최고가({surge_high:,.0f}원) 미돌파 (현재가: {curr_p:,.0f}원, 이격: {disp_pct:+.2f}%)"
         )
 
     return res

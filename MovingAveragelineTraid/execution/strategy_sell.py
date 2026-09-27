@@ -104,15 +104,43 @@ def analyze_sell_signals(
     wma5_now = float(latest['wma5']) if pd.notna(latest['wma5']) else 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # [1단계] 수익 +4.0% 이상 달성 시 단계별 마지노선 익절 보존 스탑로스 (Step Trailing Lock)
+    # [1단계] 수익구간 방어: 다이나믹 트레일링 스탑 & 본전 보존 스탑 (Dynamic Profit Lock)
     # ─────────────────────────────────────────────────────────────
     max_price = max(touch_high, curr_p)
     max_profit_pct = ((max_price - buy_price) / buy_price * 100.0) if buy_price > 0 else profit_pct
 
-    if max_profit_pct >= 4.0:
-        # 수익률이 +4% 이상 올라서면 1.0% 딱 뒤따라가며 익절 스탑로스 설정 (+5% ➔ +4% 스탑, +6% ➔ +5% 스탑, +7% ➔ +6% 스탑, +8% ➔ +7% 스탑)
-        floor_profit_pct = max_profit_pct - 1.0
-        step_label = f"+{max_profit_pct:.1f}% 도달 ➔ +{floor_profit_pct:.1f}% 마지노선 스탑"
+    # 1-1. [본전 보존 스탑 (Break-Even Stop)]
+    # 장중 최고 수익률 +1.0% 이상 달성 후 주가가 밀려 본전(+0.2% 수수료 보전)까지 내려오면 원금 보존 즉시 청산!
+    if max_profit_pct >= 1.0 and profit_pct <= 0.2:
+        return {
+            "sell": True,
+            "close": curr_p,
+            "buy_price": buy_price,
+            "profit_pct": profit_pct,
+            "m_resistance": 0.0,
+            "wma3": wma3_now,
+            "wma5": wma5_now,
+            "sma5": wma3_now,
+            "sma20": wma5_now,
+            "sma40": 0.0,
+            "reason": (
+                f"🛡️ [본전 보존 스탑 가동] 최고 수익률(+{max_profit_pct:.2f}%) 도달 후 본전(+0.2%) 회귀 "
+                f"➔ 원금 100% 보존 즉시 매도 (현재 손익률: {profit_pct:+.2f}%)"
+            ),
+            "exit_type": "BREAK_EVEN_STOP"
+        }
+
+    # 1-2. [다이나믹 트레일링 익절 (Trailing Stop)]
+    # +1.5% 이상 수익 도달 시: 고점 대비 0.5% 하락 시 익절 락인 (+1.5% ➔ +1.0% 스탑)
+    # +2.5% 이상 수익 도달 시: 고점 대비 0.8% 하락 시 익절 락인 (+2.5% ➔ +1.7% 스탑)
+    # +4.0% 이상 수익 도달 시: 고점 대비 1.0% 하락 시 익절 락인 (+4.0% ➔ +3.0% 스탑)
+    if max_profit_pct >= 1.5:
+        if max_profit_pct >= 4.0:
+            floor_profit_pct = max_profit_pct - 1.0
+        elif max_profit_pct >= 2.5:
+            floor_profit_pct = max_profit_pct - 0.8
+        else:
+            floor_profit_pct = max_profit_pct - 0.5
 
         if profit_pct < floor_profit_pct:
             return {
@@ -127,8 +155,8 @@ def analyze_sell_signals(
                 "sma20": wma5_now,
                 "sma40": 0.0,
                 "reason": (
-                    f"🛡️ [단계별 익절 보존 스탑로스 가동] {step_label} 이탈! "
-                    f"최고 수익률(+{max_profit_pct:.2f}%) 대비 현재 수익률({profit_pct:+.2f}%)이 마지노선(+{floor_profit_pct:.1f}%) 하회 ➔ 익절 확정"
+                    f"🎯 [다이나믹 트레일링 익절 가동] 최고 수익률(+{max_profit_pct:.2f}%) 대비 "
+                    f"마지노선(+{floor_profit_pct:.2f}%) 하향 이탈 ➔ 수익 확정 시장가 매도 (실현: {profit_pct:+.2f}%)"
                 ),
                 "exit_type": "STEP_TRAILING_STOP"
             }

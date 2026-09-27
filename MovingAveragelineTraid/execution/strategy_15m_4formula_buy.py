@@ -37,7 +37,7 @@ class Formula4Params:
     body_tail_ratio: float = 1.2          # 캔들 몸통 / 윗꼬리 비율 (기본 1.2배 이상)
     supply_surge_multiplier: float = 3.0  # 직전 2개봉 평균 수급 대비 폭증 배수 (기본 3.0배)
     supply_ma20_multiplier: float = 5.0   # 20봉 평균 수급 대비 폭증 배수 (5배: A >= AvgA * 5)
-    max_bar_gain_pct: float = 7.5         # 단일 15분봉 종가 상승률 상한선 (7.5% 초과 과열 급등봉 추격 금지)
+    max_bar_gain_pct: float = 2.5         # 단일 15분봉 종가 상승률 상한선 (2.5% 초과 과열 급등봉 추격 금지, 돌파 찰나 포착)
     max_spread_pct: float = 8.0           # 단일 15분봉 (고가-저가) 변동 편차 상한선 (8.0% 초과 롤러코스터 휩소봉 배제)
     sma_fast: int = 1                     # 단기 이평 (1 = 종가)
     sma_mid: int = 20                     # 중기 이평 (20)
@@ -184,11 +184,12 @@ def analyze_15m_4formulas(
 
     # ─────────────────────────────────────────────────────────────
     # [수식 4] 1-20-60 첫 정배열 완성 & M선 상향 돌파 (CrossUp(a, M))
-    # A오늘 && !A어제 && crossup(a, M)
+    # 돌파 찰나(Golden Moment): M선 대비 -0.2% ~ +0.8% 이내에서만 발화!
     # ─────────────────────────────────────────────────────────────
     # a = ma(C, 1) = close
     crossup_a_m = (df['ma1'].shift(1) <= df['m_line'].shift(1)) & (df['ma1'] > df['m_line'])
-    df['cond_4_align_and_m_breakout'] = df['cond_3_align_first_bar'] & crossup_a_m
+    m_breakout_moment = (df['ma1'] >= df['m_line'] * 0.998) & (df['ma1'] <= df['m_line'] * 1.008)
+    df['cond_4_align_and_m_breakout'] = df['cond_3_align_first_bar'] & crossup_a_m & m_breakout_moment
 
     # ═════════════════════════════════════════════════════════════
     # 🎯 최종 4가지 수식 '동시 완성' 매수 시그널
@@ -218,6 +219,8 @@ def evaluate_4formula_buy(
         "name": name,
         "should_buy": False,
         "price": 0.0,
+        "target_price": 0.0,
+        "priority_score": 0.0,
         "reason": "",
         "details": {}
     }
@@ -229,12 +232,15 @@ def evaluate_4formula_buy(
 
     latest = df_res.iloc[-1]
     curr_p = float(current_price) if current_price and current_price > 0 else float(latest['close'])
+    m_val = float(latest['m_line']) if pd.notna(latest['m_line']) else 0.0
 
     c1 = bool(latest['cond_1_supply_candle'])
     c2 = bool(latest['cond_2_hwang_ryong_supply'])
     c3 = bool(latest['cond_3_align_first_bar'])
     c4 = bool(latest['cond_4_align_and_m_breakout'])
     is_buy = bool(latest['buy_signal_all_4'])
+
+    disp_from_m = ((curr_p - m_val) / m_val * 100.0) if m_val > 0 else 0.0
 
     result["details"] = {
         "수식1_수급_캔들완성": c1,
@@ -243,19 +249,30 @@ def evaluate_4formula_buy(
         "수식4_M선_상향돌파": c4,
         "당봉수급_억원": round(float(latest['supply']), 2),
         "현재가": curr_p,
-        "M선_저항가": round(float(latest['m_line']), 2) if pd.notna(latest['m_line']) else 0.0,
+        "M선_저항가": round(m_val, 2),
+        "M선_이격도": round(disp_from_m, 2),
         "20이평": round(float(latest['ma20']), 2) if pd.notna(latest['ma20']) else 0.0,
         "60이평": round(float(latest['ma60']), 2) if pd.notna(latest['ma60']) else 0.0,
     }
 
     if is_buy:
+        # [핵심] 돌파 찰나(-0.2% ~ +0.8% 이내) 스나이핑
+        if m_val > 0 and (curr_p < m_val * 0.998 or curr_p > m_val * 1.008):
+            if curr_p > m_val * 1.008:
+                result["reason"] = f"⏭️ [돌파 찰나 경과] M선({m_val:,.0f}원) 대비 이미 +{disp_from_m:.2f}% 급등하여 돌파 찰나 경과 (+0.8% 초과) ➔ 상투 추격 매수 방지"
+            else:
+                result["reason"] = f"M선({m_val:,.0f}원) 돌파 대기 (현재가: {curr_p:,.0f}원, 이격: {disp_from_m:+.2f}%)"
+            return result
+
         result["should_buy"] = True
         result["price"] = curr_p
+        result["target_price"] = m_val if m_val > 0 else curr_p  # M선 지정가 매수!
+        result["priority_score"] = 350.0  # 👑 2순위 (350점)
         result["reason"] = (
-            f"🎯 [4대 수식 100% 동시 완성] "
-            f"15분봉 수급폭증({latest['supply']:.1f}억) + "
-            f"1-20-60 첫정배열 전환 + "
-            f"M선({latest['m_line']:,.0f}원) 골든크로스 돌파"
+            f"⚡ [4대 수식 완성 ➔ M선 돌파 찰나 스나이핑] "
+            f"15분봉 수급폭증({latest['supply']:.1f}억) + 1-20-60 첫정배열 전환 + "
+            f"M선({m_val:,.0f}원) 돌파 찰나 포착 (현재가: {curr_p:,.0f}원, 이격: {disp_from_m:+.2f}%) ➔ "
+            f"M선({m_val:,.0f}원) 지정가 매수"
         )
         logger.info(f"🚀 [{code} {name}] 매수 신호 포착! {result['reason']}")
     else:
@@ -266,7 +283,7 @@ def evaluate_4formula_buy(
         if not c3:
             missing.append("수식3(1-20-60 첫정배열)")
         if not c4:
-            missing.append("수식4(M선 돌파)")
+            missing.append(f"수식4(M선 돌파 찰나: 현재이격 {disp_from_m:+.2f}%)")
         result["reason"] = f"미충족 조건: {', '.join(missing)}" if missing else "조건 미달"
 
     return result
