@@ -335,8 +335,8 @@ class BuyManager:
             # ── 0-C. 🎯 [우선 1.6순위] 15분봉 피봇 돌파 + 20봉 평균 거래량 130% 돌파 전략 ──
             eval_pivot = evaluate_pivot_breakout(df_15m, daily_df) if (df_15m is not None and not df_15m.empty and daily_df is not None and not daily_df.empty) else {'should_buy': False}
 
-            # ── 1. [2순위] 15분봉 4대 수식 완성 전략 평가 ──
-            eval_f4 = evaluate_4formula_buy(code, name, df_15m, current_price=None, params=self.params_f4) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
+            # ── 1. [2순위] 15분봉 4대 수식 완성 전략 평가 (일봉 실시간 3일선 안착 검증 연동) ──
+            eval_f4 = evaluate_4formula_buy(code, name, df_15m, daily_df=daily_df, current_price=None, params=self.params_f4) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
 
             # ── 2. [3순위] 15분봉 수급 및 이평 변곡 전략 평가 ──
             eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, current_price=None, params=self.params_15m) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
