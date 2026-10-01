@@ -660,24 +660,31 @@ class BuyManager:
             tick = get_tick_size(int(buy_price))
             price_limit = int((int(buy_price) // tick) * tick)
 
-            # ── [핵심] 실시간 마이크로 오더플로우 (순간 체결 횟수 + 거래량 + 거래대금 + 낚시 필터) 분석 ──
+            # ── [핵심] 실시간 마이크로 오더플로우 (1안 속도 + 2안 체결빈도 + 3안 낚시방어/티켓) 분석 ──
             intensity_ratio = 1.0
             is_strong = False
             is_smart_breakout = False
             is_fake_wash = False
+            sec_1pct = 999.0
+            tick_freq = 0.0
+            flow_score = 0.0
             micro_flow = {}
             try:
                 ticks = await asyncio.to_thread(self.client.get_tick_data, code)
                 if ticks:
                     micro_flow = calculate_smart_micro_flow(ticks)
                     intensity_ratio = micro_flow.get('intensity_ratio', 1.0)
-                    is_strong = intensity_ratio >= 1.02
                     is_smart_breakout = micro_flow.get('is_smart_breakout', False)
                     is_fake_wash = micro_flow.get('is_fake_wash', False)
+                    # [3안 방어] 체결강도가 102% 이상이어도 자전거래 낚시가 아닐 때만 유효 강세로 인정
+                    is_strong = (intensity_ratio >= 1.02) and (not is_fake_wash)
+                    sec_1pct = micro_flow.get('seconds_to_rise_1pct', 999.0)
+                    tick_freq = micro_flow.get('buy_tick_freq', 0.0)
+                    flow_score = micro_flow.get('score', 0.0)
             except Exception as e:
                 logger.debug(f"[{name}] 틱 오더플로우 분석 스킵: {e}")
 
-            # 🚫 [자전거래 1주 낚시 차단]: 체결 횟수만 많고 건당 체결액이 20만원 미만인 낚시 종목 원천 배제!
+            # 🚫 [3안 자전거래 1주 낚시 차단]: 체결 횟수만 많고 건당 체결액이 30만원 미만인 낚시 종목 원천 배제!
             if is_fake_wash:
                 logger.warning(
                     f"🚫 [{name}] 세력의 소액 1주 자전거래 낚시 감지! "
@@ -685,26 +692,30 @@ class BuyManager:
                 )
                 continue
 
-            # 지수 급락 방어 모드일 때는 W자 반등 대장주이거나 체결강도 102% 이상인 종목만 예외 매수 허용
+            # 지수 급락 방어 모드일 때는 W자 반등 대장주이거나 오더플로우 스마트 돌파/강세 종목만 예외 매수 허용
             if is_market_in_danger:
-                can_buy_in_danger = is_w or (is_strong and intensity_ratio >= 1.02)
+                can_buy_in_danger = is_w or is_smart_breakout or (is_strong and intensity_ratio >= 1.02)
                 if not can_buy_in_danger:
                     logger.info(
-                        f"⏸️ [{name}] 지수 급락 방어 중 - 체결강도({intensity_ratio * 100:.0f}%) 또는 W자 반등 기준 미달로 매수 보류"
+                        f"⏸️ [{name}] 지수 급락 방어 중 - 오더플로우 기준 미달(체결강도 {intensity_ratio * 100:.0f}%, 1%주파 {sec_1pct:.1f}초)로 매수 보류"
                     )
                     continue
                 else:
                     logger.info(
-                        f"🔥 [{name}] 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 체결강도={intensity_ratio * 100:.0f}%)"
+                        f"🔥 [{name}] 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
                     )
 
             is_aggressive = False
-            if is_smart_breakout or (is_strong and intensity_ratio >= 1.02):
+            if is_smart_breakout:
                 price_limit = price_limit + tick
                 is_aggressive = True
                 logger.info(
-                    f"⚡ [{name}] 스마트 마이크로 수급 폭발! ({micro_flow.get('reason')}) ➔ "
+                    f"⚡ [{name}] 차세대 스마트 오더플로우 폭발 승인! (점수: {flow_score:.0f}점 | {micro_flow.get('reason')}) ➔ "
                     f"스마트 1호가 공격 매수 적용: {price_limit:,}원 (+1틱)"
+                )
+            elif is_strong and intensity_ratio >= 1.02:
+                logger.info(
+                    f"✅ [{name}] 마이크로 수급 안정 확인 ({micro_flow.get('reason')}) ➔ 기준가 매수: {price_limit:,}원"
                 )
 
             qty = self.buy_amount // int(buy_price)
@@ -806,7 +817,10 @@ class BuyManager:
             name = self.watchlist.get(code, {}).get('name') or await asyncio.to_thread(self.client.get_stock_name, code)
 
             # 지수 급락 방어 모드 확인
-            is_market_in_danger = await self.market_guard.is_danger_mode()
+            is_market_in_danger = False
+            if self.market_guard:
+                market_status = await self.market_guard.check_market_health()
+                is_market_in_danger = not market_status.get('safe', True)
 
             async with self.api_lock:
                 df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
@@ -830,13 +844,13 @@ class BuyManager:
                 return
 
             # ── [6대 전략 실시간 우선순위 평가] ──
-            eval_squeeze = evaluate_15m_squeeze_alignment(code, name, df_15m)
-            eval_5d2v = evaluate_5d2v_surge_breakout(code, name, daily_df, df_15m)
+            eval_squeeze = evaluate_15m_squeeze_alignment(code, name, df_15m, daily_df=daily_df, params=self.params_squeeze)
+            eval_5d2v = evaluate_5d2v_surge_breakout(code, name, daily_df, df_15m=df_15m)
             eval_pivot = evaluate_pivot_breakout(df_15m, daily_df)
-            eval_f4 = evaluate_4formula_buy(code, name, df_15m)
-            eval_15m = evaluate_15m_entry(code, name, daily_df, df_15m)
-            signals_30m = analyze_buy_signals(df_30m if df_30m is not None else df_15m, code=code)
-            eval_hh = evaluate_hh_rebound(df_15m)
+            eval_f4 = evaluate_4formula_buy(code, name, df_15m, daily_df=daily_df, params=self.params_f4)
+            eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, params=self.params_15m)
+            signals_30m = analyze_buy_signals(df_30m if df_30m is not None else df_15m, None, daily_df, df_15m=df_15m)
+            eval_hh = evaluate_hh_rebound(df_15m, daily_df)
 
             selected_signal = None
             is_w = False
@@ -935,24 +949,31 @@ class BuyManager:
             tick = get_tick_size(int(buy_price))
             price_limit = int((int(buy_price) // tick) * tick)
 
-            # ── [핵심] 실시간 마이크로 오더플로우 분석 ──
+            # ── [핵심] 실시간 마이크로 오더플로우 (1안 속도 + 2안 체결빈도 + 3안 낚시방어/티켓) 분석 ──
             intensity_ratio = 1.0
             is_strong = False
             is_smart_breakout = False
             is_fake_wash = False
+            sec_1pct = 999.0
+            tick_freq = 0.0
+            flow_score = 0.0
             micro_flow = {}
             try:
                 ticks = await asyncio.to_thread(self.client.get_tick_data, code)
                 if ticks:
                     micro_flow = calculate_smart_micro_flow(ticks)
                     intensity_ratio = micro_flow.get('intensity_ratio', 1.0)
-                    is_strong = intensity_ratio >= 1.02
                     is_smart_breakout = micro_flow.get('is_smart_breakout', False)
                     is_fake_wash = micro_flow.get('is_fake_wash', False)
+                    # [3안 방어] 체결강도가 102% 이상이어도 자전거래 낚시가 아닐 때만 유효 강세로 인정
+                    is_strong = (intensity_ratio >= 1.02) and (not is_fake_wash)
+                    sec_1pct = micro_flow.get('seconds_to_rise_1pct', 999.0)
+                    tick_freq = micro_flow.get('buy_tick_freq', 0.0)
+                    flow_score = micro_flow.get('score', 0.0)
             except Exception as e:
                 logger.debug(f"[{name}] 틱 오더플로우 분석 스킵: {e}")
 
-            # 🚫 [자전거래 1주 낚시 차단]
+            # 🚫 [3안 자전거래 1주 낚시 차단]: 체결 횟수만 많고 건당 체결액이 30만원 미만인 낚시 종목 원천 배제!
             if is_fake_wash:
                 logger.warning(
                     f"🚫 [0.1초 스나이핑] [{name}] 세력의 소액 1주 자전거래 낚시 감지! "
@@ -962,20 +983,28 @@ class BuyManager:
 
             # 지수 급락 방어 모드
             if is_market_in_danger:
-                can_buy_in_danger = is_w or (is_strong and intensity_ratio >= 1.02)
+                can_buy_in_danger = is_w or is_smart_breakout or (is_strong and intensity_ratio >= 1.02)
                 if not can_buy_in_danger:
                     logger.info(
-                        f"⏸️ [0.1초 스나이핑] [{name}] 지수 급락 방어 중 - 체결강도({intensity_ratio * 100:.0f}%) 또는 W자 반등 기준 미달로 매수 보류"
+                        f"⏸️ [0.1초 스나이핑] [{name}] 지수 급락 방어 중 - 오더플로우 기준 미달(체결강도 {intensity_ratio * 100:.0f}%, 1%주파 {sec_1pct:.1f}초)로 매수 보류"
                     )
                     return
+                else:
+                    logger.info(
+                        f"🔥 [0.1초 스나이핑] [{name}] 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
+                    )
 
             is_aggressive = False
-            if is_smart_breakout or (is_strong and intensity_ratio >= 1.02):
+            if is_smart_breakout:
                 price_limit = price_limit + tick
                 is_aggressive = True
                 logger.info(
-                    f"⚡ [0.1초 스나이핑] [{name}] 스마트 마이크로 수급 폭발! ({micro_flow.get('reason')}) ➔ "
+                    f"⚡ [0.1초 스나이핑] [{name}] 차세대 스마트 오더플로우 폭발 승인! (점수: {flow_score:.0f}점 | {micro_flow.get('reason')}) ➔ "
                     f"스마트 1호가 공격 매수 적용: {price_limit:,}원 (+1틱)"
+                )
+            elif is_strong and intensity_ratio >= 1.02:
+                logger.info(
+                    f"✅ [0.1초 스나이핑] [{name}] 마이크로 수급 안정 확인 ({micro_flow.get('reason')}) ➔ 기준가 매수: {price_limit:,}원"
                 )
 
             if price_limit <= 0:

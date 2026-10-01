@@ -2,296 +2,456 @@
     "229640": {
         "name": "LS에코에너지",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "327260": {
-        "name": "RF머트리얼즈",
+    "452190": {
+        "name": "한빛레이저",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "361610": {
-        "name": "SK아이이테크놀로지",
+    "099750": {
+        "name": "이지케어텍",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
     "100840": {
         "name": "SNT에너지",
         "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "000500": {
-        "name": "가온전선",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "017900": {
-        "name": "광전자",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "053260": {
-        "name": "금강철강",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "092790": {
-        "name": "넥스틸",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "234690": {
-        "name": "녹십자웰빙",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "336260": {
-        "name": "두산퓨얼셀",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "003160": {
-        "name": "디아이",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "042510": {
-        "name": "라온시큐어",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "108490": {
-        "name": "로보티즈",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "201490": {
-        "name": "미투온",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "064550": {
-        "name": "바이오니아",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "382900": {
-        "name": "범한퓨얼셀",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "090460": {
-        "name": "비에이치",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "042370": {
-        "name": "비츠로테크",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "072950": {
-        "name": "빛샘전자",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "437730": {
-        "name": "삼현",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "001820": {
-        "name": "삼화콘덴서",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "043260": {
-        "name": "성호전자",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "019170": {
-        "name": "신풍제약",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "413630": {
-        "name": "씨피시스템",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "124500": {
-        "name": "아이티센글로벌",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "058610": {
-        "name": "에스피지",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "356680": {
-        "name": "엑스게이트",
-        "weight": 1.4,
-        "theme": "양자암호/양자컴퓨팅",
-        "role": "LEADER",
-        "catalyst": "📰[NLP] 일반 시황/중립",
-        "source": "premarket_scanner"
-    },
-    "476060": {
-        "name": "온코닉테라퓨틱스",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "232140": {
-        "name": "와이씨",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "041190": {
-        "name": "우리기술투자",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "115440": {
-        "name": "우리넷",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "032940": {
-        "name": "원익",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "030530": {
-        "name": "원익홀딩스",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "249420": {
-        "name": "일동제약",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "079900": {
-        "name": "전진건설로봇",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "044490": {
-        "name": "태웅",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "484810": {
-        "name": "티엑스알로보틱스",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "356860": {
-        "name": "티엘비",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "441270": {
-        "name": "파인엠텍",
-        "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
     "161580": {
         "name": "필옵틱스",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "004090": {
-        "name": "한국석유",
+    "327260": {
+        "name": "RF머트리얼즈",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
+    },
+    "053260": {
+        "name": "금강철강",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "092790": {
+        "name": "넥스틸",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "077360": {
+        "name": "덕산하이메탈",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "149950": {
+        "name": "아바텍",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "252990": {
+        "name": "샘씨엔에스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "126730": {
+        "name": "코칩",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "079370": {
+        "name": "제우스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "033640": {
+        "name": "네패스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "042370": {
+        "name": "비츠로테크",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "090460": {
+        "name": "비에이치",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "072950": {
+        "name": "빛샘전자",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "192650": {
+        "name": "드림텍",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "382900": {
+        "name": "범한퓨얼셀",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "228850": {
+        "name": "레이언스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "183300": {
+        "name": "코미코",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "001820": {
+        "name": "삼화콘덴서",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "064550": {
+        "name": "바이오니아",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "356680": {
+        "name": "엑스게이트",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "041190": {
+        "name": "우리기술투자",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "232140": {
+        "name": "와이씨",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "115440": {
+        "name": "우리넷",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "032940": {
+        "name": "원익",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "005010": {
+        "name": "휴스틸",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "079900": {
+        "name": "전진건설로봇",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "030530": {
+        "name": "원익홀딩스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "044490": {
+        "name": "태웅",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "476060": {
+        "name": "온코닉테라퓨틱스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "009470": {
+        "name": "삼화전기",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "036810": {
+        "name": "에프에스티",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "441270": {
+        "name": "파인엠텍",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "064760": {
+        "name": "티씨케이",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "084370": {
+        "name": "유진테크",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "356860": {
+        "name": "티엘비",
+        "weight": 1.0,
+        "source": "today.csv"
     },
     "003350": {
         "name": "한국화장품제조",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "008930": {
-        "name": "한미사이언스",
+    "086450": {
+        "name": "동국제약",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
+    },
+    "446540": {
+        "name": "메가터치",
+        "weight": 1.0,
+        "source": "today.csv"
     },
     "128940": {
         "name": "한미약품",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "452280": {
-        "name": "한선엔지니어링",
+    "068930": {
+        "name": "디지털대성",
         "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "078350": {
-        "name": "한양디지텍",
-        "weight": 1.0,
-        "source": "500pick.csv"
-    },
-    "052690": {
-        "name": "한전기술",
-        "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
     "130660": {
         "name": "한전산업",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "000880": {
-        "name": "한화",
+    "052690": {
+        "name": "한전기술",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "004310": {
-        "name": "현대약품",
+    "323280": {
+        "name": "태성",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "024060": {
-        "name": "흥구석유",
+    "260970": {
+        "name": "에스앤디",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
+    },
+    "004710": {
+        "name": "한솔테크닉스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "093370": {
+        "name": "후성",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "089010": {
+        "name": "켐트로닉스",
+        "weight": 1.0,
+        "source": "today.csv"
     },
     "003280": {
         "name": "흥아해운",
         "weight": 1.0,
-        "source": "500pick.csv"
+        "source": "today.csv"
     },
-    "0010S0": {
-        "name": "와이즈플래닛컴퍼니",
-        "weight": 1.4,
-        "theme": "2026 하반기 신규상장",
-        "role": "LEADER",
-        "catalyst": "⚪ 최근 뉴스 없음 (중립)",
-        "source": "premarket_scanner"
+    "217590": {
+        "name": "티엠씨",
+        "weight": 1.0,
+        "source": "today.csv"
     },
-    "0161M0": {
-        "name": "네오사피엔스",
-        "weight": 1.2,
-        "theme": "2026 하반기 신규상장",
-        "role": "SECOND",
-        "catalyst": "⚪ 최근 뉴스 없음 (중립)",
-        "source": "premarket_scanner"
+    "003160": {
+        "name": "디아이",
+        "weight": 1.0,
+        "source": "today.csv"
     },
-    "0039P0": {
-        "name": "매드업",
-        "weight": 1.2,
-        "theme": "광고",
-        "role": "SECOND",
-        "catalyst": "📰[NLP] ✨돌파",
-        "source": "premarket_scanner"
+    "012210": {
+        "name": "삼미금속",
+        "weight": 1.0,
+        "source": "today.csv"
     },
-    "046970": {
-        "name": "우리로",
-        "weight": 1.2,
-        "theme": "양자암호/양자컴퓨팅",
-        "role": "SECOND",
-        "catalyst": "📰[NLP] 일반 시황/중립",
-        "source": "premarket_scanner"
+    "122640": {
+        "name": "예스티",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "403850": {
+        "name": "더핑크퐁컴퍼니",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "078340": {
+        "name": "컴투스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "361610": {
+        "name": "SK아이이테크놀로지",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "114810": {
+        "name": "한솔아이원스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "018310": {
+        "name": "삼목에스폼",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "067920": {
+        "name": "이글루",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "089980": {
+        "name": "상아프론테크",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "265740": {
+        "name": "엔에프씨",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "051360": {
+        "name": "토비스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "241710": {
+        "name": "코스메카코리아",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "105740": {
+        "name": "디케이락",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "039860": {
+        "name": "나노엔텍",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "217190": {
+        "name": "제너셈",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "200470": {
+        "name": "에이팩트",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "058610": {
+        "name": "에스피지",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "056190": {
+        "name": "SFA",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "105330": {
+        "name": "케이엔더블유",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "332570": {
+        "name": "PS일렉트로닉스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "005160": {
+        "name": "동국산업",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "0007C0": {
+        "name": "아크릴",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "452260": {
+        "name": "한화갤러리아",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "004090": {
+        "name": "한국석유",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "028100": {
+        "name": "동아지질",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "041960": {
+        "name": "코미팜",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "067310": {
+        "name": "하나마이크론",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "218410": {
+        "name": "RFHIC",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "226590": {
+        "name": "엠디바이스",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "119850": {
+        "name": "지엔씨에너지",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "041440": {
+        "name": "현대에버다임",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "234340": {
+        "name": "헥토파이낸셜",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "182360": {
+        "name": "큐브엔터",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "024840": {
+        "name": "KBI메탈",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "484590": {
+        "name": "삼양컴텍",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "417840": {
+        "name": "저스템",
+        "weight": 1.0,
+        "source": "today.csv"
+    },
+    "460850": {
+        "name": "동국씨엠",
+        "weight": 1.0,
+        "source": "today.csv"
     }
 }
