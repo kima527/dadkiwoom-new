@@ -1,16 +1,16 @@
 """
-trading_bot.py - 30분봉 260이평 W자 반등 우선 매수 + 15분봉 WMA 3-5 데드크로스 단일 매도 봇
+trading_bot.py - 30분봉 260이평 W자 반등 우선 매수 + 실시간 3일선 저가 이탈 단일 매도 봇
 ===========================================================================
 
 구조:
   1. BuyManager  - 15분봉 4대수식/수급변곡 + 30분봉 260이평 W자 반등 최우선 매수
-  2. SellManager - 15분봉 WMA 3-5 데드크로스 단일 매도
+  2. SellManager - 실시간 3일선(M/3) 저가 하향 이탈 단일 매도
 
 전략 요약:
   - 매수: 15분봉 4대 수식 올인원 돌파 최우선 + 30분봉 260이평 W자 반등 매수
-  - 매도: 15분봉 WMA 3-5 데드크로스 발생 시 전량 시장가(03) 매도
+  - 매도: 저가가 실시간 3일선(M/3) 아래로 떨어지면 전량 시장가(03) 매도 (단일화)
   - 오버나잇 허용, 세션 자동 연동 (NXT 프리 08:00 ~ KRX 정규 ~ NXT 애프터 20:00)
-  - 종목당 500만원 / 최대 2종목 분산 보유 (총 1,000만원 한도)
+  - 종목당 1주 / 검증 매수 모드
 
 실행 방법:
   python trading_bot.py                      # 전체 임무 실행
@@ -35,6 +35,7 @@ from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 from strategy_15m_squeeze_alignment import evaluate_15m_squeeze_alignment, SqueezeAlignmentParams
 from strategy_5d2v_surge_breakout import evaluate_5d2v_surge_breakout
+from strategy_15m_m_wma_squeeze import evaluate_15m_m_wma_squeeze
 from db_logger import TradeDBLogger
 from scan_tomorrow_picks import run_scanner
 from theme_manager import ThemeManager
@@ -89,14 +90,48 @@ logger = logging.getLogger(__name__)
 class MarketIndexGuard:
     """
     KODEX 200(069500) 및 KODEX 코스닥150(229200)의 15분봉 및 당일 등락률을 모니터링하여,
-    지수 마지노선 이탈(코스피 시가 대비 -0.5% 이하, 코스닥 시가 대비 -0.8% 이하) 발생 시
-    신규 매수를 선제적으로 일시 중단(Pause)하는 안전장치.
+    코스피와 코스닥 지수를 독립적으로 판정하고 종목의 소속 시장(코스피/코스닥)에 맞춰
+    1:1 개별 안전장치를 적용하는 모듈.
     """
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock):
         self.client = client
         self.api_lock = api_lock
         self.last_check_time = 0
-        self.cached_status = {"safe": True, "kospi_chg": 0.0, "kosdaq_chg": 0.0, "reason": "정상"}
+        self.cached_status = {
+            "safe": True,
+            "kospi_safe": True,
+            "kosdaq_safe": True,
+            "kospi_chg": 0.0,
+            "kosdaq_chg": 0.0,
+            "reason": "정상"
+        }
+        self.market_cache = {}  # {clean_code: "KOSPI" | "KOSDAQ"} 메모리 캐시
+
+    def get_stock_market(self, stock_code: str) -> str:
+        """종목의 소속 시장(KOSPI / KOSDAQ)을 판별하여 반환 (캐시 적용으로 0초 조회)"""
+        clean = stock_code.replace('_AL', '').replace('_NX', '').lstrip('A').strip()
+        if clean in self.market_cache:
+            return self.market_cache[clean]
+
+        try:
+            import requests
+            url = f"https://m.stock.naver.com/api/stock/{clean}/basic"
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+            if res.status_code == 200:
+                data = res.json()
+                m_name = str(data.get('stockExchangeType', {}).get('name', '')).upper()
+                if 'KOSPI' in m_name:
+                    self.market_cache[clean] = 'KOSPI'
+                    return 'KOSPI'
+                elif 'KOSDAQ' in m_name:
+                    self.market_cache[clean] = 'KOSDAQ'
+                    return 'KOSDAQ'
+        except Exception:
+            pass
+
+        # 기본값: 단타/급등주 조건검색 종목은 KOSDAQ 비중이 높으므로 KOSDAQ 기본 지정
+        self.market_cache[clean] = 'KOSDAQ'
+        return 'KOSDAQ'
 
     async def check_market_health(self) -> dict:
         now = time.time()
@@ -145,10 +180,12 @@ class MarketIndexGuard:
                         warning_reasons.append(f"코스닥 마지노선 이탈({kosdaq_chg:+.2f}% <= -0.8%)")
 
             is_safe = kospi_safe and kosdaq_safe
-            reason = "정상 (매수 허용)" if is_safe else ", ".join(warning_reasons) + " 발생 (매수 보류)"
+            reason = "양대 지수 정상" if is_safe else ", ".join(warning_reasons) + " 발생"
 
             self.cached_status = {
                 "safe": is_safe,
+                "kospi_safe": kospi_safe,
+                "kosdaq_safe": kosdaq_safe,
                 "kospi_chg": kospi_chg,
                 "kosdaq_chg": kosdaq_chg,
                 "reason": reason,
@@ -159,6 +196,8 @@ class MarketIndexGuard:
         except Exception as e:
             logger.warning(f"지수 확인 중 예외 발생: {e}")
             self.cached_status["safe"] = True
+            self.cached_status["kospi_safe"] = True
+            self.cached_status["kosdaq_safe"] = True
 
         return self.cached_status
 
@@ -168,7 +207,7 @@ class MarketIndexGuard:
 # ═══════════════════════════════════════════════════════════════
 class BuyManager:
     """
-    일봉 SMA20 돌파 & HH 돌파 또는 30분봉 SMA260 돌파 & HH 돌파 시 종목당 500만원 매수.
+    일봉 SMA20 돌파 & HH 돌파 또는 30분봉 SMA260 돌파 & HH 돌파 시 종목당 1주 매수.
     지수 급락 시에는 신규 매수를 일시 보류하여 자산을 보호함.
     """
 
@@ -178,7 +217,8 @@ class BuyManager:
                  db_logger: TradeDBLogger = None,
                  theme_manager = None,
                  news_agent: RealtimeNewsAgent = None,
-                 buy_amount: int = 5000000, max_positions: int = 2):
+                 buy_amount: int = 5000000, max_positions: int = 99,
+                 buy_qty: int = 1):
         self.client = client
         self.api_lock = api_lock
         self.trade_states = trade_states
@@ -186,8 +226,9 @@ class BuyManager:
         self.watchlist = watchlist
         self.market_guard = market_guard
         self.db_logger = db_logger
-        self.buy_amount = buy_amount        # 종목당 매수 금액 (500만원)
-        self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 2종목 분산 매매)
+        self.buy_amount = buy_amount        # 종목당 매수 금액 상한 (기본: 500만원)
+        self.buy_qty = buy_qty              # 종목당 매수 수량 (기본: 1주)
+        self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 99종목, 종목수 무제한 1주 검증 매매)
         self.theme_manager = theme_manager  # 실시간 테마 관리자 (대장주 차등 가중치)
         self.news_agent = news_agent        # 실시간 뉴스/모멘텀 AI 스코어러 (호재 가산 및 악재 차단)
         self.params_15m = Turnaround15mParams(min_daily_supply_money=20.0)
@@ -199,7 +240,7 @@ class BuyManager:
         """매수 감시 사이클 실행"""
 
         # ── 1. 시장 지수 급락 안전장치 검사 (정규장 세션 09:00~15:30에서만 적용, 프리/애프터마켓은 주가지수 적용 해제) ──
-        is_market_in_danger = False
+        market_status = {"safe": True, "kospi_safe": True, "kosdaq_safe": True, "kospi_chg": 0.0, "kosdaq_chg": 0.0, "reason": "정상"}
         now_time = datetime.now().time()
         is_regular_session = (dtime(9, 0, 0) <= now_time <= dtime(15, 30, 0))
 
@@ -207,19 +248,13 @@ class BuyManager:
             logger.info("🌅 [프리/애프터마켓 세션] 주가지수 적용 해제 (정규장 외 세션 - 주가지수 급락 방어 미적용)")
         elif self.market_guard:
             market_status = await self.market_guard.check_market_health()
-            kospi_str = f"KOSPI: {market_status['kospi_chg']:+.2f}%"
-            kosdaq_str = f"KOSDAQ: {market_status['kosdaq_chg']:+.2f}%"
-            
-            if not market_status['safe']:
-                is_market_in_danger = True
-                logger.warning(
-                    f"🛑 [지수 급락 방어 모드] {kospi_str} | {kosdaq_str} -> "
-                    f"{market_status['reason']}. 체결강도 102% 이상 강력 주도주 및 W자 반등 대장주만 선별 매수합니다."
-                )
-            else:
-                logger.info(f"🌐 [시장 지수 상태] {kospi_str} | {kosdaq_str} -> 정상 (전체 매수 탐색 진행)")
+            kpi_status = "✅정상" if market_status.get('kospi_safe', True) else "🛑급락경보"
+            kdq_status = "✅정상" if market_status.get('kosdaq_safe', True) else "🛑급락경보"
+            kospi_str = f"KOSPI: {market_status['kospi_chg']:+.2f}% ({kpi_status})"
+            kosdaq_str = f"KOSDAQ: {market_status['kosdaq_chg']:+.2f}% ({kdq_status})"
+            logger.info(f"🌐 [시장 지수 독립 감시] {kospi_str} | {kosdaq_str} ➔ 종목별 소속 시장(코스피/코스닥) 1:1 맞춤 방어 적용")
 
-        # 보유 종목 수 제한 (기본 2종목)
+        # 보유 종목 수 제한 (기본: 99종목, 종목수 무제한 1주 검증 매수 모드)
         pending_buy_codes = {
             o['code'] for o in self.tracked_orders.values()
             if str(o.get('order_type', '')).startswith('buy')
@@ -227,7 +262,7 @@ class BuyManager:
         total_positions = len(holdings) + len(pending_buy_codes)
         if total_positions >= self.max_positions:
             logger.info(
-                f"🎯 [2종목 분산 매매] 최대 보유 종목 수({self.max_positions}개) 도달. "
+                f"🎯 [보유 한도 도달] 최대 보유 종목 수({self.max_positions}개) 도달. "
                 f"(보유: {len(holdings)}개, 매수대기: {len(pending_buy_codes)}개) "
                 f"신규 매수 탐색 스킵."
             )
@@ -332,6 +367,9 @@ class BuyManager:
             # ── 0-B. 🚀 [우선 1.5순위] 5거래일 중 2회 거래량 130% 폭증 ➔ 수급봉 최고가 돌파 전략 ──
             eval_5d2v = evaluate_5d2v_surge_breakout(code, name, daily_df, df_15m=df_15m) if (daily_df is not None and not daily_df.empty) else {'should_buy': False}
 
+            # ── 0-B2. 💎 [우선 1.55순위] 15분봉 수식1(황룡선)-수식2(WMA골든선) 1% 초응축 + 1번식 변곡 돌파 전략 ──
+            eval_m_wma = evaluate_15m_m_wma_squeeze(code, name, df_15m, daily_df=daily_df, current_price=None) if (df_15m is not None and not df_15m.empty) else {'should_buy': False}
+
             # ── 0-C. 🎯 [우선 1.6순위] 15분봉 피봇 돌파 + 20봉 평균 거래량 130% 돌파 전략 ──
             eval_pivot = evaluate_pivot_breakout(df_15m, daily_df) if (df_15m is not None and not df_15m.empty and daily_df is not None and not daily_df.empty) else {'should_buy': False}
 
@@ -425,6 +463,42 @@ class BuyManager:
                     'weight': weight,
                     'is_15m_squeeze': False,
                     'is_5d2v_surge': True,
+                    'is_15m_pivot': False,
+                    'is_15m_4formula': False,
+                    'is_15m_turnaround': False,
+                    'is_w_rebound': False,
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
+                    'final_score': final_score,
+                    'priority_score': final_score
+                })
+            # 💎 1.55순위: 15분봉 수식1(황룡선)-수식2(WMA골든선) 1% 초응축 + 1번식 변곡 돌파 (365점)
+            elif eval_m_wma.get('should_buy'):
+                target_p = eval_m_wma.get('target_price', eval_m_wma['price'])
+                buy_price = target_p
+                if buy_price > self.buy_amount:
+                    continue
+                base_score = 365.0  # 💎 1.55순위 (365점)
+                final_score = (base_score + supply_bonus + news_bonus) * weight
+                buy_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'state': state,
+                    'signals': {
+                        'buy': True,
+                        'close': eval_m_wma['price'],
+                        'target_price': target_p,
+                        'reason': eval_m_wma['reason'],
+                        'll': target_p
+                    },
+                    'df_30m': df_30m if df_30m is not None else df_15m,
+                    'weight': weight,
+                    'is_15m_squeeze': False,
+                    'is_5d2v_surge': False,
+                    'is_m_wma_squeeze': True,
                     'is_15m_pivot': False,
                     'is_15m_4formula': False,
                     'is_15m_turnaround': False,
@@ -692,17 +766,27 @@ class BuyManager:
                 )
                 continue
 
-            # 지수 급락 방어 모드일 때는 W자 반등 대장주이거나 오더플로우 스마트 돌파/강세 종목만 예외 매수 허용
-            if is_market_in_danger:
+            # ── [핵심 개선] 종목별 소속 시장(코스피 vs 코스닥) 1:1 맞춤 지수 방어 검증 ──
+            # 코스피가 하락해도 코스닥이 정상이면 코스닥 종목은 100% 정상 매수 승인!
+            stock_market = self.market_guard.get_stock_market(code) if self.market_guard else "KOSDAQ"
+            is_stock_market_danger = False
+            if self.market_guard and is_regular_session:
+                if stock_market == "KOSDAQ":
+                    is_stock_market_danger = not market_status.get('kosdaq_safe', True)
+                else:
+                    is_stock_market_danger = not market_status.get('kospi_safe', True)
+
+            # 해당 종목의 소속 시장이 급락 상태일 때만 제한적으로 방어 모드 발동
+            if is_stock_market_danger:
                 can_buy_in_danger = is_w or is_smart_breakout or (is_strong and intensity_ratio >= 1.02)
                 if not can_buy_in_danger:
                     logger.info(
-                        f"⏸️ [{name}] 지수 급락 방어 중 - 오더플로우 기준 미달(체결강도 {intensity_ratio * 100:.0f}%, 1%주파 {sec_1pct:.1f}초)로 매수 보류"
+                        f"⏸️ [{name}({stock_market})] {stock_market} 지수 급락 방어 중 - 오더플로우 기준 미달(체결강도 {intensity_ratio * 100:.0f}%, 1%주파 {sec_1pct:.1f}초)로 매수 보류"
                     )
                     continue
                 else:
                     logger.info(
-                        f"🔥 [{name}] 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
+                        f"🔥 [{name}({stock_market})] {stock_market} 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
                     )
 
             is_aggressive = False
@@ -718,7 +802,7 @@ class BuyManager:
                     f"✅ [{name}] 마이크로 수급 안정 확인 ({micro_flow.get('reason')}) ➔ 기준가 매수: {price_limit:,}원"
                 )
 
-            qty = self.buy_amount // int(buy_price)
+            qty = self.buy_qty  # 종목당 1주 매수
 
             # ── [중복 매수 원천 차단 이중 안전장치] ──
             # 1. 상태 객체 기준 이미 매수 완료/보유/당일매매종료 상태인지 재확인
@@ -816,11 +900,15 @@ class BuyManager:
 
             name = self.watchlist.get(code, {}).get('name') or await asyncio.to_thread(self.client.get_stock_name, code)
 
-            # 지수 급락 방어 모드 확인
-            is_market_in_danger = False
+            # 지수 급락 방어 모드 확인 (종목 소속 시장별 독립 판정)
+            stock_market = self.market_guard.get_stock_market(code) if self.market_guard else "KOSDAQ"
+            is_stock_market_danger = False
             if self.market_guard:
                 market_status = await self.market_guard.check_market_health()
-                is_market_in_danger = not market_status.get('safe', True)
+                if stock_market == "KOSDAQ":
+                    is_stock_market_danger = not market_status.get('kosdaq_safe', True)
+                else:
+                    is_stock_market_danger = not market_status.get('kospi_safe', True)
 
             async with self.api_lock:
                 df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
@@ -846,6 +934,7 @@ class BuyManager:
             # ── [6대 전략 실시간 우선순위 평가] ──
             eval_squeeze = evaluate_15m_squeeze_alignment(code, name, df_15m, daily_df=daily_df, params=self.params_squeeze)
             eval_5d2v = evaluate_5d2v_surge_breakout(code, name, daily_df, df_15m=df_15m)
+            eval_m_wma = evaluate_15m_m_wma_squeeze(code, name, df_15m, daily_df=daily_df)
             eval_pivot = evaluate_pivot_breakout(df_15m, daily_df)
             eval_f4 = evaluate_4formula_buy(code, name, df_15m, daily_df=daily_df, params=self.params_f4)
             eval_15m = evaluate_15m_entry(code, name, df_15m, daily_df, params=self.params_15m)
@@ -874,6 +963,16 @@ class BuyManager:
                     'reason': eval_5d2v['reason'],
                     'base_score': 370.0,
                     'priority_score': 370.0
+                }
+            # 💎 1.55순위: 15분봉 수식1-2 1% 초응축 + 1번식 변곡 (365점)
+            elif eval_m_wma.get('should_buy'):
+                target_p = eval_m_wma.get('target_price', eval_m_wma['price'])
+                selected_signal = {
+                    'target_price': target_p,
+                    'close': eval_m_wma['price'],
+                    'reason': eval_m_wma['reason'],
+                    'base_score': 365.0,
+                    'priority_score': 365.0
                 }
             # 🎯 1.6순위: 15분봉 피봇 돌파 찰나 스나이핑 (360점)
             elif eval_pivot.get('should_buy'):
@@ -981,17 +1080,17 @@ class BuyManager:
                 )
                 return
 
-            # 지수 급락 방어 모드
-            if is_market_in_danger:
+            # 해당 종목 소속 시장이 급락 상태일 때만 제한적으로 방어 모드 발동
+            if is_stock_market_danger:
                 can_buy_in_danger = is_w or is_smart_breakout or (is_strong and intensity_ratio >= 1.02)
                 if not can_buy_in_danger:
                     logger.info(
-                        f"⏸️ [0.1초 스나이핑] [{name}] 지수 급락 방어 중 - 오더플로우 기준 미달(체결강도 {intensity_ratio * 100:.0f}%, 1%주파 {sec_1pct:.1f}초)로 매수 보류"
+                        f"⏸️ [0.1초 스나이핑] [{name}({stock_market})] {stock_market} 지수 급락 방어 중 - 오더플로우 기준 미달(체결강도 {intensity_ratio * 100:.0f}%, 1%주파 {sec_1pct:.1f}초)로 매수 보류"
                     )
                     return
                 else:
                     logger.info(
-                        f"🔥 [0.1초 스나이핑] [{name}] 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
+                        f"🔥 [0.1초 스나이핑] [{name}({stock_market})] {stock_market} 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
                     )
 
             is_aggressive = False
@@ -1009,7 +1108,7 @@ class BuyManager:
 
             if price_limit <= 0:
                 return
-            qty = self.buy_amount // price_limit
+            qty = self.buy_qty  # 종목당 1주 매수
 
             # 중복 매수 재확인
             if state.buy_step >= 1 or state.is_holding or state.trade_ended:
@@ -1058,12 +1157,12 @@ class BuyManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SellManager - 15분봉 WMA 3-5 데드크로스 매도 전용
+# SellManager - 실시간 3일선 저가 하향 이탈 단일 매도
 # ═══════════════════════════════════════════════════════════════
 class SellManager:
     """
-    15분봉 WMA 3이 WMA 5를 하향 돌파(데드크로스)할 때만 시장가 전량 매도.
-    장초반 강력 매수 후 상승 탄력이 꺾이는 꼭지 부근에서 신속히 이익을 확정하고 자금을 회전합니다.
+    저가가 실시간 3일선(M/3) 아래로 떨어질 때 전량 시장가 매도 (단일 매도 원칙).
+    3일선 지지 유지 시에는 일시적 흔들림에 털리지 않고 지속 홀딩하여 상승 추세 수익을 극대화합니다.
     """
 
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
@@ -1078,7 +1177,7 @@ class SellManager:
         self.last_15m_fetch_time = {}  # TR 스로틀링 타이머 {code: float}
 
     async def run(self, holdings: dict):
-        """매도 감시 사이클 실행 (보유 종목 대상 15분봉 3-5 WMA 데드크로스 감시)"""
+        """매도 감시 사이클 실행 (보유 종목 대상 실시간 3일선 저가 하향 이탈 단일 감시)"""
         now = time.time()
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
@@ -1103,26 +1202,28 @@ class SellManager:
             current_price = float(hold_info.get('current_price', 0)) if isinstance(hold_info, dict) else 0.0
             qty_sell = hold_info.get('qty', 1) if isinstance(hold_info, dict) else hold_info
 
-            # ── [m_touch_high 실시간 갱신] 보유 중 최고가를 매 사이클마다 추적하여 트레일링 익절 연동 ──
+            # 보유 중 최고가 추적
             if current_price > 0:
                 if current_price > state.m_touch_high:
                     state.m_touch_high = current_price
 
-            # 15분봉 데이터 조회 (보유 2종목 미만이므로 매 사이클 신속 감시)
+            # 15분봉 및 일봉 데이터 조회 (실시간 3일선 저가 이탈 감시)
             async with self.api_lock:
                 df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
+                daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
+                await asyncio.sleep(0.05)
 
-            if df_15m is None or df_15m.empty or len(df_15m) < 5:
+            if (df_15m is None or df_15m.empty) and (daily_df is None or daily_df.empty):
                 continue
 
-            # 15분봉 3-5 WMA 데드크로스 신호 판정 (touch_high를 전달하여 단계별 익절 스탑로스 작동)
+            # 실시간 3일선(M/3) 저가 하향 이탈 단일 매도 신호 판정
             signals = analyze_sell_signals(
-                df_15m, buy_price=buy_price, current_price=current_price,
+                df_15m, daily_df=daily_df, buy_price=buy_price, current_price=current_price,
                 touch_high=state.m_touch_high
             )
 
-            # 15분봉 WMA 3 < WMA 5 데드크로스 발생 시에만 전량 시장가 매도 집행
+            # 저가가 3일선 아래로 떨어질 때 전량 시장가 매도 집행
             if signals.get('sell'):
                 logger.info(f"🔴 [{name}] 매도 신호 감지! {signals['reason']}")
                 async with self.api_lock:
@@ -1145,12 +1246,12 @@ class SellManager:
                         sell_p = current_price if current_price > 0 else buy_price
                         self.db_logger.log_sell(
                             code=code, sell_price=sell_p,
-                            sell_qty=qty_sell, sell_reason=signals.get('reason', '매도')
+                            sell_qty=qty_sell, sell_reason=signals.get('reason', '3일선 저가 이탈 매도')
                         )
                 else:
                     logger.warning(f"⚠️ [{name}] 매도 주문 전송 실패! 다음 사이클에서 재시도합니다.")
             else:
-                logger.debug(f"ℹ️ [{name}] 15분봉 3-5 WMA 정배열/상승 탄력 유지 중 (WMA3: {signals.get('wma3', 0):,.0f} >= WMA5: {signals.get('wma5', 0):,.0f}, 홀딩)")
+                logger.debug(f"ℹ️ [{name}] {signals.get('reason', '3일선 지지 유지 홀딩')}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1159,7 +1260,8 @@ class SellManager:
 class TradingBot:
     def __init__(self, condition_name="Traiding,traiding",
                  enable_buy=True, enable_sell=True,
-                 buy_amount=5000000, max_positions=2):
+                 buy_amount=5000000, max_positions=99,
+                 buy_qty=1):
         self.client = RealAPIAdapter()
         self.condition_name = condition_name
         self.watchlist = {}
@@ -1196,7 +1298,8 @@ class TradingBot:
             db_logger=self.db_logger,
             theme_manager=self.theme_manager,
             news_agent=self.news_agent,
-            buy_amount=buy_amount, max_positions=max_positions
+            buy_amount=buy_amount, max_positions=max_positions,
+            buy_qty=buy_qty
         ) if enable_buy else None
 
         self.sell_manager = SellManager(
@@ -1552,8 +1655,8 @@ class TradingBot:
         logger.info(f" 전략: [1순위] 15분봉 20억 수급 + 3일선 U턴 변곡 스나이퍼 매수 (Combo 3+4)")
         logger.info(f"       [2순위] 30분봉 260이평 W자 반등 종목 우선 매수")
         logger.info(f"       [3순위] 15분봉 3-20 골든크로스 / 3-5 더블 변곡 매수")
-        logger.info(f"       [매도] 15분봉 WMA 3-5 데드크로스 발생 시 전량 시장가(03) 매도")
-        logger.info(f" 매매 모드: 🎯 [최대 {self.buy_manager.max_positions if self.buy_manager else 2}종목 분산 모드] (종목당: {self.buy_manager.buy_amount if self.buy_manager else 5000000:,.0f}원 | 총 한도: {(self.buy_manager.buy_amount * self.buy_manager.max_positions) if self.buy_manager else 10000000:,.0f}원)")
+        logger.info(f"       [매도] 저가가 실시간 3일선(M/3) 아래로 떨어질 때 전량 시장가(03) 매도 (단일화)")
+        logger.info(f" 매매 모드: 🎯 [종목수 무제한 1주 검증 매수 모드] (종목당: {getattr(self.buy_manager, 'buy_qty', 1)}주 매수 | 전략별 매수 근거 DB 자동 수집)")
         logger.info(f" 오버나잇: 허용 | 시간 제한: 없음")
         logger.info("=" * 60)
 
@@ -1594,12 +1697,16 @@ async def main():
         help="키움증권 조건검색식 이름 (쉼표로 복수 지정 가능, 기본: Traiding,traiding)"
     )
     parser.add_argument(
-        '--amount', type=int, default=5000000,
-        help="종목당 매수 금액 (기본: 5,000,000원)"
+        '--qty', type=int, default=1,
+        help="종목당 매수 수량 (기본: 1주)"
     )
     parser.add_argument(
-        '--max-positions', type=int, default=2,
-        help="최대 보유 종목 수 (기본: 2 - 2종목 분산 매매)"
+        '--amount', type=int, default=5000000,
+        help="종목당 매수 금액 상한 (기본: 5,000,000원)"
+    )
+    parser.add_argument(
+        '--max-positions', type=int, default=99,
+        help="최대 보유 종목 수 (기본: 99 - 종목수 무제한 1주 검증 매수 모드)"
     )
 
     args = parser.parse_args()
@@ -1619,6 +1726,7 @@ async def main():
         enable_sell=enable_sell,
         buy_amount=args.amount,
         max_positions=args.max_positions,
+        buy_qty=args.qty,
     )
     await bot.start()
 

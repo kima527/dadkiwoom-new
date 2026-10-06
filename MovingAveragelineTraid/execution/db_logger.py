@@ -226,3 +226,40 @@ class TradeDBLogger:
         logger.info(f" 🎯 승률(Win Rate): {win_rate:.1f}%")
         logger.info(f" 💰 총 실현손익: {pnl:+,.0f}원 (평균 수익률: {avg_ret:+.2f}%)")
         logger.info("=" * 60)
+        self.print_strategy_summary(trade_date)
+
+    def print_strategy_summary(self, trade_date: str = None):
+        """전략별 매매 통계(전략별 체결 건수, 손익, 승률) 산출 및 출력"""
+        if not trade_date:
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT
+                        buy_reason,
+                        COUNT(*) as cnt,
+                        SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) as wins,
+                        AVG(return_rate) as avg_ret,
+                        SUM(profit_loss) as sum_pnl
+                    FROM trades
+                    WHERE trade_date = ?
+                    GROUP BY buy_reason
+                """, (trade_date,))
+                rows = cursor.fetchall()
+                if rows:
+                    logger.info("=" * 60)
+                    logger.info(f" 📈 [전략별 매수 근거 및 성과 분석 리포트 - {trade_date}]")
+                    for r in rows:
+                        reason = r['buy_reason'] or '기타'
+                        short_reason = reason[:38] + '..' if len(reason) > 38 else reason
+                        cnt = r['cnt']
+                        wins = r['wins']
+                        wr = (wins / cnt * 100) if cnt > 0 else 0.0
+                        avg_r = r['avg_ret'] or 0.0
+                        pnl = r['sum_pnl'] or 0.0
+                        logger.info(f"   * {short_reason} | {cnt}건 (승률: {wr:.1f}%, 평균수익: {avg_r:+.2f}%, 손익: {pnl:+,.0f}원)")
+                    logger.info("=" * 60)
+        except Exception as e:
+            logger.debug(f"전략별 통계 출력 스킵: {e}")

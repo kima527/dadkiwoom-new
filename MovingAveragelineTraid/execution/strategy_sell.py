@@ -1,76 +1,114 @@
 """
-strategy_sell.py - 15분봉 WMA 3-5 데드크로스 전용 매도 전략
+strategy_sell.py - 실시간 3일선 저가 하향 이탈 단일 매도 전략
 ===========================================================================
 
-[통합 매도 로직]
-1. [15분봉 WMA 3-5 데드크로스 매도 (단일 원칙)]:
-   - 15분봉의 3 가중이동평균(WMA 3)이 5 가중이동평균(WMA 5)을 하향 돌파(WMA 3 < WMA 5)할 때 즉시 전량 매도.
-   - WMA 3 >= WMA 5 유지 시 지속 홀딩하여 상승 탄력 구간 수익을 극대화.
-   - 가중이동평균(WMA)을 적용하여 장초반 피크 꺾임을 신속하게 포착하고 휩소를 최소화.
-
-사용 데이터: 15분봉
+[단일 매도 원칙]
+1. 저가가 실시간 3일선(M/3) 아래로 떨어지면 즉시 전량 매도:
+   - 일봉 실시간 3일선 공식:
+     M = 현재가 + 전일종가(1) + 전전일종가(2)
+     기준선 = M / 3.0
+   - 당봉 저가(Low) 또는 실시간 현재가가 3일선 미만(low < day3_line 또는 curr < day3_line)으로
+     이탈할 때 전량 시장가 매도.
+2. 저가가 3일선 이상 지지 유지 시에는 지속 홀딩하여 상승 추세 수익을 극대화.
+3. WMA 3-5 데드크로스, 다이나믹 트레일링 스탑 등 복잡한 다중 지표를 배제하고
+   '저가 3일선 이탈'로 단일화.
 """
 
 import pandas as pd
 import numpy as np
 import logging
+from datetime import datetime
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# WMA (가중이동평균) 계산 헬퍼
+# 실시간 3일선(M/3) 계산 함수
 # ═══════════════════════════════════════════════════════════════
-def calc_wma(series: pd.Series, period: int) -> pd.Series:
+def calculate_day3_m_line(daily_df: Optional[pd.DataFrame], current_price: float) -> float:
     """
-    가중이동평균(Weighted Moving Average)을 계산합니다.
-    WMA = Σ(가중치 × 가격) / Σ(가중치)
+    일봉 실시간 3일선 M/3 계산:
+    M = 현재가 + 전일종가(1) + 전전일종가(2)
+    기준선 = M / 3.0
     """
-    if series is None or len(series) < period:
-        return pd.Series([np.nan] * (len(series) if series is not None else 0))
-    weights = np.arange(1, period + 1, dtype=float)
-    weight_sum = weights.sum()
-    return series.rolling(window=period, min_periods=period).apply(
-        lambda prices: np.dot(prices, weights) / weight_sum,
-        raw=True
-    )
+    if daily_df is None or len(daily_df) < 2 or current_price <= 0:
+        return 0.0
+
+    df_d = daily_df.copy()
+    col_map = {col: str(col).lower() for col in df_d.columns if str(col).lower() in ('open', 'high', 'low', 'close', 'date')}
+    df_d.rename(columns=col_map, inplace=True)
+
+    today_str = datetime.now().strftime('%Y%m%d')
+
+    if 'date' in df_d.columns:
+        last_date = str(df_d['date'].iloc[-1]).replace('-', '').strip()
+        # 오늘 날짜 일봉 캔들이 이미 포함되어 있으면 Day-1(전일), Day-2(전전일) 사용
+        if last_date == today_str and len(df_d) >= 3:
+            pred1 = float(df_d['close'].iloc[-2])
+            pred2 = float(df_d['close'].iloc[-3])
+        else:
+            pred1 = float(df_d['close'].iloc[-1])
+            pred2 = float(df_d['close'].iloc[-2]) if len(df_d) >= 2 else pred1
+    else:
+        pred1 = float(df_d['close'].iloc[-1])
+        pred2 = float(df_d['close'].iloc[-2]) if len(df_d) >= 2 else pred1
+
+    m = float(current_price) + pred1 + pred2
+    return m / 3.0
 
 
 # ═══════════════════════════════════════════════════════════════
-# 15분봉 3-5 WMA 데드크로스 매도 신호 분석
+# 실시간 3일선 저가 이탈 단일 매도 신호 분석
 # ═══════════════════════════════════════════════════════════════
 def analyze_sell_signals(
-    df_15m: pd.DataFrame,
+    df_15m: Optional[pd.DataFrame] = None,
     daily_df: Optional[pd.DataFrame] = None,
     buy_price: float = 0.0,
     current_price: Optional[float] = None,
     touch_high: float = 0.0
 ) -> Dict[str, Any]:
     """
-    15분봉 DataFrame의 WMA 3과 WMA 5를 계산하여 데드크로스(WMA 3 < WMA 5) 시에만 매도 신호를 판정합니다.
+    저가가 실시간 3일선(M/3) 아래로 떨어지면 전량 매도하는 단일화 매도 로직.
+
+    Parameters
+    ----------
+    df_15m : Optional[pd.DataFrame]
+        15분봉 데이터 (최신 캔들의 low/close 확인용)
+    daily_df : Optional[pd.DataFrame]
+        일봉 데이터 (실시간 3일선 산출용)
+    buy_price : float
+        매수 평단가
+    current_price : Optional[float]
+        실시간 현재가
+    touch_high : float
+        장중 최고가 (참고용)
 
     Returns
     -------
     dict:
         sell           : bool   - 매도 신호 여부
         close          : float  - 현재 종가 / 실시간가
+        low            : float  - 당봉 저가
         buy_price      : float  - 매입단가
         profit_pct     : float  - 현재 수익률(%)
-        m_resistance   : float  - M선 저항 가격 (참고용)
-        wma3           : float  - 15분봉 WMA3 값
-        wma5           : float  - 15분봉 WMA5 값
-        sma5           : float  - 하위 호환용 (WMA3 값)
-        sma20          : float  - 하위 호환용 (WMA5 값)
-        sma40          : float  - 0.0
-        reason         : str    - 매도 사유 메시지
-        exit_type      : str    - 'DEAD_CROSS_3_5_WMA'
+        day3_m_line    : float  - 실시간 3일선(M/3) 가격
+        m_resistance   : float  - 3일선 가격 (하위 호환)
+        wma3           : float  - 하위 호환용 (0.0)
+        wma5           : float  - 하위 호환용 (0.0)
+        sma5           : float  - 하위 호환용 (0.0)
+        sma20          : float  - 하위 호환용 (0.0)
+        sma40          : float  - 하위 호환용 (0.0)
+        reason         : str    - 매도/홀딩 사유 메시지
+        exit_type      : str    - 'DAY3_LOW_BREAK' 또는 ''
     """
     default_res = {
         "sell": False,
         "close": 0.0,
+        "low": 0.0,
         "buy_price": buy_price,
         "profit_pct": 0.0,
+        "day3_m_line": 0.0,
         "m_resistance": 0.0,
         "wma3": 0.0,
         "wma5": 0.0,
@@ -81,141 +119,69 @@ def analyze_sell_signals(
         "exit_type": ""
     }
 
-    if df_15m is None or df_15m.empty:
-        return default_res
+    # 1. 현재가 및 최신 봉 저가(low) 추출
+    close_p = 0.0
+    low_p = 0.0
 
-    df = df_15m.copy()
-    col_map = {col: str(col).lower() for col in df.columns if str(col).lower() in ('open', 'high', 'low', 'close', 'volume')}
-    df.rename(columns=col_map, inplace=True)
+    if df_15m is not None and not df_15m.empty:
+        df = df_15m.copy()
+        col_map = {col: str(col).lower() for col in df.columns if str(col).lower() in ('open', 'high', 'low', 'close', 'volume')}
+        df.rename(columns=col_map, inplace=True)
+        latest = df.iloc[-1]
+        close_p = float(latest['close']) if 'close' in latest and pd.notna(latest['close']) else 0.0
+        low_p = float(latest['low']) if 'low' in latest and pd.notna(latest['low']) else close_p
 
-    if 'close' not in df.columns or len(df) < 5:
-        return default_res
-
-    close_p = float(df.iloc[-1]['close'])
     curr_p = float(current_price) if current_price and current_price > 0 else close_p
+    if low_p <= 0:
+        low_p = curr_p
+
     profit_pct = ((curr_p - buy_price) / buy_price * 100.0) if buy_price > 0 else 0.0
 
-    # 15분봉 WMA3 및 WMA5 계산
-    df['wma3'] = calc_wma(df['close'], 3)
-    df['wma5'] = calc_wma(df['close'], 5)
+    # 2. 실시간 3일선 M/3 계산
+    day3_m_line = calculate_day3_m_line(daily_df, curr_p)
 
-    latest = df.iloc[-1]
-    wma3_now = float(latest['wma3']) if pd.notna(latest['wma3']) else 0.0
-    wma5_now = float(latest['wma5']) if pd.notna(latest['wma5']) else 0.0
-
-    # ─────────────────────────────────────────────────────────────
-    # [1단계] 수익구간 방어: 다이나믹 트레일링 스탑 & 본전 보존 스탑 (Dynamic Profit Lock)
-    # ─────────────────────────────────────────────────────────────
-    max_price = max(touch_high, curr_p)
-    max_profit_pct = ((max_price - buy_price) / buy_price * 100.0) if buy_price > 0 else profit_pct
-
-    # 1-1. [본전 보존 스탑 (Break-Even Stop)]
-    # 장중 최고 수익률 +1.0% 이상 달성 후 주가가 밀려 본전(+0.2% 수수료 보전)까지 내려오면 원금 보존 즉시 청산!
-    if max_profit_pct >= 1.0 and profit_pct <= 0.2:
-        return {
-            "sell": True,
-            "close": curr_p,
-            "buy_price": buy_price,
-            "profit_pct": profit_pct,
-            "m_resistance": 0.0,
-            "wma3": wma3_now,
-            "wma5": wma5_now,
-            "sma5": wma3_now,
-            "sma20": wma5_now,
-            "sma40": 0.0,
-            "reason": (
-                f"🛡️ [본전 보존 스탑 가동] 최고 수익률(+{max_profit_pct:.2f}%) 도달 후 본전(+0.2%) 회귀 "
-                f"➔ 원금 100% 보존 즉시 매도 (현재 손익률: {profit_pct:+.2f}%)"
-            ),
-            "exit_type": "BREAK_EVEN_STOP"
-        }
-
-    # 1-2. [다이나믹 트레일링 익절 (Trailing Stop)]
-    # +1.5% 이상 수익 도달 시: 고점 대비 0.5% 하락 시 익절 락인 (+1.5% ➔ +1.0% 스탑)
-    # +2.5% 이상 수익 도달 시: 고점 대비 0.8% 하락 시 익절 락인 (+2.5% ➔ +1.7% 스탑)
-    # +4.0% 이상 수익 도달 시: 고점 대비 1.0% 하락 시 익절 락인 (+4.0% ➔ +3.0% 스탑)
-    if max_profit_pct >= 1.5:
-        if max_profit_pct >= 4.0:
-            floor_profit_pct = max_profit_pct - 1.0
-        elif max_profit_pct >= 2.5:
-            floor_profit_pct = max_profit_pct - 0.8
-        else:
-            floor_profit_pct = max_profit_pct - 0.5
-
-        if profit_pct < floor_profit_pct:
-            return {
-                "sell": True,
-                "close": curr_p,
-                "buy_price": buy_price,
-                "profit_pct": profit_pct,
-                "m_resistance": 0.0,
-                "wma3": wma3_now,
-                "wma5": wma5_now,
-                "sma5": wma3_now,
-                "sma20": wma5_now,
-                "sma40": 0.0,
-                "reason": (
-                    f"🎯 [다이나믹 트레일링 익절 가동] 최고 수익률(+{max_profit_pct:.2f}%) 대비 "
-                    f"마지노선(+{floor_profit_pct:.2f}%) 하향 이탈 ➔ 수익 확정 시장가 매도 (실현: {profit_pct:+.2f}%)"
-                ),
-                "exit_type": "STEP_TRAILING_STOP"
-            }
-
-    if wma3_now > 0 and wma5_now > 0:
-        # ─────────────────────────────────────────────────────────────
-        # [2단계] 15분봉 WMA 3-5 데드크로스 발생 시 전량 매도
-        # ─────────────────────────────────────────────────────────────
-        if wma3_now < wma5_now:
-            diff_pct = ((wma3_now - wma5_now) / wma5_now) * 100.0
-            return {
-                "sell": True,
-                "close": curr_p,
-                "buy_price": buy_price,
-                "profit_pct": profit_pct,
-                "m_resistance": 0.0,
-                "wma3": wma3_now,
-                "wma5": wma5_now,
-                "sma5": wma3_now,
-                "sma20": wma5_now,
-                "sma40": 0.0,
-                "reason": (
-                    f"📉 [15분봉 3-5 WMA 데드크로스 매도] 15분봉 WMA3({wma3_now:,.0f}원) < "
-                    f"WMA5({wma5_now:,.0f}원) 하향 이탈 (이격도: {diff_pct:+.2f}%, 현재가: {curr_p:,.0f}원, 손익률: {profit_pct:+.2f}%)"
-                ),
-                "exit_type": "DEAD_CROSS_3_5_WMA"
-            }
-
-    # ─────────────────────────────────────────────────────────────
-    # [3단계] -2.5% strict stop-loss 방어
-    # ─────────────────────────────────────────────────────────────
-    if profit_pct <= -2.5:
-        return {
-            "sell": True,
-            "close": curr_p,
-            "buy_price": buy_price,
-            "profit_pct": profit_pct,
-            "m_resistance": 0.0,
-            "wma3": wma3_now,
-            "wma5": wma5_now,
-            "sma5": wma3_now,
-            "sma20": wma5_now,
-            "sma40": 0.0,
-            "reason": f"🚨 [Strict 손절] 손실률({profit_pct:+.2f}%) <= -2.5% 마지노선 이탈 ➔ 손절 매도",
-            "exit_type": "STRICT_STOP_LOSS"
-        }
-
-    return {
-        "sell": False,
+    default_res.update({
         "close": curr_p,
-        "buy_price": buy_price,
+        "low": low_p,
         "profit_pct": profit_pct,
-        "m_resistance": 0.0,
-        "wma3": wma3_now,
-        "wma5": wma5_now,
-        "sma5": wma3_now,
-        "sma20": wma5_now,
-        "sma40": 0.0,
-        "reason": f"15분봉 WMA3({wma3_now:,.0f}원) >= WMA5({wma5_now:,.0f}원) 정배열/상승 탄력 유지 중 (현재 수익률: {profit_pct:+.2f}%, 최고: +{max_profit_pct:.2f}%)",
-        "exit_type": ""
-    }
+        "day3_m_line": day3_m_line,
+        "m_resistance": day3_m_line,
+    })
 
+    # 3. 단일 매도 판단: 저가가 3일선 아래로 떨어지면 매도!
+    if day3_m_line > 0:
+        # 15분봉 당봉 저가 또는 실시간 현재가가 3일선 미만으로 하향 이탈 시 매도
+        if low_p < day3_m_line or curr_p < day3_m_line:
+            diff_pct = ((curr_p - day3_m_line) / day3_m_line) * 100.0
+            default_res.update({
+                "sell": True,
+                "reason": (
+                    f"📉 [3일선 저가 이탈 단일 매도] 저가({low_p:,.0f}원)가 "
+                    f"실시간 3일선({day3_m_line:,.0f}원) 하향 이탈 "
+                    f"(현재가: {curr_p:,.0f}원, 3일선 대비: {diff_pct:+.2f}%, 손익률: {profit_pct:+.2f}%)"
+                ),
+                "exit_type": "DAY3_LOW_BREAK"
+            })
+            return default_res
+        else:
+            default_res.update({
+                "sell": False,
+                "reason": (
+                    f"✅ [3일선 지지 유지] 저가({low_p:,.0f}원) >= 3일선({day3_m_line:,.0f}원) "
+                    f"(현재가: {curr_p:,.0f}원, 손익률: {profit_pct:+.2f}%, 지속 홀딩)"
+                ),
+                "exit_type": ""
+            })
+            return default_res
+
+    # 4. 일봉 데이터 미수신/부족 시 비상 하드 손절(-5.0%) 안전망
+    if profit_pct <= -5.0 and buy_price > 0:
+        default_res.update({
+            "sell": True,
+            "reason": f"🚨 [비상 하드 손절] 손실률({profit_pct:+.2f}%) <= -5.0% 마지노선 도달 (3일선 미수신 안전망)",
+            "exit_type": "EMERGENCY_STOP_LOSS"
+        })
+        return default_res
+
+    default_res["reason"] = f"3일선 데이터 산출 대기 중 (현재가: {curr_p:,.0f}원)"
+    return default_res
