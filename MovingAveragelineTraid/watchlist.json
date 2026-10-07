@@ -453,5 +453,37 @@
         "name": "동국씨엠",
         "weight": 1.0,
         "source": "today.csv"
+    },
+    "002720": {
+        "name": "국제약품",
+        "weight": 1.4,
+        "theme": "마이코플라스마 폐렴",
+        "role": "LEADER",
+        "catalyst": "📰[NLP] ✨급등 ✨특징주",
+        "source": "premarket_scanner"
+    },
+    "253840": {
+        "name": "수젠텍",
+        "weight": 1.2,
+        "theme": "마이코플라스마 폐렴",
+        "role": "SECOND",
+        "catalyst": "📰[NLP] ✨급등",
+        "source": "premarket_scanner"
+    },
+    "142280": {
+        "name": "녹십자엠에스",
+        "weight": 1.4,
+        "theme": "코로나19(진단키트)",
+        "role": "LEADER",
+        "catalyst": "📰[NLP] ✨강세 ✨상한가",
+        "source": "premarket_scanner"
+    },
+    "065440": {
+        "name": "이루온",
+        "weight": 1.2,
+        "theme": "유심(USIM)",
+        "role": "SECOND",
+        "catalyst": "📰[NLP] 일반 시황/중립",
+        "source": "premarket_scanner"
     }
 }

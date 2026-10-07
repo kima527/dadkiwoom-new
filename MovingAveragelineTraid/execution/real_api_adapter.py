@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 # 진짜 실전 API를 가져오기 위한 경로 설정
 real_trading_path = os.path.abspath(r"C:\Users\zoela\OneDrive\바탕 화면\PythonWorksplace\real trading")
 if real_trading_path not in sys.path:
-    sys.path.insert(0, real_trading_path)
+    sys.path.append(real_trading_path)
 
 try:
     from kiwoom_client import KiwoomRealClient

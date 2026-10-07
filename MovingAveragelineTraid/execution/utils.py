@@ -46,6 +46,8 @@ class TradeState:
         self.m_partial_sold = False  # M선 도달 50% 1차 익절 완료 여부
         self.m_touch_high = 0.0      # M선 도달 후 기록한 최고가
         self.quick_partial_sold = False # +1.2% 단기 빠른 1차 분할 익절 여부
+        # ── 당일 매매 상태 자동 리셋용 ──
+        self.last_action_date = None    # 마지막 매수/매도 처리 일자 ("YYYY-MM-DD")
 
     def to_dict(self) -> dict:
         return {
@@ -70,6 +72,7 @@ class TradeState:
             'm_partial_sold': getattr(self, 'm_partial_sold', False),
             'm_touch_high': getattr(self, 'm_touch_high', 0.0),
             'quick_partial_sold': getattr(self, 'quick_partial_sold', False),
+            'last_action_date': getattr(self, 'last_action_date', None),
         }
 
     @classmethod
@@ -97,6 +100,7 @@ class TradeState:
         state.m_partial_sold = data.get('m_partial_sold', False)
         state.m_touch_high = data.get('m_touch_high', 0.0)
         state.quick_partial_sold = data.get('quick_partial_sold', False)
+        state.last_action_date = data.get('last_action_date')
         return state
 
 def _parse_tick_time(t: dict) -> Optional[float]:

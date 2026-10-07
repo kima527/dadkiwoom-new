@@ -21,6 +21,11 @@ trading_bot.py - 30분봉 260이평 W자 반등 우선 매수 + 실시간 3일�
 
 import os
 import sys
+
+_exec_dir = os.path.abspath(os.path.dirname(__file__))
+if sys.path[0] != _exec_dir:
+    sys.path.insert(0, _exec_dir)
+
 import json
 import time
 import socket
@@ -73,15 +78,28 @@ class SingleInstanceLock:
                 pass
             self.sock = None
 
-# real trading 폴더의 websocket_client를 가져오기 위한 경로 추가
+# real trading 폴더의 websocket_client를 가져오기 위한 경로 추가 (로컬 모듈 우선)
 real_trading_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'real trading'))
 if real_trading_path not in sys.path:
-    sys.path.insert(0, real_trading_path)
+    sys.path.append(real_trading_path)
 
 from websocket_client import KiwoomWebSocketClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# ── 파일 로그 (콘솔창을 닫아도 "왜 매수 안 했나" 사후 추적 가능) ──
+# kiwoom_client가 먼저 basicConfig를 호출하므로 루트 로거에 FileHandler를 직접 추가한다.
+try:
+    _log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".tmp", "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_path = os.path.join(_log_dir, f"trading_bot_{datetime.now().strftime('%Y%m%d')}.log")
+    _fh = logging.FileHandler(_log_path, encoding="utf-8")
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(_fh)
+except Exception as _e:
+    logger.warning(f"파일 로그 초기화 실패: {_e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -235,6 +253,7 @@ class BuyManager:
         self.params_f4 = Formula4Params(min_supply_money=20.0)
         self.params_squeeze = SqueezeAlignmentParams(min_supply_money_15m=15.0, max_squeeze_pct=1.5, max_bar_gain_pct=4.5)
         self._static_filter_cache = {}     # 당일 시가총액 & 5일 거래대금 정적 필터 캐시 {code: (passed: bool, date: str)}
+        self._evaluating_codes = set()      # 동시 중복 스나이핑 방지 락 {code}
 
     async def run(self, holdings: dict, unexecuted: list):
         """매수 감시 사이클 실행"""
@@ -690,6 +709,11 @@ class BuyManager:
             else:
                 logger.debug(f"⏭️ [{name}] 돌파 찰나 조건 미충족 - 매수 스킵")
 
+        logger.info(
+            f"🔎 [매수 스캔] 감시종목 {len(self.watchlist)}개 평가 → 매수 후보 {len(buy_candidates)}개 "
+            f"(보유 {len(holdings)}개, 매수대기 {len(pending_buy_codes)}개)"
+        )
+
         if not buy_candidates:
             return
 
@@ -850,6 +874,7 @@ class BuyManager:
                     state.is_w_rebound = is_w
                     state.buy_time = time.time()  # 매수 시각 기록 (30분 보호 유예용)
                     state.m_touch_high = float(price_limit)  # 매수가로 최고가 추적 초기화
+                    state.last_action_date = datetime.now().strftime("%Y-%m-%d")
                     total_positions += 1
                     logger.info(
                         f"✅ [{name}] 매수 주문 전송: "
@@ -871,6 +896,9 @@ class BuyManager:
         키움 실시간 조건검색(on_insert) 편입 즉시 10초 루프 대기 없이
         우선순위 6대 전략(380->370->360->350->340->330) 전속력 매수 검증 및 주문 전송!
         """
+        if code in self._evaluating_codes:
+            return
+        self._evaluating_codes.add(code)
         try:
             state = self.trade_states.setdefault(code, TradeState())
             if state.buy_step >= 1 or state.trade_ended or state.is_holding:
@@ -901,9 +929,11 @@ class BuyManager:
             name = self.watchlist.get(code, {}).get('name') or await asyncio.to_thread(self.client.get_stock_name, code)
 
             # 지수 급락 방어 모드 확인 (종목 소속 시장별 독립 판정)
+            # run()과 동일하게 정규장(09:00~15:30)에서만 지수 방어 적용
             stock_market = self.market_guard.get_stock_market(code) if self.market_guard else "KOSDAQ"
             is_stock_market_danger = False
-            if self.market_guard:
+            now_t = datetime.now().time()
+            if self.market_guard and (dtime(9, 0, 0) <= now_t <= dtime(15, 30, 0)):
                 market_status = await self.market_guard.check_market_health()
                 if stock_market == "KOSDAQ":
                     is_stock_market_danger = not market_status.get('kosdaq_safe', True)
@@ -922,8 +952,11 @@ class BuyManager:
                 return
 
             # 테마 가중치 및 대장주 역할
-            weight = self.theme_manager.get_stock_weight(code) if self.theme_manager else 1.0
-            role = self.theme_manager.get_stock_role(code) if self.theme_manager else "일반"
+            try:
+                weight = self.theme_manager.get_stock_weight(code) if (self.theme_manager and hasattr(self.theme_manager, 'get_stock_weight')) else 1.0
+                role = self.theme_manager.get_stock_role(code) if (self.theme_manager and hasattr(self.theme_manager, 'get_stock_role')) else "일반"
+            except Exception:
+                weight, role = 1.0, "일반"
 
             # ── [Step 2] 실시간 뉴스 모멘텀 점수 반영 및 긴급 악재(CB/횡령/유증) 차단 ──
             news_info = self.news_agent.fetch_news_score(code, name) if self.news_agent else {'bonus': 0.0, 'is_emergency_block': False, 'score': 50, 'catalyst': '뉴스 미반영'}
@@ -1121,7 +1154,10 @@ class BuyManager:
                 return
 
             if qty > 0 and not state.is_holding:
-                role_tag = self.theme_manager.get_stock_role(code) if self.theme_manager else "NONE"
+                try:
+                    role_tag = self.theme_manager.get_stock_role(code) if (self.theme_manager and hasattr(self.theme_manager, 'get_stock_role')) else "NONE"
+                except Exception:
+                    role_tag = "NONE"
                 logger.info(
                     f"⚡ [0.1초 편입 스나이핑] [{name}({code}) | {role_tag} | {selected_signal['priority_score']:.0f}점] "
                     f"편입 즉시 지정가 매수 전송! {selected_signal['reason']}"
@@ -1145,6 +1181,7 @@ class BuyManager:
                     state.signal_1 = float(target_price)
                     state.is_w_rebound = is_w
                     state.m_touch_high = float(price_limit)
+                    state.last_action_date = datetime.now().strftime("%Y-%m-%d")
                     if self.db_logger:
                         self.db_logger.log_buy(
                             code=code, name=name, buy_price=price_limit,
@@ -1154,6 +1191,8 @@ class BuyManager:
                         )
         except Exception as e:
             logger.warning(f"⚠️ evaluate_single_stock 에러 ({code}): {e}")
+        finally:
+            self._evaluating_codes.discard(code)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1240,6 +1279,7 @@ class SellManager:
                     state.sold_once = True
                     state.is_holding = False
                     state.trade_ended = True
+                    state.last_action_date = datetime.now().strftime("%Y-%m-%d")
                     logger.info(f"✅ [{name}] 매도 주문 전송 완료 (주문번호: {order_no})")
                     # SQLite DB에 매도 손익 정산 기록
                     if self.db_logger:
@@ -1281,6 +1321,7 @@ class TradingBot:
         self.db_logger = TradeDBLogger()
         self.cycle_count = 0
         self.auto_scanned_date = None  # 당일 20:00 자동 스캔 완료 일자 (중복 실행 방지)
+        self.last_reset_date = None    # 일일 상태 리셋 완료 일자
         self.is_scanning = False
 
         # ── 실시간 테마 관리자 및 뉴스/장전 에이전트 생성 ──
@@ -1318,8 +1359,11 @@ class TradingBot:
                 name = await asyncio.to_thread(self.client.get_stock_name, code)
             
             # 테마 매니저를 통해 대장주 가중치 및 역할 즉시 부여 (Step 1 연동)
-            weight = self.theme_manager.get_stock_weight(code) if self.theme_manager else 1.0
-            role = self.theme_manager.get_stock_role(code) if self.theme_manager else "NONE"
+            try:
+                weight = self.theme_manager.get_stock_weight(code) if (self.theme_manager and hasattr(self.theme_manager, 'get_stock_weight')) else 1.0
+                role = self.theme_manager.get_stock_role(code) if (self.theme_manager and hasattr(self.theme_manager, 'get_stock_role')) else "NONE"
+            except Exception:
+                weight, role = 1.0, "NONE"
             self.watchlist[code] = {'name': name, 'weight': weight, 'role': role}
             logger.info(f"✅ 관심종목 추가 완료: {name} ({code}) [역할: {role}, 테마가중치: {weight}x]")
             self.save_watchlist()
@@ -1400,6 +1444,62 @@ class TradingBot:
                 logger.info(f"💾 이전 상태 정보를 로드했습니다. ({len(self.trade_states)}개 종목)")
             except Exception as e:
                 logger.error(f"상태 정보 로드 실패: {e}")
+        self.reset_daily_states()
+
+    def _get_codes_traded_today(self, today_str: str) -> set:
+        """오늘 DB에 매수 또는 매도 기록이 있는 종목코드 집합 (last_action_date 도입 이전 데이터 보완용)"""
+        codes = set()
+        if not self.db_logger:
+            return codes
+        try:
+            conn = self.db_logger._get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT code FROM trades WHERE trade_date = ? OR substr(buy_time,1,10) = ? OR substr(sell_time,1,10) = ?",
+                (today_str, today_str, today_str)
+            )
+            codes = {str(r[0]).strip() for r in cur.fetchall() if r and r[0]}
+            conn.close()
+        except Exception as e:
+            logger.warning(f"당일 체결 종목 DB 조회 실패: {e}")
+        return codes
+
+    def reset_daily_states(self):
+        """
+        날짜가 바뀐 미보유 종목의 trade_ended / buy_step을 초기화한다.
+        (이전에는 리셋 로직이 없어 한 번 매매한 종목이 영구 매수 차단됨)
+        - 보유 중 / 미체결 주문 있는 종목은 건드리지 않음
+        - 오늘 매매한 종목(last_action_date==오늘 또는 오늘 DB 기록)은 당일 재매수 금지 유지
+        """
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        traded_today = self._get_codes_traded_today(today_str)
+        reset_cnt = 0
+        for code, st in self.trade_states.items():
+            if st.is_holding:
+                continue
+            if any(o['code'] == code for o in self.tracked_orders.values()):
+                continue
+            if not (st.trade_ended or st.buy_step >= 1):
+                continue
+            if code in traded_today:
+                st.last_action_date = today_str  # 오늘 매매 종목 → 당일 재매수 금지 유지
+                continue
+            if st.last_action_date == today_str:
+                continue
+            st.trade_ended = False
+            st.buy_step = 0
+            st.sold_once = False
+            st.first_buy_candle_time = None
+            st.first_qty = 0
+            st.is_w_rebound = False
+            st.buy_time = 0.0
+            st.m_touch_high = 0.0
+            reset_cnt += 1
+        self.last_reset_date = today_str
+        logger.info(
+            f"🔄 [일일 상태 리셋] {reset_cnt}개 종목 매수 가능 상태로 복구 "
+            f"(오늘 매매 종목 {len(traded_today)}개는 당일 재매수 금지 유지)"
+        )
 
     def save_states(self):
         state_file = os.path.join(os.path.dirname(__file__), "trade_states.json")
@@ -1489,6 +1589,10 @@ class TradingBot:
         # 1. 미체결 주문 관리 (3분 경과 주문 자동 취소)
         await self.manage_unexecuted_orders()
 
+        # 1-1. 날짜 변경 시 일일 상태 리셋 (자정 넘겨 연속 실행되는 경우)
+        if self.last_reset_date != datetime.now().strftime("%Y-%m-%d"):
+            self.reset_daily_states()
+
         # 2. 계좌 상태 조회
         holdings = await asyncio.to_thread(self.client.get_account_holdings)
         unexecuted = await asyncio.to_thread(self.client.get_unexecuted_orders)
@@ -1525,6 +1629,7 @@ class TradingBot:
                     logger.info(f"✅ 잔고 소진 확인 (매도 체결 완료): {code}")
                     state.is_holding = False
                     state.trade_ended = True  # 당일 재매수 금지 (무한 반복 매매 방지)
+                    state.last_action_date = datetime.now().strftime("%Y-%m-%d")
 
         # 5. 보유 종목 상태 동기화
         for code in list(holdings.keys()):

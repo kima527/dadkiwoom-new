@@ -50,12 +50,108 @@ from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 from strategy_15m_turnaround import evaluate_15m_entry, Turnaround15mParams
 from theme_manager import ThemeManager
 
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("TomorrowScanner")
 
 
+def scan_40pct_surge_stocks(client: RealAPIAdapter) -> dict:
+    """
+    최근 10거래일 내 2일간 40% 이상 급등한 주도주 전수 검색:
+    - 대상: 코스피, 코스닥 전체 상장종목 (우선주/ETF/스팩 제외)
+    - 시가총액: 1,000억원 ~ 5조원
+    - 증거금률: 20%, 30%, 40%, 45%, 50% (증거금 100% 잡주 제외)
+    - 급등 조건: 최근 10거래일 구간에서 2일간 상승률 >= 40% (종가 또는 장중 최고 기준)
+    """
+    surge_stocks = {}
+    if yf is None:
+        logger.warning("yfinance 라이브러리 미설치로 40% 급등주 전수 스캔을 건너뜁니다.")
+        return surge_stocks
+
+    exclude_keywords = [
+        "KODEX", "TIGER", "KBSTAR", "KINDEX", "ARIRANG", "KOSEF", "HANARO",
+        "ACE", "ETN", "스팩", "SOL", "인버스", "레버리지", "선물", "KOACT",
+        "TIMEFOLIO", "WOORI", "히어로즈", "PLUS", "WON", "2X", "KRX", "합병", "RISE"
+    ]
+
+    try:
+        candidates = []
+        for m in ['0', '10']:
+            suffix = '.KS' if m == '0' else '.KQ'
+            res = client.real_client.stock_info_api.stock_information_list_request_ka10099(market_type=m)
+            for s in res.get('list', []):
+                code = s.get('code', '')
+                name = s.get('name', '')
+                state = s.get('state', '')
+
+                if any(kw in name for kw in exclude_keywords) or name.endswith('우') or name.endswith('우B'):
+                    continue
+
+                if not any(f'증거금{r}%' in state for r in [20, 30, 40, 45, 50]):
+                    continue
+
+                try:
+                    cnt = int(s.get('listCount', '0'))
+                    prc = abs(int(s.get('lastPrice', '0')))
+                    mcap = cnt * prc
+                    if 100_000_000_000 <= mcap <= 5_000_000_000_000:
+                        candidates.append((code, name, f"{code}{suffix}", mcap, state))
+                except Exception:
+                    pass
+
+        logger.info(f"⚡ [급등주 전수 스캔] 시총 1,000억~5조 & 증거금 20~50% 1차 통과: {len(candidates)}개 종목 시세 분석 중...")
+        tickers = [c[2] for c in candidates]
+        t_map = {c[2]: (c[0], c[1]) for c in candidates}
+
+        batch_size = 100
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i+batch_size]
+            try:
+                df = yf.download(batch, period='1mo', progress=False)
+                if df.empty or 'Close' not in df:
+                    continue
+                close_df = df['Close']
+                high_df = df['High']
+
+                for t in batch:
+                    if t not in close_df.columns:
+                        continue
+                    sc = close_df[t].dropna()
+                    sh = high_df[t].dropna() if t in high_df.columns else sc
+                    if len(sc) < 3:
+                        continue
+
+                    recent_c = sc.iloc[-12:]
+                    recent_h = sh.iloc[-12:]
+
+                    max_2d = 0.0
+                    for idx in range(2, len(recent_c)):
+                        base = recent_c.iloc[idx-2]
+                        if base > 0:
+                            g_c = (recent_c.iloc[idx] - base) / base * 100.0
+                            g_h = (recent_h.iloc[idx] - base) / base * 100.0
+                            max_2d = max(max_2d, g_c, g_h)
+
+                    if max_2d >= 40.0:
+                        c_code, c_name = t_map[t]
+                        surge_stocks[c_code] = c_name
+                        logger.info(f"  🔥 [2일 40% 급등주 포착] {c_name}({c_code}) | 2일 최고상승: +{max_2d:.1f}%")
+            except Exception as e:
+                logger.debug(f"배치 스캔 오류 ({i}): {e}")
+
+        logger.info(f"✅ 최근 10거래일 2일 40% 이상 급등주 총 {len(surge_stocks)}개 발굴 완료!")
+    except Exception as e:
+        logger.warning(f"급등주 전수 스캔 중 예외: {e}")
+
+    return surge_stocks
+
+
 def build_candidate_universe(client: RealAPIAdapter) -> dict:
-    """스캔 대상 종목군 구성 (거래대금 상위 + 테마주 + 기존 관심종목)"""
+    """스캔 대상 종목군 구성: 최근 10일내 2일 40% 급등 주도주 최우선 탑재"""
     universe = {}
 
     exclude_keywords = [
@@ -74,46 +170,14 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
         except Exception:
             pass
 
-    logger.info("🔍 1. 키움 API 거래대금 상위 150종목 수집 중...")
-    try:
-        raw_top = client.real_client.get_top_trading_value_stocks(limit=150)
-        for code_raw in raw_top:
-            try:
-                code = code_raw.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
-                if code in blacklist_codes:
-                    logger.info(f"🚫 [{code}] 블랙리스트 등록 종목으로 스캔 유니버스에서 원천 제외")
-                    continue
-                if len(code) == 6 and code.isalnum():
-                    name = client.get_stock_name(code) or ""
-                    if not name or any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
-                        continue
-                    universe[code] = name
-                    time.sleep(0.04)
-            except Exception:
-                continue
-        logger.info(f" -> 거래대금 상위 {len(universe)}개 일반 종목 로드 완료")
-    except Exception as e:
-        logger.warning(f"거래대금 상위 수집 중 오류: {e}")
+    # 1. [최우선] 최근 10거래일 내 2일간 40% 이상 급등한 주도주 전수 스캔
+    logger.info("🔍 1. 최근 10거래일 내 '2일간 40% 이상 급등' 주도주 전수 발굴 중...")
+    surge_universe = scan_40pct_surge_stocks(client)
+    for code, name in surge_universe.items():
+        if code not in blacklist_codes:
+            universe[code] = name
 
-    logger.info("🔍 2. 당일 등락률 상위 100종목 수집 중...")
-    try:
-        rates = client.real_client.get_top_fluctuation_stocks_with_rates(limit=100)
-        for code_raw in rates.keys():
-            try:
-                code = code_raw.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
-                if len(code) == 6 and code.isalnum() and code not in universe:
-                    name = client.get_stock_name(code) or ""
-                    if not name or any(kw in name for kw in exclude_keywords) or name.endswith("우") or name.endswith("우B"):
-                        continue
-                    universe[code] = name
-                    time.sleep(0.04)
-            except Exception:
-                continue
-        logger.info(f" -> 등락률 상위 포함 총 {len(universe)}개 종목 확보")
-    except Exception as e:
-        logger.warning(f"등락률 상위 수집 중 오류: {e}")
-
-    # 기존 관심종목 파일들 병합
+    # 2. 기존 관심종목 파일(today_picks.json) 병합
     picks_path = os.path.join(current_dir, "today_picks.json")
     if os.path.exists(picks_path):
         try:
@@ -121,27 +185,13 @@ def build_candidate_universe(client: RealAPIAdapter) -> dict:
                 old_picks = json.load(f)
                 for code, info in old_picks.items():
                     c = code.lstrip('A')
-                    if len(c) == 6 and c.isalnum() and c not in universe:
+                    if c not in blacklist_codes and len(c) == 6 and c.isalnum() and c not in universe:
                         name = info.get('name') or client.get_stock_name(c)
                         universe[c] = name
         except Exception:
             pass
 
-    # 핵심 주도 테마주 리스트 보강 (10조 이상 초대형주 제외, 실전 탄력성 높은 중소형/주도주 중심)
-    core_stocks = {
-        "042700": "한미반도체", "053690": "한미글로벌", "014620": "성광벤드",
-        "405100": "큐알티", "006110": "삼아알미늄", "034020": "두산에너빌리티",
-        "348370": "엔켐", "178320": "서진시스템", "047080": "한빛소프트",
-        "052460": "아이크래프트", "213420": "덕산네오룩스", "108490": "로보티즈",
-        "052300": "오션인더블유", "0039P0": "매드업", "080220": "제주반도체",
-        "153890": "져스텍", "002620": "제일파마홀딩스", "043360": "디지아이",
-        "043260": "성호전자", "330860": "네패스아크"
-    }
-    for c, n in core_stocks.items():
-        if c not in universe:
-            universe[c] = n
-
-    logger.info(f"🎯 최종 스캔 대상 유니버스: 총 {len(universe)}개 종목 확정")
+    logger.info(f"🎯 최종 스캔 대상 유니버스: 총 {len(universe)}개 급등 주도주 확정")
     return universe
 
 

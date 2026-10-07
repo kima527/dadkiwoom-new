@@ -3,15 +3,23 @@ import websockets
 import json
 import logging
 from typing import Callable, Coroutine
-from kiwoom_rest_api.auth.token import TokenManager
 import os
 import config
 
-logger = logging.getLogger(__name__)
-
+# ⚠️ kiwoom_rest_api.config는 import 시점에 환경변수를 읽어 고정하므로
+#    반드시 TokenManager import "이전에" 환경변수를 설정해야 한다.
 os.environ["KIWOOM_API_KEY"] = config.KIWOOM_APP_KEY
 os.environ["KIWOOM_API_SECRET"] = config.KIWOOM_REAL_APP_SECRET
 os.environ["KIWOOM_USE_SANDBOX"] = "false"
+
+import kiwoom_rest_api.config as _kw_config
+from kiwoom_rest_api.auth.token import TokenManager
+
+# 다른 모듈이 먼저 빈 환경변수로 import했더라도 키를 확실히 주입
+_kw_config.API_KEY = config.KIWOOM_APP_KEY
+_kw_config.API_SECRET = config.KIWOOM_REAL_APP_SECRET
+
+logger = logging.getLogger(__name__)
 
 SOCKET_URL = 'wss://api.kiwoom.com:10000/api/dostk/websocket'
 
@@ -42,9 +50,14 @@ class KiwoomWebSocketClient:
         """08:00 프리마켓 가동 전 강제 토큰 갱신 (Token Pre-flight Refresh)"""
         try:
             logger.info("🔑 [TokenManager] 08:00 프리마켓 가동 전 토큰 강제 사전 갱신 진행 중...")
-            token = self.token_manager.get_token(force_refresh=True)
+            # TokenManager.get_token()에는 force_refresh 인자가 없으므로 캐시를 비워 재발급을 유도한다.
+            self.token_manager._access_token = None
+            self.token_manager._token_expiry = None
+            token = self.token_manager.get_token()
             if token:
                 logger.info("✅ [TokenManager] 신규 Access Token 사전 발급 완료 (유효기간 3시간 보장)")
+            else:
+                logger.error("❌ [TokenManager] 토큰이 비어 있습니다. APP_KEY/SECRET 설정을 확인하세요.")
             return token
         except Exception as e:
             logger.error(f"❌ [TokenManager] 사전 토큰 갱신 실패: {e}")
@@ -157,6 +170,12 @@ class KiwoomWebSocketClient:
                 
                 if trnm == 'PING':
                     await self.send_message(response)
+                    continue
+
+                if trnm == 'SYSTEM':
+                    # 예: R10001 "동일한 App key로 접속이 되었습니다. 기존 세션은 종료가 됩니다"
+                    # → 다른 스크립트가 같은 AppKey로 웹소켓 접속 시 봇 세션이 끊김 (자동 재연결됨)
+                    logger.warning(f"⚠️ [웹소켓 SYSTEM] {response.get('code')} {response.get('message')}")
                     continue
                 
                 if trnm == 'LOGIN':
