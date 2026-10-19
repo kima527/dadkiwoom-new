@@ -1,16 +1,16 @@
 """
-trading_bot.py - 30분봉 260이평 W자 반등 우선 매수 + 실시간 3일선 저가 이탈 단일 매도 봇
-===========================================================================
+trading_bot.py - 120틱 WMA20-60 당일 첫 골든크로스 상승반전 최우선 매수 + WMA60 고점 하락반전 단일 매도 봇
+=========================================================================================================
 
 구조:
-  1. BuyManager  - 15분봉 4대수식/수급변곡 + 30분봉 260이평 W자 반등 최우선 매수
-  2. SellManager - 실시간 3일선(M/3) 저가 하향 이탈 단일 매도
+  1. BuyManager  - 120틱 WMA20-60 당일 첫 골든크로스 상승반전 최우선 + 15분봉 4대수식/압축 돌파 매수
+  2. SellManager - 120틱 WMA60 고점 하락반전 & WMA20 데드크로스 전량 시장가 매도
 
 전략 요약:
-  - 매수: 15분봉 4대 수식 올인원 돌파 최우선 + 30분봉 260이평 W자 반등 매수
-  - 매도: 저가가 실시간 3일선(M/3) 아래로 떨어지면 전량 시장가(03) 매도 (단일화)
+  - 매수: 120틱 WMA20-60 당일 첫번째 골든크로스 상승반전 최우선(400점) + 15분봉 이평압축/4대수식 돌파
+  - 매도: 120틱 WMA60 고점 하락반전(또는 WMA20-60 데드크로스) 시 전량 시장가(03) 매도 (단일화)
   - 오버나잇 허용, 세션 자동 연동 (NXT 프리 08:00 ~ KRX 정규 ~ NXT 애프터 20:00)
-  - 종목당 1주 / 검증 매수 모드
+  - 종목당 가용예수금 50% 분할 최대 2종목 집중 매수 모드
 
 실행 방법:
   python trading_bot.py                      # 전체 임무 실행
@@ -41,6 +41,7 @@ from strategy_15m_4formula_buy import evaluate_4formula_buy, Formula4Params
 from strategy_15m_squeeze_alignment import evaluate_15m_squeeze_alignment, SqueezeAlignmentParams
 from strategy_5d2v_surge_breakout import evaluate_5d2v_surge_breakout
 from strategy_15m_m_wma_squeeze import evaluate_15m_m_wma_squeeze
+from strategy_120t_wma60 import evaluate_120t_wma60_entry, evaluate_120t_wma60_exit, WMA60TickParams
 from db_logger import TradeDBLogger
 from scan_tomorrow_picks import run_scanner
 from theme_manager import ThemeManager
@@ -110,6 +111,11 @@ class MarketIndexGuard:
     KODEX 200(069500) 및 KODEX 코스닥150(229200)의 15분봉 및 당일 등락률을 모니터링하여,
     코스피와 코스닥 지수를 독립적으로 판정하고 종목의 소속 시장(코스피/코스닥)에 맞춰
     1:1 개별 안전장치를 적용하는 모듈.
+
+    ★ [229200 코스닥150 펀드 대용 안내]:
+    키움 API에서 업종지수 조회 대비 일반 주식/ETF 코드가 15분봉 및 실시간 틱 데이터 호출이
+    훨씬 빠르고 왜곡 없이 안정적이므로, 코스닥 대표 우량주 150종목을 추종하는
+    229200(KODEX 코스닥150)을 코스닥 지수의 대표 Proxy로 100% 최적 활용합니다.
     """
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock):
         self.client = client
@@ -225,7 +231,8 @@ class MarketIndexGuard:
 # ═══════════════════════════════════════════════════════════════
 class BuyManager:
     """
-    일봉 SMA20 돌파 & HH 돌파 또는 30분봉 SMA260 돌파 & HH 돌파 시 종목당 1주 매수.
+    15분봉 4대수식/수급변곡 + 30분봉 260이평 W자 반등 매수 매니저.
+    [설정] 예수금의 50%씩 최대 2종목 집중 매수 + 역선택 방어 적응형 매수가 적용.
     지수 급락 시에는 신규 매수를 일시 보류하여 자산을 보호함.
     """
 
@@ -235,8 +242,9 @@ class BuyManager:
                  db_logger: TradeDBLogger = None,
                  theme_manager = None,
                  news_agent: RealtimeNewsAgent = None,
-                 buy_amount: int = 5000000, max_positions: int = 99,
-                 buy_qty: int = 1):
+                 buy_amount: int = 0, max_positions: int = 2,
+                 buy_qty: int = 1, use_cash_ratio: bool = True,
+                 cash_ratio_per_stock: float = 0.50):
         self.client = client
         self.api_lock = api_lock
         self.trade_states = trade_states
@@ -244,16 +252,87 @@ class BuyManager:
         self.watchlist = watchlist
         self.market_guard = market_guard
         self.db_logger = db_logger
-        self.buy_amount = buy_amount        # 종목당 매수 금액 상한 (기본: 500만원)
-        self.buy_qty = buy_qty              # 종목당 매수 수량 (기본: 1주)
-        self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 99종목, 종목수 무제한 1주 검증 매매)
+        self.buy_amount = buy_amount        # 종목당 매수 금액 상한 (0이면 제한 없음)
+        self.buy_qty = buy_qty              # 기본 매수 수량 (예수금 조회 불가 시 대체값)
+        self.max_positions = max_positions  # 최대 보유 종목 수 (기본: 2종목 집중 매매)
+        self.use_cash_ratio = use_cash_ratio # 예수금 비중 매수 활성화 여부
+        self.cash_ratio_per_stock = cash_ratio_per_stock # 종목당 배정 예수금 비율 (기본: 50%)
         self.theme_manager = theme_manager  # 실시간 테마 관리자 (대장주 차등 가중치)
         self.news_agent = news_agent        # 실시간 뉴스/모멘텀 AI 스코어러 (호재 가산 및 악재 차단)
+        self.params_120t = WMA60TickParams() # 120틱 WMA60 횡보 후 상승반전 전략 파라미터
         self.params_15m = Turnaround15mParams(min_daily_supply_money=20.0)
         self.params_f4 = Formula4Params(min_supply_money=20.0)
         self.params_squeeze = SqueezeAlignmentParams(min_supply_money_15m=15.0, max_squeeze_pct=1.5, max_bar_gain_pct=4.5)
         self._static_filter_cache = {}     # 당일 시가총액 & 5일 거래대금 정적 필터 캐시 {code: (passed: bool, date: str)}
         self._evaluating_codes = set()      # 동시 중복 스나이핑 방지 락 {code}
+
+    async def get_target_buy_qty(self, price: int, holdings: dict) -> int:
+        """
+        [예수금 50% 집중 매수 수량 산출]
+        계좌의 실시간 가용 예수금을 조회하여 예수금의 50%에 해당하는 수량을 계산합니다.
+        - 최대 2종목 집중 매매
+        - 0종목 보유 시: 총 가용 예수금의 50% 배정
+        - 1종목 보유 시: 남은 가용 예수금의 99%(제세금/수수료 버퍼) 배정
+        """
+        if not self.use_cash_ratio or price <= 0:
+            return self.buy_qty
+
+        try:
+            async with self.api_lock:
+                cash = await asyncio.to_thread(self.client.get_cash_balance)
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"⚠️ 예수금 조회 실패({e}) -> 기본 수량({self.buy_qty}주) 적용")
+            return self.buy_qty
+
+        if cash <= 0:
+            logger.warning(f"⚠️ 주문 가능 예수금이 부족합니다: {cash:,.0f}원")
+            return 0
+
+        pending_buy_orders = [
+            o for o in self.tracked_orders.values()
+            if str(o.get('order_type', '')).startswith('buy')
+        ]
+        pending_buy_codes = {o['code'] for o in pending_buy_orders}
+        current_slots = len(holdings) + len(pending_buy_codes)
+        if current_slots >= self.max_positions:
+            logger.info(f"⏭️ 이미 목표 포지션({self.max_positions}개) 도달 (보유+대기: {current_slots}개). 매수 수량 0.")
+            return 0
+
+        # 대기 중인 매수 주문 금액 차감하여 실제 가용 현금 계산
+        pending_buy_cost = sum(
+            float(o.get('qty', 0)) * float(o.get('price', 0))
+            for o in pending_buy_orders
+        )
+        usable_cash = max(0.0, cash - pending_buy_cost)
+
+        remaining_slots = self.max_positions - current_slots
+        if remaining_slots <= 0 or usable_cash <= 0:
+            return 0
+
+        if current_slots == 0:
+            allocated_cash = usable_cash * self.cash_ratio_per_stock
+        else:
+            # 이미 1종목 보유/대기 중인 경우 잔여 예수금 전액(99% 안전 버퍼)
+            allocated_cash = usable_cash * 0.99
+
+        if self.buy_amount > 0:
+            allocated_cash = min(allocated_cash, float(self.buy_amount))
+
+        qty = int(allocated_cash // price)
+        if qty < 1:
+            if usable_cash >= price:
+                qty = 1
+                logger.info(f"💰 [예수금 50% 비중] 계산 수량이 0이나 가용 예수금({usable_cash:,.0f}원) >= 1주 단가({price:,}원)이므로 1주 매수 승인")
+            else:
+                logger.warning(f"⚠️ [예수금 부족] 가용 예수금({usable_cash:,.0f}원)이 1주 단가({price:,}원)보다 적어 매수 불가")
+                return 0
+        else:
+            logger.info(
+                f"💰 [예수금 50% 비중 산출] 가용 예수금: {usable_cash:,.0f}원 | 배정 예산: {allocated_cash:,.0f}원 "
+                f"| 매수가: {price:,}원 ➔ 매수 수량: {qty}주 (현재 슬롯: {current_slots}/{self.max_positions})"
+            )
+        return qty
 
     async def run(self, holdings: dict, unexecuted: list):
         """매수 감시 사이클 실행"""
@@ -324,6 +403,8 @@ class BuyManager:
                     continue
                 # 필터 통과한 종목은 데이터만 조회
                 async with self.api_lock:
+                    df_120t = await asyncio.to_thread(self.client.get_120t_candles, code)
+                    await asyncio.sleep(0.04)
                     df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
                     await asyncio.sleep(0.04)
                     df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
@@ -333,6 +414,8 @@ class BuyManager:
             else:
                 # 최초 1회 정적 필터(시가총액 & 5일 거래대금) 검사 및 캐싱
                 async with self.api_lock:
+                    df_120t = await asyncio.to_thread(self.client.get_120t_candles, code)
+                    await asyncio.sleep(0.04)
                     df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
                     await asyncio.sleep(0.04)
                     df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
@@ -380,7 +463,10 @@ class BuyManager:
             if daily_df is None or len(daily_df) < 5:
                 continue
 
-            # ── 0. 👑 [최우선 1순위] 15분봉 20/40/60 이평선 응축 + 3-5-20-40-60 정배열 수급 돌파 (전략 B) ──
+            # ── 👑 [최우선 0순위] 120틱 WMA20-60 당일 첫번째 골든크로스 상승반전 진입 전략 ──
+            eval_120t = evaluate_120t_wma60_entry(df_120t, current_price=None, params=self.params_120t) if (df_120t is not None and not df_120t.empty) else {'should_buy': False}
+
+            # ── 0. 👑 [우선 1순위] 15분봉 20/40/60 이평선 응축 + 3-5-20-40-60 정배열 수급 돌파 (전략 B) ──
             eval_squeeze = evaluate_15m_squeeze_alignment(code, name, df_15m, daily_df, params=self.params_squeeze) if (df_15m is not None and not df_15m.empty) else {'is_buy_signal': False}
 
             # ── 0-B. 🚀 [우선 1.5순위] 5거래일 중 2회 거래량 130% 폭증 ➔ 수급봉 최고가 돌파 전략 ──
@@ -416,7 +502,7 @@ class BuyManager:
             supply_bonus = min(supply_money_100m / 10.0, 50.0)    # 500억 이상이면 +50점 상한
 
             # ── [Step 2] 실시간 뉴스 모멘텀 점수 반영 및 긴급 악재(CB/횡령/유증) 차단 ──
-            news_info = self.news_agent.fetch_news_score(code, name) if self.news_agent else {'bonus': 0.0, 'is_emergency_block': False, 'score': 50, 'catalyst': '뉴스 미반영'}
+            news_info = await asyncio.to_thread(self.news_agent.fetch_news_score, code, name) if self.news_agent else {'bonus': 0.0, 'is_emergency_block': False, 'score': 50, 'catalyst': '뉴스 미반영'}
             if news_info.get('is_emergency_block'):
                 logger.warning(f"🚫 [{name}({code})] 치명적 악재(CB/횡령/유증 등) 뉴스 감지로 매수 차단: {news_info.get('catalyst')}")
                 continue
@@ -424,11 +510,47 @@ class BuyManager:
             news_catalyst = news_info.get('catalyst', '')
             news_score = news_info.get('score', 50)
 
+            # 👑 0순위: 120틱 WMA20-60 당일 첫번째 골든크로스 상승반전 (400점) - 휩쏘 원천 차단 최우선 매수
+            if eval_120t.get('should_buy'):
+                target_p = eval_120t.get('target_price', eval_120t['wma60'])
+                buy_price = target_p
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
+                    continue
+                base_score = 400.0  # 👑 0순위 120틱 WMA20-60 첫 골든크로스 변곡 (400점)
+                final_score = (base_score + supply_bonus + news_bonus) * weight
+                buy_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'state': state,
+                    'signals': {
+                        'buy': True,
+                        'close': eval_120t.get('current_price', target_p),
+                        'target_price': target_p,
+                        'reason': eval_120t['reason'],
+                        'll': target_p
+                    },
+                    'df_30m': df_30m if df_30m is not None else df_15m,
+                    'weight': weight,
+                    'is_120t_wma60': True,
+                    'is_15m_squeeze': False,
+                    'is_5d2v_surge': False,
+                    'is_15m_pivot': False,
+                    'is_15m_4formula': False,
+                    'is_15m_turnaround': False,
+                    'is_w_rebound': False,
+                    'base_score': base_score,
+                    'supply_bonus': supply_bonus,
+                    'news_bonus': news_bonus,
+                    'news_score': news_score,
+                    'news_catalyst': news_catalyst,
+                    'final_score': final_score,
+                    'priority_score': final_score
+                })
             # 👑 1순위: 15분봉 이평 응축 + 정배열 수급 돌파 (380점)
-            if eval_squeeze.get('is_buy_signal'):
+            elif eval_squeeze.get('is_buy_signal'):
                 target_p = eval_squeeze.get('target_price', eval_squeeze['current_price'])
                 buy_price = target_p
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = 380.0  # 👑 1순위 (380점)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -463,7 +585,7 @@ class BuyManager:
             elif eval_5d2v.get('should_buy'):
                 target_p = eval_5d2v.get('target_price', eval_5d2v['price'])
                 buy_price = target_p
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = 370.0  # 👑 1.5순위 (370점)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -498,7 +620,7 @@ class BuyManager:
             elif eval_m_wma.get('should_buy'):
                 target_p = eval_m_wma.get('target_price', eval_m_wma['price'])
                 buy_price = target_p
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = 365.0  # 💎 1.55순위 (365점)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -534,7 +656,7 @@ class BuyManager:
             elif eval_pivot.get('should_buy'):
                 target_p = eval_pivot['target_price']
                 buy_price = target_p  # 피봇 기준선 가격 자체로 지정가 매수!
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = 360.0  # 👑 1.6순위 (360점)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -569,7 +691,7 @@ class BuyManager:
             elif eval_f4.get('should_buy'):
                 target_p = eval_f4.get('target_price', eval_f4['price'])
                 buy_price = target_p
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = 350.0  # 👑 2순위 (350점)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -604,7 +726,7 @@ class BuyManager:
             elif eval_15m.get('should_buy'):
                 target_p = eval_15m.get('target_price', eval_15m.get('limit_price', eval_15m['details']['close']))
                 buy_price = target_p
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = 340.0  # 👑 3순위 (340점)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -640,7 +762,7 @@ class BuyManager:
                 w_info = signals_30m.get('w_info', {})
                 target_p = float(w_info.get('sma260', signals_30m.get('close', 0.0)))
                 buy_price = target_p if target_p > 0 else float(signals_30m.get('close', 0.0))
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = 330.0  # W자 반등 (330점)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -675,7 +797,7 @@ class BuyManager:
             elif eval_hh.get('should_buy'):
                 target_p = eval_hh['hh_price']
                 buy_price = target_p
-                if buy_price > self.buy_amount:
+                if self.buy_amount > 0 and buy_price > self.buy_amount:
                     continue
                 base_score = eval_hh.get('priority_score', 250.0)
                 final_score = (base_score + supply_bonus + news_bonus) * weight
@@ -813,20 +935,36 @@ class BuyManager:
                         f"🔥 [{name}({stock_market})] {stock_market} 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
                     )
 
+            # ── [전문가 합의: 적응형 매수가(Adaptive Limit Price) 산출] ──
+            # 1. A급 초강력 주도주 (스마트 오더플로우 돌파 or (체결강도 130% 이상 & 대장주 가중치 1.2배 이상)):
+            #    기회 손실(미체결) 방지를 위해 기준선~+1틱 범위에서 적극 스나이핑
+            # 2. 일반 수급/변곡주 (리테스트 지지 안착형):
+            #    돌파 후 윗꼬리 역선택을 방지하고 가장 싸게 사기 위해 기준선 가격(price_limit)으로 지지선 대기 매수
+            is_super_leader = is_smart_breakout or (intensity_ratio >= 1.30 and candidate.get('weight', 1.0) >= 1.20)
             is_aggressive = False
-            if is_smart_breakout:
+
+            if is_super_leader:
                 price_limit = price_limit + tick
+                # 단, 기준선 대비 최대 +0.5% 이내로만 상한 제한
+                max_allowed = int(((target_price * 1.005) // tick) * tick)
+                price_limit = min(price_limit, max_allowed)
                 is_aggressive = True
                 logger.info(
-                    f"⚡ [{name}] 차세대 스마트 오더플로우 폭발 승인! (점수: {flow_score:.0f}점 | {micro_flow.get('reason')}) ➔ "
-                    f"스마트 1호가 공격 매수 적용: {price_limit:,}원 (+1틱)"
+                    f"⚡ [{name}] [A급 초강력 주도주] 기회손실 방지 적극 스나이핑: {price_limit:,}원 (+1틱) "
+                    f"(기준선: {target_price:,.0f}원, 현재가: {curr_c:,.0f}원, 체결강도: {intensity_ratio * 100:.0f}%)"
                 )
-            elif is_strong and intensity_ratio >= 1.02:
+            else:
+                # 일반 종목: 기준선 가격 자체로 지정가 매수 대기 (가장 싸고 안전한 리테스트 지지 체결 유도)
                 logger.info(
-                    f"✅ [{name}] 마이크로 수급 안정 확인 ({micro_flow.get('reason')}) ➔ 기준가 매수: {price_limit:,}원"
+                    f"🎯 [{name}] [리테스트 지지 안착형] 기준선 최적 지정가 매수: {price_limit:,}원 "
+                    f"(기준선: {target_price:,.0f}원, 현재가: {curr_c:,.0f}원, 체결강도: {intensity_ratio * 100:.0f}%)"
                 )
 
-            qty = self.buy_qty  # 종목당 1주 매수
+            # ── [예수금 50% 비중 매수 수량 동적 산출] ──
+            qty = await self.get_target_buy_qty(price_limit, holdings)
+            if qty <= 0:
+                logger.info(f"⏭️ [{name}] 예수금 부족 또는 수량 0으로 매수 스킵 (가격: {price_limit:,}원)")
+                continue
 
             # ── [중복 매수 원천 차단 이중 안전장치] ──
             # 1. 상태 객체 기준 이미 매수 완료/보유/당일매매종료 상태인지 재확인
@@ -850,7 +988,8 @@ class BuyManager:
                 continue
 
             if qty > 0:
-                priority_tag = "🔥 [W자 반등 최우선]" if is_w else "🟢"
+                is_120t = candidate.get('is_120t_wma60', False)
+                priority_tag = "⚡ [120틱 WMA60 변곡 최우선]" if is_120t else ("🔥 [W자 반등 최우선]" if is_w else "🟢")
                 logger.info(
                     f"{priority_tag} [{name}] 매수 신호 집행! (우선순위 점수: {candidate['priority_score']:.1f}) "
                     f"{signals['reason']} | LL: {signals['ll']:,.0f}"
@@ -863,7 +1002,7 @@ class BuyManager:
                     await asyncio.sleep(0.25)
                 if order_no:
                     self.tracked_orders[order_no] = {
-                        'code': code, 'qty': qty,
+                        'code': code, 'qty': qty, 'price': price_limit,
                         'time': time.time(), 'order_type': 'buy'
                     }
                     state.buy_step = 1
@@ -941,6 +1080,8 @@ class BuyManager:
                     is_stock_market_danger = not market_status.get('kospi_safe', True)
 
             async with self.api_lock:
+                df_120t = await asyncio.to_thread(self.client.get_120t_candles, code)
+                await asyncio.sleep(0.04)
                 df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
                 await asyncio.sleep(0.04)
                 df_30m = await asyncio.to_thread(self.client.get_30m_candles, code)
@@ -959,12 +1100,13 @@ class BuyManager:
                 weight, role = 1.0, "일반"
 
             # ── [Step 2] 실시간 뉴스 모멘텀 점수 반영 및 긴급 악재(CB/횡령/유증) 차단 ──
-            news_info = self.news_agent.fetch_news_score(code, name) if self.news_agent else {'bonus': 0.0, 'is_emergency_block': False, 'score': 50, 'catalyst': '뉴스 미반영'}
+            news_info = await asyncio.to_thread(self.news_agent.fetch_news_score, code, name) if self.news_agent else {'bonus': 0.0, 'is_emergency_block': False, 'score': 50, 'catalyst': '뉴스 미반영'}
             if news_info.get('is_emergency_block'):
                 logger.warning(f"🚫 [0.1초 스나이핑 차단] [{name}({code})] 긴급 악재 뉴스 감지: {news_info.get('catalyst')}")
                 return
 
-            # ── [6대 전략 실시간 우선순위 평가] ──
+            # ── [7대 전략 실시간 우선순위 평가] ──
+            eval_120t = evaluate_120t_wma60_entry(df_120t, current_price=None, params=self.params_120t) if (df_120t is not None and not df_120t.empty) else {'should_buy': False}
             eval_squeeze = evaluate_15m_squeeze_alignment(code, name, df_15m, daily_df=daily_df, params=self.params_squeeze)
             eval_5d2v = evaluate_5d2v_surge_breakout(code, name, daily_df, df_15m=df_15m)
             eval_m_wma = evaluate_15m_m_wma_squeeze(code, name, df_15m, daily_df=daily_df)
@@ -977,8 +1119,18 @@ class BuyManager:
             selected_signal = None
             is_w = False
 
+            # 👑 0순위: 120틱 WMA20-60 당일 첫번째 골든크로스 상승반전 찰나 스나이핑 (400점)
+            if eval_120t.get('should_buy'):
+                target_p = eval_120t.get('target_price', eval_120t['wma60'])
+                selected_signal = {
+                    'target_price': target_p,
+                    'close': eval_120t.get('current_price', target_p),
+                    'reason': eval_120t['reason'],
+                    'base_score': 400.0,
+                    'priority_score': 400.0
+                }
             # 👑 1순위: 15분봉 이평 압축 정배열 돌파 (380점)
-            if eval_squeeze.get('is_buy_signal'):
+            elif eval_squeeze.get('is_buy_signal'):
                 target_p = eval_squeeze.get('target_price', eval_squeeze['current_price'])
                 selected_signal = {
                     'target_price': target_p,
@@ -1065,7 +1217,7 @@ class BuyManager:
 
             target_price = selected_signal['target_price']
             buy_price = float(target_price) if target_price > 0 else selected_signal['close']
-            if buy_price <= 0 or buy_price > self.buy_amount:
+            if buy_price <= 0 or (self.buy_amount > 0 and buy_price > self.buy_amount):
                 return
 
             # ── [핵심: 돌파하는 그 찰나 보존 & 상투 추격 매수 원천 차단 필터] ──
@@ -1126,22 +1278,33 @@ class BuyManager:
                         f"🔥 [0.1초 스나이핑] [{name}({stock_market})] {stock_market} 지수 급락 속 강력 주도주 예외 매수 승인! (W자반등={is_w}, 스마트돌파={is_smart_breakout}, 점수={flow_score:.0f}점)"
                     )
 
+            # ── [전문가 합의: 적응형 매수가(Adaptive Limit Price) 산출] ──
+            is_super_leader = is_smart_breakout or (intensity_ratio >= 1.30 and weight >= 1.20)
             is_aggressive = False
-            if is_smart_breakout:
+
+            if is_super_leader:
                 price_limit = price_limit + tick
+                max_allowed = int(((target_price * 1.005) // tick) * tick)
+                price_limit = min(price_limit, max_allowed)
                 is_aggressive = True
                 logger.info(
-                    f"⚡ [0.1초 스나이핑] [{name}] 차세대 스마트 오더플로우 폭발 승인! (점수: {flow_score:.0f}점 | {micro_flow.get('reason')}) ➔ "
-                    f"스마트 1호가 공격 매수 적용: {price_limit:,}원 (+1틱)"
+                    f"⚡ [0.1초 스나이핑] [{name}] [A급 초강력 주도주] 적극 스나이핑: {price_limit:,}원 (+1틱) "
+                    f"(기준선: {target_price:,.0f}원, 현재가: {curr_c:,.0f}원, 체결강도: {intensity_ratio * 100:.0f}%)"
                 )
-            elif is_strong and intensity_ratio >= 1.02:
+            else:
                 logger.info(
-                    f"✅ [0.1초 스나이핑] [{name}] 마이크로 수급 안정 확인 ({micro_flow.get('reason')}) ➔ 기준가 매수: {price_limit:,}원"
+                    f"🎯 [0.1초 스나이핑] [{name}] [리테스트 지지 안착형] 기준선 최적 지정가 매수: {price_limit:,}원 "
+                    f"(기준선: {target_price:,.0f}원, 현재가: {curr_c:,.0f}원, 체결강도: {intensity_ratio * 100:.0f}%)"
                 )
 
             if price_limit <= 0:
                 return
-            qty = self.buy_qty  # 종목당 1주 매수
+
+            # ── [예수금 50% 비중 매수 수량 동적 산출] ──
+            qty = await self.get_target_buy_qty(price_limit, holdings)
+            if qty <= 0:
+                logger.info(f"⏭️ [0.1초 스나이핑] [{name}] 예수금 부족 또는 수량 0으로 매수 스킵")
+                return
 
             # 중복 매수 재확인
             if state.buy_step >= 1 or state.is_holding or state.trade_ended:
@@ -1170,7 +1333,7 @@ class BuyManager:
                     await asyncio.sleep(0.25)
                 if order_no:
                     self.tracked_orders[order_no] = {
-                        'code': code, 'qty': qty,
+                        'code': code, 'qty': qty, 'price': price_limit,
                         'time': time.time(), 'order_type': 'buy'
                     }
                     state.buy_step = 1
@@ -1196,12 +1359,13 @@ class BuyManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SellManager - 실시간 3일선 저가 하향 이탈 단일 매도
+# SellManager - 120틱 WMA60 고점 하락반전 단일 매도
 # ═══════════════════════════════════════════════════════════════
 class SellManager:
     """
-    저가가 실시간 3일선(M/3) 아래로 떨어질 때 전량 시장가 매도 (단일 매도 원칙).
-    3일선 지지 유지 시에는 일시적 흔들림에 털리지 않고 지속 홀딩하여 상승 추세 수익을 극대화합니다.
+    120틱 WMA60(가중이동평균)이 상승 모멘텀을 소진하고 고점에서 하락반전할 때 전량 시장가 매도.
+    상승 추세 동안에는 흔들림에 털리지 않고 홀딩하다가, 꼭지(Peak)에서 우하향으로 꺾이는 변곡점을
+    포착하여 최고점 부근에서 깔끔하게 수익을 실현(익절) 및 손실을 방어합니다.
     """
 
     def __init__(self, client: RealAPIAdapter, api_lock: asyncio.Lock,
@@ -1213,10 +1377,11 @@ class SellManager:
         self.tracked_orders = tracked_orders
         self.watchlist = watchlist
         self.db_logger = db_logger
+        self.params_120t = WMA60TickParams()
         self.last_15m_fetch_time = {}  # TR 스로틀링 타이머 {code: float}
 
     async def run(self, holdings: dict):
-        """매도 감시 사이클 실행 (보유 종목 대상 실시간 3일선 저가 하향 이탈 단일 감시)"""
+        """매도 감시 사이클 실행 (보유 종목 대상 120틱 WMA60 고점 하락반전 단일 감시)"""
         now = time.time()
         for code in list(holdings.keys()):
             state = self.trade_states.get(code)
@@ -1246,29 +1411,26 @@ class SellManager:
                 if current_price > state.m_touch_high:
                     state.m_touch_high = current_price
 
-            # 15분봉 및 일봉 데이터 조회 (실시간 3일선 저가 이탈 감시)
+            # 120틱 데이터 조회 (WMA60 고점 하락반전 감시)
             async with self.api_lock:
-                df_15m = await asyncio.to_thread(self.client.get_15m_candles, code)
-                await asyncio.sleep(0.05)
-                daily_df = await asyncio.to_thread(self.client.get_daily_candles, code)
+                df_120t = await asyncio.to_thread(self.client.get_120t_candles, code)
                 await asyncio.sleep(0.05)
 
-            if (df_15m is None or df_15m.empty) and (daily_df is None or daily_df.empty):
+            if df_120t is None or df_120t.empty:
                 continue
 
-            # 실시간 3일선(M/3) 저가 하향 이탈 단일 매도 신호 판정
-            signals = analyze_sell_signals(
-                df_15m, daily_df=daily_df, buy_price=buy_price, current_price=current_price,
-                touch_high=state.m_touch_high
+            # 120틱 WMA60 고점 하락반전 단일 매도 신호 판정
+            signals = evaluate_120t_wma60_exit(
+                df_120t, current_price=current_price, buy_price=buy_price, params=self.params_120t
             )
 
-            # 저가가 3일선 아래로 떨어질 때 전량 시장가 매도 집행
-            if signals.get('sell'):
+            # WMA60이 하락반전할 때 전량 시장가 매도 집행
+            if signals.get('should_sell'):
                 logger.info(f"🔴 [{name}] 매도 신호 감지! {signals['reason']}")
                 async with self.api_lock:
                     order_no = await asyncio.to_thread(
                         self.client.place_sell_order, code, qty_sell,
-                        price=0, order_type="03"  # 시장가(03)는 price=0 전달 (거래소가 최우선 호가로 체결)
+                        price=0, order_type="03"  # 시장가(03)는 price=0 전달
                     )
                     await asyncio.sleep(0.25)
                 if order_no:
@@ -1280,18 +1442,18 @@ class SellManager:
                     state.is_holding = False
                     state.trade_ended = True
                     state.last_action_date = datetime.now().strftime("%Y-%m-%d")
-                    logger.info(f"✅ [{name}] 매도 주문 전송 완료 (주문번호: {order_no})")
+                    logger.info(f"✅ [{name}] 120틱 WMA60 하락반전 매도 주문 전송 완료 (주문번호: {order_no})")
                     # SQLite DB에 매도 손익 정산 기록
                     if self.db_logger:
                         sell_p = current_price if current_price > 0 else buy_price
                         self.db_logger.log_sell(
                             code=code, sell_price=sell_p,
-                            sell_qty=qty_sell, sell_reason=signals.get('reason', '3일선 저가 이탈 매도')
+                            sell_qty=qty_sell, sell_reason=signals.get('reason', '120틱 WMA60 하락반전 매도')
                         )
                 else:
                     logger.warning(f"⚠️ [{name}] 매도 주문 전송 실패! 다음 사이클에서 재시도합니다.")
             else:
-                logger.debug(f"ℹ️ [{name}] {signals.get('reason', '3일선 지지 유지 홀딩')}")
+                logger.debug(f"ℹ️ [{name}] 120틱 WMA60 추세 유지 중 (기울기: {signals.get('slope_pct', 0.0):+.4f}%)")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1300,7 +1462,7 @@ class SellManager:
 class TradingBot:
     def __init__(self, condition_name="Traiding,traiding",
                  enable_buy=True, enable_sell=True,
-                 buy_amount=5000000, max_positions=99,
+                 buy_amount=0, max_positions=2,
                  buy_qty=1):
         self.client = RealAPIAdapter()
         self.condition_name = condition_name
@@ -1340,7 +1502,8 @@ class TradingBot:
             theme_manager=self.theme_manager,
             news_agent=self.news_agent,
             buy_amount=buy_amount, max_positions=max_positions,
-            buy_qty=buy_qty
+            buy_qty=buy_qty, use_cash_ratio=True,
+            cash_ratio_per_stock=0.50
         ) if enable_buy else None
 
         self.sell_manager = SellManager(
@@ -1354,6 +1517,11 @@ class TradingBot:
     # ─────────────────────────────────────────────────
     async def on_insert(self, code: str):
         logger.info(f"🟢 [조건검색 편입] 종목코드: {code}")
+        state = self.trade_states.get(code)
+        if state and (state.is_holding or state.trade_ended or state.buy_step >= 1):
+            logger.info(f"⏭️ [{code}] 이미 보유 중이거나 당일 매매 완료된 종목입니다. 편입 스킵.")
+            return
+
         if code not in self.watchlist:
             async with self.api_lock:
                 name = await asyncio.to_thread(self.client.get_stock_name, code)
@@ -1551,11 +1719,14 @@ class TradingBot:
     # 미체결 주문 관리
     # ─────────────────────────────────────────────────
     async def manage_unexecuted_orders(self):
-        """접수 후 3분(180초) 경과한 미체결 주문 취소"""
+        """접수 후 매수 주문은 90초, 매도 주문은 180초 경과 시 자동 취소 (페이크 돌파/역선택 방어)"""
         current_time = time.time()
         for order_no, info in list(self.tracked_orders.items()):
-            if current_time - info['time'] > 180:
-                logger.info(f"⏳ 3분 경과! 미체결 주문 자동 취소 진행 (종목: {info['code']}, 주문번호: {order_no})")
+            order_type = str(info.get('order_type', 'buy'))
+            timeout_sec = 90 if order_type.startswith('buy') else 180
+            elapsed = current_time - info['time']
+            if elapsed > timeout_sec:
+                logger.info(f"⏳ [{info['code']}] {timeout_sec}초 경과! 페이크 돌파/역선택 방어 미체결 {order_type} 주문 자동 취소 진행 (주문번호: {order_no})")
                 async with self.api_lock:
                     await asyncio.to_thread(
                         self.client.cancel_order, order_no, info['code'], info['qty']
@@ -1754,14 +1925,14 @@ class TradingBot:
             tasks_str.append("매도")
 
         logger.info("=" * 60)
-        logger.info(" 🚀 [15분봉 수급변곡 최우선 스나이핑 + 30분봉 W자 반등 매수 봇] 시작")
+        logger.info(" 🚀 [120틱 WMA60 횡보 후 상승반전 최우선 매수 + WMA60 하락반전 매도 봇] 시작")
         logger.info(f" 활성 임무: {', '.join(tasks_str)}")
         logger.info(f" 세션: [NXT 프리] 08:00~08:50 | [KRX 정규] 09:00~15:30 | [NXT 애프터] 15:40~20:00 (오후 8시까지 감시)")
-        logger.info(f" 전략: [1순위] 15분봉 20억 수급 + 3일선 U턴 변곡 스나이퍼 매수 (Combo 3+4)")
-        logger.info(f"       [2순위] 30분봉 260이평 W자 반등 종목 우선 매수")
-        logger.info(f"       [3순위] 15분봉 3-20 골든크로스 / 3-5 더블 변곡 매수")
-        logger.info(f"       [매도] 저가가 실시간 3일선(M/3) 아래로 떨어질 때 전량 시장가(03) 매도 (단일화)")
-        logger.info(f" 매매 모드: 🎯 [종목수 무제한 1주 검증 매수 모드] (종목당: {getattr(self.buy_manager, 'buy_qty', 1)}주 매수 | 전략별 매수 근거 DB 자동 수집)")
+        logger.info(f" 전략: [1순위] 👑 120틱 WMA60 횡보 후 상승반전 U턴 변곡 스나이퍼 매수 (400점)")
+        logger.info(f"       [2순위] 15분봉 이평 압축 정배열 돌파 매수 (380점)")
+        logger.info(f"       [3순위] 30분봉 260이평 W자 반등 종목 우선 매수 (330점)")
+        logger.info(f"       [매도] 120틱 WMA60 고점 하락반전 시 전량 시장가(03) 매도 (완전 대체 단일 매도)")
+        logger.info(f" 매매 모드: 🎯 [예수금 50% 분할 최대 2종목 집중 매매] (종목당: 예수금 50% 배정 | 역선택 방어 적응형 매수가 & 90초 TTL)")
         logger.info(f" 오버나잇: 허용 | 시간 제한: 없음")
         logger.info("=" * 60)
 
@@ -1803,15 +1974,15 @@ async def main():
     )
     parser.add_argument(
         '--qty', type=int, default=1,
-        help="종목당 매수 수량 (기본: 1주)"
+        help="기본 매수 수량 (기본: 1주, 예수금 조회 불가 시 대체)"
     )
     parser.add_argument(
-        '--amount', type=int, default=5000000,
-        help="종목당 매수 금액 상한 (기본: 5,000,000원)"
+        '--amount', type=int, default=0,
+        help="종목당 매수 금액 상한 (기본: 0 - 제한 없음, 예수금 50%% 전액 배정)"
     )
     parser.add_argument(
-        '--max-positions', type=int, default=99,
-        help="최대 보유 종목 수 (기본: 99 - 종목수 무제한 1주 검증 매수 모드)"
+        '--max-positions', type=int, default=2,
+        help="최대 보유 종목 수 (기본: 2 - 예수금 50%%씩 2종목 집중 매매)"
     )
 
     args = parser.parse_args()

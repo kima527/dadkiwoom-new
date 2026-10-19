@@ -513,7 +513,7 @@ class KiwoomRealClient:
             if not result:
                 return []
                 
-            raw_candles = result.get("stk_dt_pole_chart_qry", [])
+            raw_candles = result.get("stk_tic_chart_qry") or result.get("stk_dt_pole_chart_qry") or []
             if not raw_candles:
                 return []
                 
