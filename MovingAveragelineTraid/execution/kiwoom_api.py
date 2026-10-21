@@ -22,6 +22,21 @@ class KiwoomRESTClient:
         # In a real scenario, this would call the balance API.
         return 10000000.0  # 10,000,000 KRW
 
+    def get_2m_candles(self, stock_code: str) -> pd.DataFrame:
+        """Mock: Fetch 2-minute candles."""
+        now = datetime.now()
+        data = {
+            'time': [now - timedelta(minutes=2 * i) for i in range(120, 0, -1)],
+            'open': [50000 + (i * 50) - 20 for i in range(120)],
+            'high': [50000 + (i * 50) + 40 for i in range(120)],
+            'low': [50000 + (i * 50) - 40 for i in range(120)],
+            'close': [50000 + (i * 50) for i in range(120)],
+            'volume': [5000 for _ in range(120)]
+        }
+        df = pd.DataFrame(data)
+        df.set_index('time', inplace=True)
+        return df
+
     def get_15m_candles(self, stock_code: str) -> pd.DataFrame:
         """Mock: Fetch 15-minute candles."""
         # Return a mock DataFrame with 'close' prices to calculate SMAs

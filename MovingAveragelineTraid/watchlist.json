@@ -341,8 +341,11 @@
     },
     "217190": {
         "name": "제너셈",
-        "weight": 1.0,
-        "source": "today.csv"
+        "weight": 1.4,
+        "theme": "반도체 장비",
+        "role": "LEADER",
+        "catalyst": "🤖[AI] 일반 시장 시황 뉴스",
+        "source": "premarket_scanner"
     },
     "200470": {
         "name": "에이팩트",
@@ -484,6 +487,46 @@
         "theme": "유심(USIM)",
         "role": "SECOND",
         "catalyst": "📰[NLP] 일반 시황/중립",
+        "source": "premarket_scanner"
+    },
+    "040160": {
+        "name": "누리플렉스",
+        "weight": 1.4,
+        "theme": "화폐/금융자동화기기(디지털화폐 등)",
+        "role": "LEADER",
+        "catalyst": "🤖[AI] 기업 직접 연관 없는 일반기사",
+        "source": "premarket_scanner"
+    },
+    "052600": {
+        "name": "한네트",
+        "weight": 1.2,
+        "theme": "화폐/금융자동화기기(디지털화폐 등)",
+        "role": "SECOND",
+        "catalyst": "🤖[AI] 당사 무관 핀테크 기업 기사",
+        "source": "premarket_scanner"
+    },
+    "177350": {
+        "name": "베셀",
+        "weight": 1.4,
+        "theme": "OLED(유기 발광 다이오드)",
+        "role": "LEADER",
+        "catalyst": "🤖[AI] 종목과 무관한 뉴스",
+        "source": "premarket_scanner"
+    },
+    "255440": {
+        "name": "야스",
+        "weight": 1.2,
+        "theme": "OLED(유기 발광 다이오드)",
+        "role": "SECOND",
+        "catalyst": "🤖[AI] OLED증착기 수주 기대감",
+        "source": "premarket_scanner"
+    },
+    "265520": {
+        "name": "AP시스템",
+        "weight": 1.2,
+        "theme": "반도체 장비",
+        "role": "SECOND",
+        "catalyst": "🤖[AI] 삼성 출신 인재 영입 기사",
         "source": "premarket_scanner"
     }
 }

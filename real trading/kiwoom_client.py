@@ -477,6 +477,14 @@ class KiwoomRealClient:
         """주식 종목의 1분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="1", last_n_days=last_n_days)
 
+    def get_2min_candles(self, stock_code: str, last_n_days: int = 2) -> list:
+        """주식 종목의 2분봉 차트 데이터를 조회합니다."""
+        candles = self._fetch_minute_candles(stock_code, tic_scope="2", last_n_days=last_n_days)
+        if not candles:
+            # 2분봉 API 미지원 시 1분봉 fallback
+            candles = self.get_1min_candles(stock_code, last_n_days=last_n_days)
+        return candles
+
     def get_3min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
         """주식 종목의 3분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="3", last_n_days=last_n_days)

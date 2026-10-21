@@ -46,6 +46,12 @@ class TradeState:
         self.m_partial_sold = False  # M선 도달 50% 1차 익절 완료 여부
         self.m_touch_high = 0.0      # M선 도달 후 기록한 최고가
         self.quick_partial_sold = False # +1.2% 단기 빠른 1차 분할 익절 여부
+        # ── 당일 2종목 집중 회전 매매 (재매수) 관련 ──
+        self.sold_price = 0.0        # 직전 매도 체결가
+        self.sold_time = 0.0         # 직전 매도 시간
+        self.reentry_count = 0       # 당일 재매수 횟수 (회전 수)
+        self.dip_detected = False    # 매도 후 하락(눌림) 발생 여부
+        self.dip_min_price = 0.0     # 매도 후 하락 시 기록한 최저가
         # ── 당일 매매 상태 자동 리셋용 ──
         self.last_action_date = None    # 마지막 매수/매도 처리 일자 ("YYYY-MM-DD")
 
@@ -72,6 +78,11 @@ class TradeState:
             'm_partial_sold': getattr(self, 'm_partial_sold', False),
             'm_touch_high': getattr(self, 'm_touch_high', 0.0),
             'quick_partial_sold': getattr(self, 'quick_partial_sold', False),
+            'sold_price': getattr(self, 'sold_price', 0.0),
+            'sold_time': getattr(self, 'sold_time', 0.0),
+            'reentry_count': getattr(self, 'reentry_count', 0),
+            'dip_detected': getattr(self, 'dip_detected', False),
+            'dip_min_price': getattr(self, 'dip_min_price', 0.0),
             'last_action_date': getattr(self, 'last_action_date', None),
         }
 
@@ -100,6 +111,11 @@ class TradeState:
         state.m_partial_sold = data.get('m_partial_sold', False)
         state.m_touch_high = data.get('m_touch_high', 0.0)
         state.quick_partial_sold = data.get('quick_partial_sold', False)
+        state.sold_price = data.get('sold_price', 0.0)
+        state.sold_time = data.get('sold_time', 0.0)
+        state.reentry_count = data.get('reentry_count', 0)
+        state.dip_detected = data.get('dip_detected', False)
+        state.dip_min_price = data.get('dip_min_price', 0.0)
         state.last_action_date = data.get('last_action_date')
         return state
 

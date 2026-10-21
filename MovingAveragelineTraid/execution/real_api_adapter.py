@@ -81,6 +81,33 @@ class RealAPIAdapter:
             logger.error(f"1분봉 변환 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
+    def get_2m_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 2분봉 데이터를 가져와서 trading_bot이 쓰는 Pandas DataFrame으로 변환"""
+        try:
+            raw_candles = []
+            if hasattr(self.real_client, 'get_2min_candles'):
+                raw_candles = self.real_client.get_2min_candles(stock_code, last_n_days=4)
+            elif hasattr(self.real_client, '_fetch_minute_candles'):
+                raw_candles = self.real_client._fetch_minute_candles(stock_code, tic_scope="2", last_n_days=4)
+
+            df = self._convert_raw_candles_to_df(raw_candles, stock_code, "2분봉") if raw_candles else pd.DataFrame()
+            
+            # 2분봉 직접 조회가 부족할 경우 1분봉 데이터를 2분봉으로 리샘플링하여 합성
+            if df.empty or len(df) < 20:
+                df_1m = self.get_1m_candles(stock_code)
+                if not df_1m.empty and len(df_1m) >= 2:
+                    df = df_1m.resample('2min').agg({
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last',
+                        'volume': 'sum'
+                    }).dropna()
+            return df
+        except Exception as e:
+            logger.error(f"2분봉 변환 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
     def get_15m_candles(self, stock_code: str) -> pd.DataFrame:
         """실전 15분봉 데이터를 가져와서 trading_bot이 쓰는 Pandas DataFrame으로 변환"""
         try:
