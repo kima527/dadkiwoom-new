@@ -1,0 +1,5 @@
+# 테마급등관문선 60분봉 자동매매 프로젝트 필수 패키지
+pandas>=1.5.0
+numpy>=1.22.0
+matplotlib>=3.5.0
+python-dotenv>=1.0.0
