@@ -174,6 +174,11 @@ class ThemeGate60mStrategy:
             if day3_m_line > 0 and tick_close < day3_m_line:
                 return None
 
+            # 🛡️ [시가 훼손 방어벽]: 당일 시가 아래로 밀린 파란 음봉(Gap & Crap) 매수 차단 (시가 위 붉은 양봉 유지 필수)
+            open_p = float(row.get('open', tick_close))
+            if open_p > 0 and tick_close < open_p:
+                return None
+
             gate_support = is_gate_up or (not np.isnan(gate_line) and close >= gate_line * 0.990 and low <= gate_line * 1.015)
             gijun_breakout = (not np.isnan(gijun_line) and gijun_line > 0 and tick_close >= gijun_line)
             

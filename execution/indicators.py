@@ -254,3 +254,45 @@ def calculate_day3_m_line(df_daily: Optional[pd.DataFrame], current_price: float
     return day3_m_line, m_val, pred1, pred2
 
 
+def calculate_pred_volume_ratio(df_daily: Optional[pd.DataFrame], curr_day_vol: float) -> Tuple[float, float]:
+    """
+    ⚡ [장초반 3% 번개 돌파]: 전일 거래량 대비 당일 누적 거래량 잠식률(%) 및 전일 거래량 산출
+    Returns:
+        Tuple[float, float]: (vol_ratio_prev, pre_day_vol)
+        - vol_ratio_prev: (curr_day_vol / pre_day_vol) * 100.0 (%)
+        - pre_day_vol: 전일 1일 전체 거래량 (주)
+    """
+    if df_daily is None or len(df_daily) < 1:
+        return 0.0, 0.0
+
+    df_d = df_daily.copy()
+    col_map = {col: str(col).lower() for col in df_d.columns if str(col).lower() in ('volume', 'date')}
+    df_d.rename(columns=col_map, inplace=True)
+
+    if 'volume' not in df_d.columns:
+        return 0.0, 0.0
+
+    today_str = datetime.now().strftime('%Y%m%d')
+    pre_day_vol = 0.0
+
+    if 'date' in df_d.columns and len(df_d) >= 2:
+        last_date = str(df_d['date'].iloc[-1]).replace('-', '').replace('/', '').strip()[:8]
+        if last_date == today_str and len(df_d) >= 2:
+            pre_day_vol = float(df_d['volume'].iloc[-2])
+            if curr_day_vol <= 0:
+                curr_day_vol = float(df_d['volume'].iloc[-1])
+        else:
+            pre_day_vol = float(df_d['volume'].iloc[-1])
+    elif len(df_d) >= 2:
+        pre_day_vol = float(df_d['volume'].iloc[-2])
+    else:
+        pre_day_vol = float(df_d['volume'].iloc[-1])
+
+    if pre_day_vol <= 0:
+        return 0.0, 0.0
+
+    vol_ratio_prev = (float(curr_day_vol) / pre_day_vol) * 100.0
+    return vol_ratio_prev, pre_day_vol
+
+
+

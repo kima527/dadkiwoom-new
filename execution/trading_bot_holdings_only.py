@@ -35,11 +35,11 @@ for p in [CURRENT_DIR, PROJECT_ROOT, MOVING_AVERAGE_TRAID, REAL_TRADING_PATH]:
         sys.path.insert(0, p)
 
 try:
-    from indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line
+    from indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_pred_volume_ratio
     from strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker
     from config import DEFAULT_CONFIG
 except ImportError:
-    from execution.indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line
+    from execution.indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_pred_volume_ratio
     from execution.strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker
     from execution.config import DEFAULT_CONFIG
 
@@ -102,6 +102,21 @@ def is_market_open() -> bool:
     """시장 운영 여부 (NXT 프리/애프터 및 KRX 정규장 포함)"""
     is_active, _, _ = get_market_session()
     return is_active
+
+def get_session_volume_target() -> tuple[float, str]:
+    """
+    ⚡ [세션별 차등 거래량 기준]:
+    - NXT 프리마켓 (08:00 ~ 08:50): 전일 대비 1.5%
+    - KRX 정규장   (09:00 ~ 15:30): 전일 대비 3.0%
+    - NXT 애프터마켓 (15:40 ~ 20:00): 전일 대비 1.0%
+    """
+    cur_t = datetime.now().time()
+    if dtime(8, 0, 0) <= cur_t < dtime(8, 50, 0):
+        return 1.5, "NXT 프리마켓(1.5%)"
+    elif dtime(15, 40, 0) <= cur_t < dtime(20, 0, 0):
+        return 1.0, "NXT 애프터마켓(1.0%)"
+    else:
+        return 3.0, "KRX 정규장(3.0%)"
 
 def align_to_tick(price: float) -> int:
     """한국거래소 및 대체거래소 호가 단위 정렬"""
@@ -388,48 +403,62 @@ class SafeHoldingsThemeGateBot:
         last_60m: pd.Series,
         last_daily: pd.Series,
         df_60m: pd.DataFrame,
-        pre_day_close: Optional[float] = None
+        pre_day_close: Optional[float] = None,
+        df_daily: Optional[pd.DataFrame] = None,
+        vol_ratio_prev: Optional[float] = None,
+        session_target_vol: Optional[float] = None
     ) -> Tuple[float, Dict[str, Any]]:
         """
-        동시 기준선 돌파 시 우선순위 스코어링 (전문가 패널 3대 핵심 팩터 합의 모델 - 100점 만점)
-        1. 당일 거래대금 체급 점수 (40점)
-        2. 상대 거래량(R-Vol) 폭발 배율 점수 (30점)
-        3. 캔들 몸통 완성도 & 당일 등락률 골든존 점수 (30점)
+        ⚡ [세션별 차등 번개 돌파 스나이핑 1위 선정 체계 - 100점 만점]
+        1. 🥇 세션별 전일 거래량 돌파 속도 및 잠식률 (50점 만점, 최우선 엔진!)
+           - 🎯 세션별 기준치: [NXT 프리마켓: 1.5%] / [KRX 정규장: 3.0%] / [NXT 애프터마켓: 1.0%]
+           - 목표치 대비 달성률(attainment_ratio = vol_ratio_prev / target_vol):
+             * 달성률 >= 1.5배 (정규장 4.5%+, 프리 2.25%+, 애프터 1.5%+): 50점 만점!
+             * 달성률 >= 1.0배 (정규장 3.0%+, 프리 1.5%+, 애프터 1.0%+): 45점 (목표 돌파 완료)
+             * 달성률 >= 0.7배: 35점
+             * 달성률 >= 0.4배: 20점
+             * 달성률 < 0.4배: 5점
+        2. 🥈 시가 무훼손 양봉 순도 (25점 만점)
+           - 당일 시가(Open)를 단 1호가도 깨지 않고 지키는 강력한 붉은 양봉
+           - 시가 위 양봉 유지 (tick_close >= c_open) + 윗꼬리 25% 이하: 25점 만점
+           - 양봉 유지 + 윗꼬리 40% 이하: 18점
+           - 음봉 (tick_close < c_open): 0점 (시가 훼손 감점)
+        3. 🥉 기준선(M선) 안착 이격도 (25점 만점)
+           - 시가 갭돌파든 장중 돌파든 기준선 위 +0.3% ~ +3.5% 최적 안착: 25점 만점
+           - 기준선 위 +3.5% ~ +7.0%: 20점
+           - 기준선 위 0.0% ~ +0.3%: 12점
+           - 기준선 대비 +12% 이상 과열: 5점 (추격 매수 방지)
         """
-        # 1. 거래대금 (40점)
-        day_val = float(last_daily.get('trading_value', 0.0)) if pd.notna(last_daily.get('trading_value')) else 0.0
-        if day_val <= 0:
-            d_close = float(last_daily.get('close', tick_close))
-            d_vol = float(last_daily.get('volume', 0.0))
-            day_val = d_close * d_vol
-        day_val_eok = day_val / 100_000_000.0
-
-        if day_val_eok >= 1000.0:
-            score_val = 40.0
-        elif day_val_eok >= 500.0:
-            score_val = 30.0
-        elif day_val_eok >= 200.0:
-            score_val = 20.0
-        elif day_val_eok >= 50.0:
-            score_val = 10.0
+        # 세션별 차등 목표 거래량 기준 설정 (프리 1.5%, 정규장 3.0%, 애프터 1.0%)
+        if session_target_vol is not None and session_target_vol > 0:
+            target_vol = float(session_target_vol)
+            target_name = f"지정세션({target_vol:.1f}%)"
         else:
-            score_val = 5.0
+            target_vol, target_name = get_session_volume_target()
 
-        # 2. 상대 거래량 폭발 배율 (30점)
-        recent_20_vol = df_60m['volume'].iloc[-21:-1].mean() if len(df_60m) >= 2 else 0.0
-        curr_vol = float(last_60m.get('volume', 0.0))
-        vol_surge_ratio = (curr_vol / recent_20_vol) if recent_20_vol > 0 else 1.0
-
-        if vol_surge_ratio >= 4.0:
-            score_vol = 30.0
-        elif vol_surge_ratio >= 2.5:
-            score_vol = 22.0
-        elif vol_surge_ratio >= 1.5:
-            score_vol = 15.0
+        # 1. 전일 거래량 돌파 속도 점수 (50점 만점)
+        if vol_ratio_prev is None:
+            curr_vol = float(last_daily.get('volume', 0.0))
+            if curr_vol <= 0:
+                curr_vol = float(last_60m.get('volume', 0.0))
+            vol_ratio_prev, pre_day_vol = calculate_pred_volume_ratio(df_daily, curr_vol)
         else:
-            score_vol = 5.0
+            pre_day_vol = 0.0
 
-        # 3. 캔들 몸통 완성도 & 당일 등락률 (30점)
+        attainment_ratio = (vol_ratio_prev / target_vol) if target_vol > 0 else 1.0
+
+        if attainment_ratio >= 1.5:
+            score_speed = 50.0
+        elif attainment_ratio >= 1.0:
+            score_speed = 45.0
+        elif attainment_ratio >= 0.7:
+            score_speed = 35.0
+        elif attainment_ratio >= 0.4:
+            score_speed = 20.0
+        else:
+            score_speed = 5.0
+
+        # 2. 시가 무훼손 양봉 순도 점수 (25점 만점)
         c_open = float(last_60m.get('open', tick_close))
         c_high = float(last_60m.get('high', tick_close))
         c_low = float(last_60m.get('low', tick_close))
@@ -437,33 +466,64 @@ class SafeHoldingsThemeGateBot:
         c_range = max(c_high - c_low, 1.0)
         c_body = max(c_close - c_open, 0.0)
         body_ratio = c_body / c_range
+        upper_shadow = max(c_high - max(c_open, c_close), 0.0)
+        upper_shadow_ratio = upper_shadow / c_range
 
-        # 전일 종가: pre_day_close(pred1) 우선 적용하여 당일 0% 왜곡 방지
+        if tick_close >= c_open and upper_shadow_ratio <= 0.25 and body_ratio >= 0.40:
+            score_shape = 25.0
+        elif tick_close >= c_open and upper_shadow_ratio <= 0.40:
+            score_shape = 18.0
+        elif tick_close < c_open:
+            score_shape = 0.0
+        else:
+            score_shape = 10.0
+
+        # 3. 기준선(M선) 안착 이격도 (25점 만점)
+        gijun_val = float(last_60m.get('theme_gijun', 0.0))
+        if gijun_val <= 0:
+            gijun_val = float(last_60m.get('theme_gate', tick_close))
+
+        gijun_diff_pct = ((tick_close - gijun_val) / gijun_val * 100.0) if gijun_val > 0 else 0.0
+
+        if 0.3 <= gijun_diff_pct <= 3.5:
+            score_anchor = 25.0
+        elif 3.5 < gijun_diff_pct <= 7.0:
+            score_anchor = 20.0
+        elif 0.0 <= gijun_diff_pct < 0.3:
+            score_anchor = 12.0
+        elif gijun_diff_pct > 12.0:
+            score_anchor = 5.0
+        else:
+            score_anchor = 8.0
+
+        # 참고 모니터링용 지표
+        day_val = float(last_daily.get('trading_value', 0.0)) if pd.notna(last_daily.get('trading_value')) else 0.0
+        if day_val <= 0:
+            day_val = float(last_daily.get('close', tick_close)) * float(last_daily.get('volume', 0.0))
+        day_val_eok = day_val / 100_000_000.0
+
         if pre_day_close is not None and pre_day_close > 0:
             pre_close = float(pre_day_close)
         else:
             pre_close = float(last_daily.get('close', tick_close))
         day_ret_pct = ((tick_close - pre_close) / pre_close * 100.0) if pre_close > 0 else 0.0
 
-        if body_ratio >= 0.70 and 5.0 <= day_ret_pct <= 16.0:
-            score_candle = 30.0
-        elif body_ratio >= 0.50 and day_ret_pct <= 20.0:
-            score_candle = 20.0
-        elif day_ret_pct > 24.0 or body_ratio < 0.35:
-            score_candle = 5.0
-        else:
-            score_candle = 15.0
-
-        total_score = score_val + score_vol + score_candle
+        total_score = score_speed + score_shape + score_anchor
         details = {
             'total_score': total_score,
-            'day_val_eok': day_val_eok,
-            'score_val': score_val,
-            'vol_surge_ratio': vol_surge_ratio,
-            'score_vol': score_vol,
+            'vol_ratio_prev': vol_ratio_prev,
+            'target_vol': target_vol,
+            'target_name': target_name,
+            'attainment_ratio': attainment_ratio,
+            'score_speed': score_speed,
+            'gijun_diff_pct': gijun_diff_pct,
+            'score_anchor': score_anchor,
             'body_ratio': body_ratio,
+            'upper_shadow_ratio': upper_shadow_ratio,
+            'score_shape': score_shape,
+            'score_candle': score_shape + score_anchor,
             'day_ret_pct': day_ret_pct,
-            'score_candle': score_candle
+            'day_val_eok': day_val_eok
         }
         return total_score, details
 
@@ -615,7 +675,7 @@ class SafeHoldingsThemeGateBot:
                     # 3) 신규 1차 매수: 동시 돌파 우선순위 스코어링 평가 리스트에 수집
                     elif order.action == "BUY_1":
                         p_score, p_details = self.calculate_priority_score(
-                            code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1
+                            code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1, df_daily=df_daily
                         )
                         buy_candidates.append({
                             'code': code,
@@ -658,10 +718,11 @@ class SafeHoldingsThemeGateBot:
                 winner = buy_candidates[0]
                 w_d = winner['details']
                 logger.info(
-                    f"👑 [동시 기준선 돌파 주도주 1픽 선정] 총 {len(buy_candidates)}개 돌파 후보 중 [{winner['name']}({winner['code']})] "
+                    f"👑 [동시 기준선 돌파 1픽 선정] 총 {len(buy_candidates)}개 돌파 후보 중 [{winner['name']}({winner['code']})] "
                     f"우선순위 1위 ({winner['priority_score']:.1f}점) 선정 및 매수 집행! "
-                    f"[거래대금: {w_d['day_val_eok']:.1f}억({w_d['score_val']:.0f}점), 거래량배율: {w_d['vol_surge_ratio']:.1f}배({w_d['score_vol']:.0f}점), "
-                    f"캔들/등락률: {w_d['score_candle']:.0f}점]"
+                    f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}% 돌파({w_d.get('score_speed', 0.0):.0f}점), "
+                    f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
+                    f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%({w_d.get('score_anchor', 0.0):.0f}점)]"
                 )
 
                 self.execute_order(winner['code'], winner['name'], winner['order'])

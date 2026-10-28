@@ -305,28 +305,31 @@ def test_priority_scoring_and_ranking():
     print("\n=== 7. 동시 기준선 돌파 시 3대 핵심 팩터 스코어링 (100점 만점) 검증 ===")
     bot = SafeHoldingsThemeGateBot(is_real=False, dry_run=True, holdings_state="idle")
     
-    # 2개 후보 종목:
-    # 종목A (소형주): 당일 거래대금 30억, 거래량 1.2배, 캔들 윗꼬리 김
-    # 종목B (대장주): 당일 거래대금 800억, 거래량 5.0배 폭증, 장대양봉 몸통 86.5% (+9% 상승)
-    
-    last_60m_a = pd.Series({'open': 10000, 'high': 10500, 'low': 9900, 'close': 10100, 'volume': 1200})
+    # 1) KRX 정규장 세션 테스트 (기준: 3.0%)
+    last_60m_a = pd.Series({'open': 10000, 'high': 10500, 'low': 9900, 'close': 10010, 'volume': 1200, 'theme_gijun': 10000})
     df_60m_a = pd.DataFrame({'volume': [1000]*25})
-    last_daily_a = pd.Series({'close': 10000, 'volume': 300000, 'trading_value': 3_000_000_000}) # 30억
+    last_daily_a = pd.Series({'close': 10000, 'volume': 300000, 'trading_value': 3_000_000_000})
+    score_a, d_a = bot.calculate_priority_score('000010', '소형주A', 10010, last_60m_a, last_daily_a, df_60m_a, vol_ratio_prev=0.8, session_target_vol=3.0)
     
-    score_a, d_a = bot.calculate_priority_score('000010', '소형주A', 10100, last_60m_a, last_daily_a, df_60m_a)
+    last_60m_b = pd.Series({'open': 50000, 'high': 51000, 'low': 49800, 'close': 50800, 'volume': 50000, 'theme_gijun': 50000})
+    df_60m_b = pd.DataFrame({'volume': [10000]*25})
+    last_daily_b = pd.Series({'close': 50000, 'volume': 1600000, 'trading_value': 80_000_000_000})
+    score_b, d_b = bot.calculate_priority_score('000020', '대장주B', 50800, last_60m_b, last_daily_b, df_60m_b, vol_ratio_prev=4.2, session_target_vol=3.0)
     
-    last_60m_b = pd.Series({'open': 50000, 'high': 55000, 'low': 49800, 'close': 54500, 'volume': 50000})
-    df_60m_b = pd.DataFrame({'volume': [10000]*25}) # 20봉 평균 1만 -> 당봉 5만 (5배 폭증)
-    last_daily_b = pd.Series({'close': 50000, 'volume': 1600000, 'trading_value': 80_000_000_000}) # 800억
-    
-    score_b, d_b = bot.calculate_priority_score('000020', '대장주B', 54500, last_60m_b, last_daily_b, df_60m_b)
-    
-    print(f"  소형주A 점수: {score_a:.1f}점 (거래대금: {d_a['day_val_eok']:.1f}억[{d_a['score_val']:.0f}점], 거래량배율: {d_a['vol_surge_ratio']:.1f}배[{d_a['score_vol']:.0f}점], 캔들: {d_a['score_candle']:.0f}점)")
-    print(f"  대장주B 점수: {score_b:.1f}점 (거래대금: {d_b['day_val_eok']:.1f}억[{d_b['score_val']:.0f}점], 거래량배율: {d_b['vol_surge_ratio']:.1f}배[{d_b['score_vol']:.0f}점], 캔들: {d_b['score_candle']:.0f}점)")
-    
-    assert score_b > score_a, f"대장주 점수({score_b})가 소형주({score_a})보다 높아야 합니다."
-    assert score_b >= 80.0, f"대장주B 점수({score_b})는 80점 이상이어야 합니다."
-    print("  [성공] 3대 팩터 스코어링: 대장주B가 압도적 1위(90점)로 선정됨을 확인!")
+    print(f"  [정규장(3.0%)] 후발주A 점수: {score_a:.1f}점 (전일대비: {d_a['vol_ratio_prev']:.1f}%[{d_a['score_speed']:.0f}점], 안착: {d_a['score_anchor']:.0f}점)")
+    print(f"  [정규장(3.0%)] 대장주B 점수: {score_b:.1f}점 (전일대비: {d_b['vol_ratio_prev']:.1f}%[{d_b['score_speed']:.0f}점], 안착: {d_b['score_anchor']:.0f}점)")
+    assert score_b > score_a and score_b >= 90.0, "정규장 3% 돌파 대장주 평가 오류"
+    print("  [성공] KRX 정규장: 3.0% 돌파 대장주B(4.2%)가 95점 1위 선정 확인!")
+
+    # 2) NXT 프리마켓 세션 테스트 (기준: 1.5%)
+    score_pre, d_pre = bot.calculate_priority_score('000020', '프리대장', 50800, last_60m_b, last_daily_b, df_60m_b, vol_ratio_prev=1.6, session_target_vol=1.5)
+    assert d_pre['score_speed'] >= 45.0, f"프리마켓 1.5% 돌파 시 45점 이상이어야 함: {d_pre['score_speed']}"
+    print(f"  [성공] NXT 프리마켓: 1.5% 목표 기준 작동 확인 (1.6% 달성 시 {score_pre:.1f}점 고득점 획득)")
+
+    # 3) NXT 애프터마켓 세션 테스트 (기준: 1.0%)
+    score_aft, d_aft = bot.calculate_priority_score('000020', '애프터대장', 50800, last_60m_b, last_daily_b, df_60m_b, vol_ratio_prev=1.1, session_target_vol=1.0)
+    assert d_aft['score_speed'] >= 45.0, f"애프터마켓 1.0% 돌파 시 45점 이상이어야 함: {d_aft['score_speed']}"
+    print(f"  [성공] NXT 애프터마켓: 1.0% 목표 기준 작동 확인 (1.1% 달성 시 {score_aft:.1f}점 고득점 획득)")
 
 def test_expert_diagnostic_safeguards():
     print("\n=== 8. 전문가 정밀 진단 4대 안전장치 검증 ===")
