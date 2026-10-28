@@ -503,6 +503,34 @@ class SafeHoldingsThemeGateBot:
                 df_60m = self.get_60m_candles(code)
                 df_daily = self.get_daily_candles(code)
 
+                # 실시간 현재가 최우선 확보: 1순위 계좌 잔고 TR 수신가 -> 2순위 API 조회 -> 3순위 60분봉 종가
+                acc_price = self.active_holdings.get(code, {}).get('current_price', 0.0)
+                if acc_price and acc_price > 0:
+                    tick_close = float(acc_price)
+                else:
+                    tick_close = 0.0
+                    if self.is_real and self.api:
+                        try:
+                            real_prc = self.api.get_current_price(code)
+                            if real_prc and real_prc > 0:
+                                tick_close = float(real_prc)
+                        except Exception:
+                            pass
+
+                if tick_close <= 0 and df_60m is not None and not df_60m.empty:
+                    tick_close = float(df_60m.iloc[-1]['close'])
+
+                # 💡 [실시간 60분봉 캔들 합성]: 장중 진행 중인 마지막 60분봉에 실시간 현재가 즉시 반영
+                # ➔ 60분이 끝나기를 기다릴 필요 없이 실시간 기준선 변곡 및 TEMA 지표 즉각 연산
+                if df_60m is not None and not df_60m.empty and tick_close > 0:
+                    df_60m = df_60m.copy()
+                    last_idx = df_60m.index[-1]
+                    df_60m.loc[last_idx, 'close'] = tick_close
+                    if tick_close > df_60m.loc[last_idx, 'high']:
+                        df_60m.loc[last_idx, 'high'] = tick_close
+                    if tick_close < df_60m.loc[last_idx, 'low']:
+                        df_60m.loc[last_idx, 'low'] = tick_close
+
                 df_60m_calc = calculate_all_60m_indicators(
                     df_60m,
                     p1=DEFAULT_CONFIG.TEMA_FAST,
@@ -520,21 +548,7 @@ class SafeHoldingsThemeGateBot:
 
                 daily_dead_cross = bool(last_daily.get('daily_dead_cross', False)) if pd.notna(last_daily.get('daily_dead_cross')) else False
                 daily_bull = bool(last_daily.get('daily_trend_bull', True)) if pd.notna(last_daily.get('daily_trend_bull')) else True
-
                 close_val = last_60m['close']
-                # 실시간 현재가: 1순위 계좌 잔고 TR 수신가 -> 2순위 API 조회 -> 3순위 60분봉 종가
-                acc_price = self.active_holdings.get(code, {}).get('current_price', 0.0)
-                if acc_price and acc_price > 0:
-                    tick_close = float(acc_price)
-                else:
-                    tick_close = float(close_val)
-                    if self.is_real and self.api:
-                        try:
-                            real_prc = self.api.get_current_price(code)
-                            if real_prc and real_prc > 0:
-                                tick_close = float(real_prc)
-                        except Exception:
-                            pass
 
                 # M/3 수식선 계산: M = 종가 + nPreDayClose(1) + nPreDayClose(2); 수식선 = M / 3.0
                 day3_m_line, m_val, pred1, pred2 = calculate_day3_m_line(df_daily, tick_close)
