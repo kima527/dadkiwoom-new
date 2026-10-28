@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from datetime import datetime
 from typing import Tuple, Optional
 
 def calculate_tema(series: pd.Series, period: int) -> pd.Series:
@@ -205,4 +206,51 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame) -> pd.DataFrame:
     df['is_tema_dead_5_20'] = df['tema5'] < df['tema20']
     
     return df
+
+def calculate_day3_m_line(df_daily: Optional[pd.DataFrame], current_price: float) -> Tuple[float, float, float, float]:
+    """
+    영웅문(키움 HTS) 실시간 3일선 M/3 수식선 계산:
+    M = 종가 + nPreDayClose(1) + nPreDayClose(2);
+    수식선 = M / 3.0
+
+    HTS 함수 정의:
+    - 종가: 당일 실시간 현재가(체결가)
+    - nPreDayClose(1): 1일전 전일 종가
+    - nPreDayClose(2): 2일전 전전일 종가
+
+    Returns:
+        Tuple[float, float, float, float]: (day3_m_line, m_val, pred1, pred2)
+    """
+    if df_daily is None or len(df_daily) < 2 or current_price <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    df_d = df_daily.copy()
+    col_map = {col: str(col).lower() for col in df_d.columns if str(col).lower() in ('open', 'high', 'low', 'close', 'date')}
+    df_d.rename(columns=col_map, inplace=True)
+
+    today_str = datetime.now().strftime('%Y%m%d')
+
+    if 'date' in df_d.columns:
+        last_date = str(df_d['date'].iloc[-1]).replace('-', '').replace('/', '').strip()[:8]
+        # 오늘 날짜 일봉 캔들이 이미 포함되어 있으면 Day-1(전일), Day-2(전전일) 사용
+        if last_date == today_str and len(df_d) >= 3:
+            pred1 = float(df_d['close'].iloc[-2])
+            pred2 = float(df_d['close'].iloc[-3])
+        else:
+            pred1 = float(df_d['close'].iloc[-1])
+            pred2 = float(df_d['close'].iloc[-2]) if len(df_d) >= 2 else pred1
+    else:
+        # date 컬럼이 없는 경우 인덱스 확인
+        last_idx_str = str(df_d.index[-1]).replace('-', '').replace('/', '').strip()[:8]
+        if last_idx_str == today_str and len(df_d) >= 3:
+            pred1 = float(df_d['close'].iloc[-2])
+            pred2 = float(df_d['close'].iloc[-3])
+        else:
+            pred1 = float(df_d['close'].iloc[-1])
+            pred2 = float(df_d['close'].iloc[-2]) if len(df_d) >= 2 else pred1
+
+    m_val = float(current_price) + pred1 + pred2
+    day3_m_line = m_val / 3.0
+    return day3_m_line, m_val, pred1, pred2
+
 

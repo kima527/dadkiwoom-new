@@ -245,11 +245,51 @@ class RealAPIAdapter:
     def get_30m_candles(self, stock_code: str) -> pd.DataFrame:
         """실전 30분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (SMA260 계산을 위해 30일치 조회)"""
         try:
-            raw_candles = self.real_client.get_30min_candles(stock_code, last_n_days=30)
+            raw_candles = self.real_client._fetch_minute_candles(stock_code, tic_scope="30", last_n_days=30) if hasattr(self.real_client, '_fetch_minute_candles') else []
+            if not raw_candles and hasattr(self.real_client, 'get_30min_candles'):
+                raw_candles = self.real_client.get_30min_candles(stock_code, last_n_days=30)
             return self._convert_raw_candles_to_df(raw_candles, stock_code, "30분봉")
         except Exception as e:
             logger.error(f"30분봉 조회 에러 ({stock_code}): {e}")
             return pd.DataFrame()
+
+    def get_60m_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 60분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (HTS 60분봉 공식 차트 일치)"""
+        try:
+            raw_candles = []
+            if hasattr(self.real_client, '_fetch_minute_candles'):
+                raw_candles = self.real_client._fetch_minute_candles(stock_code, tic_scope="60", last_n_days=30)
+            elif hasattr(self.real_client, 'get_60min_candles'):
+                raw_candles = self.real_client.get_60min_candles(stock_code, last_n_days=30)
+
+            df = self._convert_raw_candles_to_df(raw_candles, stock_code, "60분봉") if raw_candles else pd.DataFrame()
+
+            # 직접 조회가 부족할 경우 30분봉 데이터를 60분봉으로 리샘플링하여 안전 합성
+            if df.empty or len(df) < 10:
+                df_30m = self.get_30m_candles(stock_code)
+                if not df_30m.empty and len(df_30m) >= 2:
+                    df = df_30m.resample('60min').agg({
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last',
+                        'volume': 'sum'
+                    }).dropna()
+            return df
+        except Exception as e:
+            logger.error(f"60분봉 조회 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
+    def get_current_price(self, stock_code: str) -> float:
+        """현재가 조회 (계좌 잔고 캐시 우선)"""
+        try:
+            holdings = self.get_account_holdings()
+            clean_code = stock_code.replace('_AL', '').replace('_NX', '').lstrip('A').strip()
+            if clean_code in holdings and holdings[clean_code].get('current_price', 0) > 0:
+                return float(holdings[clean_code]['current_price'])
+        except Exception as e:
+            logger.debug(f"현재가 조회 에러 ({stock_code}): {e}")
+        return 0.0
 
     def get_120t_candles(self, stock_code: str) -> pd.DataFrame:
         """실전 120틱 데이터를 가져와서 Pandas DataFrame으로 변환"""
