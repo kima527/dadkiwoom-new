@@ -71,3 +71,20 @@ python execution/render_kpop_spotlight_fancam.py \
   --trim-logo
 ```
 
+---
+
+## 5. 유튜브 저작권(Content ID) 대응 및 바이럴 리믹스
+
+유튜브 자동 저작권 감지 시스템(Content ID)에 의한 전 세계 차단을 방지하고 숏폼 바이럴을 극대화하기 위한 후처리 파이프라인:
+
+1. **Mirror Ver. (좌우 반전)**: `hflip`을 적용하여 안무 커버/연습용 거울 시야를 제공하고 공간 비디오 핑거프린트 매칭을 우회.
+2. **Sped Up (1.06x 템포 & +1 반음 피치)**: `asetrate=sr*1.06,aresample=sr` 및 `setpts=PTS/1.06`을 적용하여 오디오 핑거프린트 봇의 고정 주파수 매칭을 통과하고 시각적 타격감 극대화.
+
+```bash
+python execution/render_mirror_spedup_remix.py \
+  --input "D:/BTS/input_fancam.mp4" \
+  --output "D:/BTS/output_mirror_spedup.mp4" \
+  --speed 1.06
+```
+
+

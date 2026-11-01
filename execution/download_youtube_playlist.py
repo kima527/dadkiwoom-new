@@ -36,3 +36,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     download_playlist(args.url, args.output_dir)
+
