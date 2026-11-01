@@ -70,3 +70,4 @@ python execution/render_kpop_spotlight_fancam.py \
   --center-x 1820 \
   --trim-logo
 ```
+
