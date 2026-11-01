@@ -344,6 +344,21 @@ class SafeHoldingsThemeGateBot:
             else:
                 account_holding_qty = self.active_holdings.get(code, {}).get('qty', 0)
 
+            # 🛡️ [관종 1주 매도 절대 차단 원칙]
+            # 사용자가 관심종목/정찰병으로 1주 매수한 종목은 2차 매수가 실제로 체결되어
+            # 계좌 수량이 1주를 초과할 때만 매도 시 함께 정리됩니다.
+            # 실계좌에 1주만 남아있는 상태에서는 어떠한 경우에도 매도 주문을 전송하지 않고 보존합니다.
+            if account_holding_qty <= 1:
+                logger.warning(
+                    f"🛡️ [관종 1주 매도 절대 차단] [{name}({code})] 현재 실계좌 수량이 {account_holding_qty}주(관종 마커)입니다. "
+                    f"2차 매수가 완료되지 않았으므로 매도 주문 발송을 원천 차단하고 1주를 안전하게 보존합니다."
+                )
+                if strat:
+                    strat.position = PositionTracker()
+                    strat.position.state = StrategyState.IDLE
+                    strat.position.base_account_qty = account_holding_qty
+                return
+
             # 실전 매도시 실계좌 보유수량이 0이면 매도 차단 및 상태 동기화
             if self.is_real and not self.dry_run and account_holding_qty <= 0:
                 logger.warning(f"⚠️ [매도 스킵] [{name}({code})] 실계좌 보유수량이 0주이므로 매도 주문을 전송하지 않고 상태를 동기화합니다.")
@@ -666,8 +681,13 @@ class SafeHoldingsThemeGateBot:
                 )
 
                 if order:
-                    # 1) 매도 주문(전량 익절/손절/이탈): 즉시 집행하여 슬롯 및 예수금 확보
+                    # 1) 매도 주문(전량 익절/손절/이탈): 2차 매수가 완료된 종목에 한해 전량 집행
                     if order.action in ["TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]:
+                        # 🛡️ 관종 1주 종목은 2차 매수가 실제로 체결되기 전에는 매도하지 않음
+                        current_holding_qty = self.active_holdings.get(code, {}).get('qty', 0)
+                        if current_holding_qty <= 1:
+                            logger.info(f"   🛡️ [{name}({code})] 관종 1주 보유 종목 ➔ 2차 매수 미완료 상태 매도 신호 무시 (1주 보존)")
+                            continue
                         self.execute_order(code, name, order)
                     # 2) 2차 불타기 매수: 이미 활성 운용 중인 종목이므로 즉시 집행
                     elif order.action == "BUY_2":

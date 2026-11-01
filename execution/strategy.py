@@ -117,7 +117,8 @@ class ThemeGate60mStrategy:
         # 0. 최우선 규칙: 일봉 기준 테마 5-20 데드크로스 발생 시 전량 청산 및 종료
         # ─────────────────────────────────────────────────────────────
         if daily_dead_cross:
-            if self.position.total_qty > 0:
+            # 🛡️ 실보유 물량이 실제로 2차 매수까지 체결된 경우(수량 > 1)에만 청산 주문 발생 (관종 1주는 매도 차단)
+            if self.position.total_qty > 1:
                 sell_qty = self.position.total_qty
                 sell_amt = sell_qty * tick_close
                 self.cash += sell_amt
@@ -213,68 +214,10 @@ class ThemeGate60mStrategy:
                     return order
 
         # ─────────────────────────────────────────────────────────────
-        # 2. FIRST_BUY_DONE 상태: 2차 매수 (50% 불타기) 또는 M/3 수식선 이탈 전량 매도
+        # 2. FIRST_BUY_DONE 상태: 2차 매수 (50% 불타기) 대기
+        # (원칙: 관종 1주 및 1차 매수 물량은 2차 매수가 완료된 FULL_POSITION 상태에서만 매도 2대 원칙 적용)
         # ─────────────────────────────────────────────────────────────
         elif self.position.state == StrategyState.FIRST_BUY_DONE:
-            is_sell_signal = False
-            sell_reason = ""
-            action_type = "TAKE_PROFIT"
-            exit_price = tick_close
-
-            # 🛡️ 진입 직후 1~2틱 호가 노이즈 털림 방지 (최소 3분간 노이즈 버퍼 적용):
-            is_recent_entry = (self.position.entry_time > 0 and (time.time() - self.position.entry_time < 180))
-            m3_thresh = day3_m_line * 0.995 if is_recent_entry else day3_m_line * 0.998
-            gijun_thresh = gijun_line * 0.993 if is_recent_entry else gijun_line * 0.995
-
-            # 매도 원칙:
-            # 1) M=종가+nPreDayClose(1)+nPreDayClose(2); M/3 수식선 이탈 즉시 전량 매도
-            if day3_m_line > 0 and tick_close < m3_thresh:
-                is_sell_signal = True
-                diff_pct = ((tick_close - day3_m_line) / day3_m_line) * 100.0
-                profit_rate = ((exit_price - self.position.avg_price) / self.position.avg_price) * 100.0
-                action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
-                sell_reason = (
-                    f"1차 매수 후 M/3 수식선({day3_m_line:,.0f}원) 하향 이탈 즉시 전량 매도 "
-                    f"(현재가: {exit_price:,.0f}원, M/3대비: {diff_pct:+.2f}%, 수익률: {profit_rate:+.2f}%)"
-                )
-            # 2) 60분봉 기준선 변곡선(M선) 넘지 못할 경우 전량 매도 (기준선 돌파 진입 후 하향 이탈 또는 저항 꺾임)
-            elif not np.isnan(gijun_line) and gijun_line > 0:
-                was_near_gijun = (self.position.first_buy_price >= gijun_line * 0.998) or (tick_close >= gijun_line)
-                if was_near_gijun and tick_close < gijun_thresh:
-                    is_sell_signal = True
-                    diff_pct = ((tick_close - gijun_line) / gijun_line) * 100.0
-                    profit_rate = ((exit_price - self.position.avg_price) / self.position.avg_price) * 100.0
-                    action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
-                    sell_reason = (
-                        f"1차 매수 후 60분봉 기준선 변곡선({gijun_line:,.0f}원) 미돌파/하향 이탈 즉시 전량 매도 "
-                        f"(현재가: {exit_price:,.0f}원, 기준선대비: {diff_pct:+.2f}%, 수익률: {profit_rate:+.2f}%)"
-                    )
-            elif day3_m_line <= 0:
-                # Fallback: 관문선 하향 이탈
-                if not np.isnan(gate_line) and close < gate_line * (1.0 - self.gate_sl_pct):
-                    is_sell_signal = True
-                    profit_rate = ((exit_price - self.position.avg_price) / self.position.avg_price) * 100.0
-                    action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
-                    sell_reason = "1차 매수 후 테마급등관문선 하향 이탈 전량 손절"
-
-            if is_sell_signal:
-                sell_qty = self.position.total_qty
-                sell_amt = sell_qty * exit_price
-                self.cash += sell_amt
-                self.last_sell_time = time.time()
-                order = TradeOrder(
-                    timestamp=timestamp,
-                    action=action_type,
-                    price=exit_price,
-                    qty=sell_qty,
-                    amount=sell_amt,
-                    reason=sell_reason,
-                    stage="IDLE"
-                )
-                self.trade_history.append(order)
-                self.position = PositionTracker()
-                return order
-
             # 2차 매수 조건 (분할 매수 및 더블 바잉 방지):
             # 1) 1차 매수를 관문선 지지로 진입한 경우: 60분봉 테마기준선(M선) 상향 돌파 시 2차 매수
             # 2) 1차 매수를 이미 기준선 돌파로 진입한 경우: 급등관문고가선(HH) 돌파 또는 1차 매수가 대비 +0.5% 이상 추가 상승 시 불타기
@@ -340,6 +283,10 @@ class ThemeGate60mStrategy:
         # 3. FULL_POSITION 상태: 매도 2대 원칙 충족 시 전량 매도 -> 즉시 IDLE 복귀 (재매수 없음)
         # ─────────────────────────────────────────────────────────────
         elif self.position.state == StrategyState.FULL_POSITION:
+            # 🛡️ 관종 1주 매도 절대 차단: 실보유 수량이 1주 이하인 종목은 2차 매수가 완료된 것이 아니므로 매도 신호 차단
+            if self.position.total_qty <= 1:
+                return None
+
             is_sell_signal = False
             sell_reason = ""
             action_type = "TAKE_PROFIT"

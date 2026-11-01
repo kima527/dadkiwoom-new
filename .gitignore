@@ -30,3 +30,14 @@ MovingAveragelineTraid/execution/trade_states.json
 .tmp/
 .venv/
 venv/
+
+# 3D Assets & Media Outputs
+outputs/
+*.glb
+*.gltf
+*.bvh
+*.mp4
+*.avi
+*.mov
+*.raw.mp4
+
