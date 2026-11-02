@@ -14,9 +14,9 @@ Execute a 100% automated, repeatable, high-CPM YouTube Shorts video production p
 - Orchestrates data anomaly detection, script generation, audio synthesis, and visual rendering.
 
 ### Layer 3: Execution Tools (`execution/`)
-1. `execution/fetch_market_anomaly.py`: Fetches US/Global tickers and domestic leading indices (Philadelphia Semiconductor `^SOX`, Night KOSPI 200 Futures `KRX:K2I1!`, Night KOSDAQ 150 Futures `KRX:KQI1!`), detects maximum % move anomaly, and generates tailored Korean investor killer hooks.
-2. `execution/generate_financial_chart.py`: Generates 1080x1920 Full HD 9:16 dark-mode infographic with custom price curves, Global Macro scoreboard, and Korea Pre-market Leading Indicators card.
-3. `execution/generate_market_script.py`: Tightened 52~55s 4-stage script covering semiconductor anomalies and night futures opening gap predictions, synthesized via Edge-TTS neural speech (`ko-KR-InJoonNeural`, +20% rate).
+1. `execution/fetch_market_anomaly.py`: Fetches real-time US market closing headline news (Google News RSS), Philadelphia Semiconductor (`^SOX`), and domestic leading indicators (Night KOSPI 200 Futures, Night KOSDAQ 150 Futures) to provide actionable market context.
+2. `execution/generate_financial_chart.py`: Generates 1080x1920 Full HD 9:16 dark-mode infographic featuring Global Macro scoreboard, `◆ [오늘 아침 증시 영향 핵심 헤드라인 뉴스]` card, Philadelphia Semiconductor (`^SOX`) 5-day trend chart, and domestic pre-market checklist.
+3. `execution/generate_market_script.py`: Tightened 52~55s 4-stage script synchronized with headline news and night futures opening gap predictions, synthesized via Edge-TTS neural speech (`ko-KR-InJoonNeural`, +20% rate).
 4. `execution/render_financial_shorts.py`: FFmpeg rock-solid 60FPS `-tune stillimage` stabilization video rendering (zero micro-jitter).
 5. `execution/build_daily_shorts.py`: Master one-click end-to-end runner.
 

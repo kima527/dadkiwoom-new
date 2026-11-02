@@ -25,7 +25,7 @@ def run_full_pipeline(output_video_path=r"D:\DailyQuant\Daily_Quant_Shorts_Sampl
     print("=" * 70 + "\n")
 
     # Step 1: Data & Anomaly
-    print(">>> [1/4] 미국 증시 데이터 수집 및 킬러 훅 이상치 스캔 중...")
+    print(">>> [1/4] 미국/국내 증시 데이터 및 핵심 헤드라인 뉴스 수집 중...")
     data = fetch_market_data()
     if not data:
         print("❌ 실패: 데이터 수집에 실패했습니다.")
@@ -35,7 +35,9 @@ def run_full_pipeline(output_video_path=r"D:\DailyQuant\Daily_Quant_Shorts_Sampl
     json_path = ".tmp/market_anomaly_today.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
-    print(f"✅ 1단계 완료: 오늘의 이상치 종목 -> {report['top_anomaly']['name']} ({report['top_anomaly']['change_pct']}%)\n")
+    headlines_count = len(report.get('headlines', []))
+    sox_pct = report.get('sox_data', {}).get('change_pct', 0)
+    print(f"✅ 1단계 완료: 헤드라인 {headlines_count}건 수집 완료, 필라델피아 반도체({sox_pct}%)\n")
 
     # Step 2: Infographic
     print(">>> [2/4] 9:16 모바일 최적화 고대비 다크모드 차트 렌더링 중...")
@@ -51,7 +53,7 @@ def run_full_pipeline(output_video_path=r"D:\DailyQuant\Daily_Quant_Shorts_Sampl
     print()
 
     # Step 4: Video Render
-    print(">>> [4/4] FFmpeg 60FPS 시네마틱 줌 모션 비디오 렌더링 중...")
+    print(">>> [4/4] FFmpeg 60FPS 무흔들림 안정화 비디오 렌더링 중...")
     render_financial_shorts(image_path, audio_path, output_video_path)
     print()
 

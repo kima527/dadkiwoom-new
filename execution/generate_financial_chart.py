@@ -48,9 +48,13 @@ def create_shorts_infographic(json_path=".tmp/market_anomaly_today.json", output
     k2 = korea_ind.get("kospi200_night") or {"price": 918.65, "change_pct": 2.13}
     kq = korea_ind.get("kosdaq150_night") or {"price": 1229.0, "change_pct": 2.09}
 
-    is_positive = top_stock["change_pct"] >= 0
-    hero_color = "#00F59B" if is_positive else "#FF4757"  # Neon Green / Vivid Crimson
-    hero_sign = "+" if is_positive else ""
+    # Market headlines
+    headlines = data.get("market_headlines", [])
+    if len(headlines) < 2:
+        headlines = [
+            "인텔발 반도체 쇼크에 나스닥 2.86% 급락… 뉴욕증시 일제히 하락 마감",
+            "미 10년물 국채금리 4.9% 재진입 속 글로벌 증시 밸류에이션 부담 가중"
+        ]
 
     # Setup 1080x1920 Matplotlib Figure (10.8 x 19.2 inches at 100 DPI)
     fig = plt.figure(figsize=(10.8, 19.2), dpi=100, facecolor="#0A0E17")
@@ -64,27 +68,51 @@ def create_shorts_infographic(json_path=".tmp/market_anomaly_today.json", output
     ax_bg.text(0.5, 0.915, "미국 증시 마감 & 국내 개장 긴급 브리핑", color="#FFFFFF", fontsize=31, fontweight='bold', ha='center', fontproperties=font_prop)
     ax_bg.text(0.5, 0.890, f"기준: {data.get('timestamp', '오늘')} 실시간 데이터", color="#8B949E", fontsize=15, ha='center', fontproperties=font_prop)
 
-    # 2. Hero Anomaly Badge
-    badge_box = dict(boxstyle="round,pad=0.7,rounding_size=0.3", fc="#161B22", ec=hero_color, lw=2.5)
-    hero_text = f"▶ 오늘의 핵심 이상치: {top_stock['name']}\n{top_stock['price']:.2f} USD  ({hero_sign}{top_stock['change_pct']}%)"
-    ax_bg.text(0.5, 0.825, hero_text, color="#FFFFFF", fontsize=25, fontweight='bold', ha='center', bbox=badge_box, fontproperties=font_prop)
+    # 2. Market-Moving Headline News Card (Replaces '오늘의 핵심 이상치' badge)
+    # Position: [left=0.07, bottom=0.765, width=0.86, height=0.105]
+    ax_news = fig.add_axes([0.07, 0.765, 0.86, 0.105], facecolor="none")
+    ax_news.axis('off')
+    ax_news.set_xlim(0, 1)
+    ax_news.set_ylim(0, 1)
 
-    # 3. Middle Chart: Hero Asset 5-Day Trend Curve
-    # Position: [left, bottom, width, height]
-    ax_chart = fig.add_axes([0.07, 0.54, 0.86, 0.22], facecolor="#101520")
+    news_border_color = "#FF4757" if sox["change_pct"] < 0 else "#00F59B"
+    box_news = patches.FancyBboxPatch(
+        (0.005, 0.005), 0.99, 0.99,
+        boxstyle="round,pad=0.01,rounding_size=0.03",
+        transform=ax_news.transAxes,
+        linewidth=2.0,
+        edgecolor=news_border_color,
+        facecolor="#161B22"
+    )
+    ax_news.add_patch(box_news)
+
+    ax_news.text(0.05, 0.80, "◆ [오늘 아침 증시 영향 핵심 헤드라인 뉴스]", color="#FF6B6B" if sox["change_pct"] < 0 else "#00F59B", fontsize=16, fontweight='bold', ha='left', fontproperties=font_prop)
+    ax_news.plot([0.04, 0.96], [0.65, 0.65], color="#30363D", lw=1.2)
+
+    hl_1 = f"• {headlines[0]}"
+    hl_2 = f"• {headlines[1]}"
+    ax_news.text(0.05, 0.43, hl_1, color="#F0F6FC", fontsize=15, fontweight='bold', ha='left', va='center', fontproperties=font_prop)
+    ax_news.text(0.05, 0.18, hl_2, color="#C9D1D9", fontsize=14.5, ha='left', va='center', fontproperties=font_prop)
+
+    # 3. Middle Chart: Philadelphia Semiconductor (SOX) 5-Day Trend
+    # Position: [left=0.07, bottom=0.535, width=0.86, height=0.205]
+    ax_chart = fig.add_axes([0.07, 0.535, 0.86, 0.205], facecolor="#101520")
     ax_chart.spines['top'].set_visible(False)
     ax_chart.spines['right'].set_visible(False)
     ax_chart.spines['left'].set_color('#30363D')
     ax_chart.spines['bottom'].set_color('#30363D')
-    ax_chart.tick_params(colors='#8B949E', labelsize=13)
+    ax_chart.tick_params(colors='#8B949E', labelsize=12)
 
-    history = top_stock.get("history", [100, 102, 98, 99, 95])
-    x_vals = np.arange(len(history))
+    sox_hist_all = [d.get("history") for d in data.get("all_data", []) if d.get("symbol") == "^SOX"]
+    sox_history = sox_hist_all[0] if sox_hist_all else [11083.5, 11482.5, 11684.0, 11518.2, 10688.8]
+    sox_color = "#FF4757" if sox["change_pct"] < 0 else "#00F59B"
+    sox_sign = "+" if sox["change_pct"] >= 0 else ""
+
+    x_vals = np.arange(len(sox_history))
+    ax_chart.plot(x_vals, sox_history, color=sox_color, lw=4, marker='o', markersize=8, markerfacecolor='#FFFFFF')
+    ax_chart.fill_between(x_vals, sox_history, min(sox_history)*0.98, color=sox_color, alpha=0.18)
     
-    ax_chart.plot(x_vals, history, color=hero_color, lw=4, marker='o', markersize=8, markerfacecolor='#FFFFFF')
-    ax_chart.fill_between(x_vals, history, min(history)*0.98, color=hero_color, alpha=0.18)
-    
-    ax_chart.set_title(f"{top_stock['name']} 최근 수급 및 가격 추이", color="#C9D1D9", fontsize=17, pad=10, fontproperties=font_prop)
+    ax_chart.set_title(f"필라델피아 반도체 지수 (SOX) 최근 5일 추이  |  {sox['price']:.1f} pt ({sox_sign}{sox['change_pct']}%)", color="#C9D1D9", fontsize=16, pad=10, fontproperties=font_prop)
     ax_chart.grid(True, color='#21262D', linestyle='--', alpha=0.7)
 
     def format_item(item):

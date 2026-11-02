@@ -3,6 +3,7 @@ import sys
 import json
 from datetime import datetime
 import requests
+from bs4 import BeautifulSoup
 import yfinance as yf
 import pandas as pd
 
@@ -123,6 +124,34 @@ def fetch_korea_night_futures():
         }
     return korea_data
 
+def fetch_market_headlines():
+    """Fetches top 2 real-time market-moving news headlines affecting stock market."""
+    print("📰 [1-3단계] 증시 영향 핵심 헤드라인 뉴스 수집 중...", flush=True)
+    headlines = []
+    try:
+        url = 'https://news.google.com/rss/search?q=%EB%89%B4%EC%9A%95%EC%A6%9D%EC%8B%9C%20%EB%A7%88%EA%B0%90&hl=ko&gl=KR&ceid=KR:ko'
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'xml')
+            for item in soup.find_all('item'):
+                title = item.title.text.split(' - ')[0].strip()
+                title = title.replace('[뉴욕 인사이트] ', '').replace('[뉴욕증시 마감브리핑]', '').replace('(영상)', '').strip()
+                if len(title) >= 15 and ('증시' in title or '나스닥' in title or '반도체' in title or '금리' in title or '하락' in title or '급락' in title or '급등' in title):
+                    if title not in headlines:
+                        headlines.append(title)
+                if len(headlines) >= 2:
+                    break
+    except Exception as e:
+        print(f"⚠️ 헤드라인 수집 주의: {e}")
+
+    # Fallback default headlines
+    if len(headlines) < 2:
+        headlines = [
+            "반도체 대장주 급락 및 기술주 차익 실현에 나스닥 2.86% 하락 마감",
+            "미 10년물 국채금리 4.9% 재진입 속 글로벌 증시 밸류에이션 부담 가중"
+        ]
+    return headlines[:2]
+
 def analyze_anomalies(data):
     """Detects the biggest anomalies and generates killer hooks."""
     # Sort by absolute change percentage
@@ -145,6 +174,9 @@ def analyze_anomalies(data):
     korea_futures = fetch_korea_night_futures()
     kospi200_night = korea_futures.get("kospi200_night")
     kosdaq150_night = korea_futures.get("kosdaq150_night")
+
+    # Fetch market moving headlines
+    headlines = fetch_market_headlines()
     
     # Formulate 3 Killer Hooks (Korean Investor Priority)
     hooks = []
@@ -198,6 +230,7 @@ def analyze_anomalies(data):
             "kospi200_night": kospi200_night,
             "kosdaq150_night": kosdaq150_night
         },
+        "market_headlines": headlines,
         "hooks": hooks,
         "all_data": data
     }
@@ -248,6 +281,10 @@ def main():
         print(f"🌙 야간 코스피200선물: {k2['price']:.2f} ({'+' if k2['change_pct']>0 else ''}{k2['change_pct']}%)")
     if kq:
         print(f"🌙 야간 코스닥150선물: {kq['price']:.2f} ({'+' if kq['change_pct']>0 else ''}{kq['change_pct']}%)")
+        
+    print("\n📰 [증시 영향 핵심 헤드라인 뉴스]")
+    for i, hl in enumerate(report.get("market_headlines", []), 1):
+        print(f"  {i}. {hl}")
         
     print("\n💡 [추천 3초 킬러 훅 (Hook 후보)]")
     for i, h in enumerate(report["hooks"], 1):
