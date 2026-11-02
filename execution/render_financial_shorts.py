@@ -16,7 +16,6 @@ def get_audio_duration(ffmpeg_bin: str, audio_path: str) -> float:
     res = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
     for line in res.stderr.splitlines():
         if "Duration:" in line:
-            # Duration: 00:00:55.34, start: ...
             dur_str = line.split("Duration:")[1].split(",")[0].strip()
             parts = [float(p) for p in dur_str.split(":")]
             return parts[0]*3600 + parts[1]*60 + parts[2]
@@ -26,11 +25,15 @@ def render_financial_shorts(
     image_path: str = ".tmp/shorts_visual_today.png",
     audio_path: str = ".tmp/shorts_narration.mp3",
     output_path: str = r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4",
+    cover_path: str = ".tmp/shorts_cover_today.png",
+    cover_duration: float = 2.5,
+    fade_duration: float = 0.4,
     fps: int = 60
 ):
     """
     Renders high-quality 1080x1920 60FPS vertical YouTube Short.
-    Rock-solid stability with zero vibration/jitter for crystal-clear readability.
+    Seamlessly places the high-CTR viral cover page at the very beginning (0.0s~2.5s)
+    with a cinematic crossfade transition into the detailed infographic.
     """
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -44,32 +47,61 @@ def render_financial_shorts(
     duration = get_audio_duration(ffmpeg_bin, audio_path)
     total_frames = int(duration * fps)
 
-    print("🎬 [4단계 시작] 파이낸셜 쇼츠 비디오 렌더링 파이프라인 (안정화 모드)")
+    print("🎬 [4단계 시작] 파이낸셜 쇼츠 비디오 렌더링 파이프라인 (커버페이지 인트로 모드)")
+    has_cover = os.path.exists(cover_path)
+    if has_cover:
+        print(f"🌟 커버페이지: {cover_path} (인트로 노출: {cover_duration:.1f}초, 크로스페이드: {fade_duration:.1f}초)")
     print(f"🖼️ 인포그래픽: {image_path}")
     print(f"🎙️ 내레이션 : {audio_path} (길이: {duration:.2f}초)")
     print(f"💾 출력 파일 : {output_path}")
-    print(f"⚡ 프레임 수 : {total_frames} frames ({fps} FPS, 상하 흔들림 완전 제거)\n", flush=True)
+    print(f"⚡ 프레임 수 : {total_frames} frames ({fps} FPS, 흔들림 없는 고화질 렌더링)\n", flush=True)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    cmd = [
-        ffmpeg_bin, "-y",
-        "-loop", "1",
-        "-framerate", str(fps),
-        "-i", image_path,
-        "-i", audio_path,
-        "-c:v", "libx264",
-        "-tune", "stillimage",
-        "-preset", "veryfast",
-        "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "320k",
-        "-t", f"{duration:.2f}",
-        "-shortest",
-        "-movflags", "+faststart",
-        output_path
-    ]
+    if has_cover:
+        # Crossfade offset = cover_duration - fade_duration
+        fade_offset = max(0.5, cover_duration - fade_duration)
+        main_duration = duration - fade_offset + 1.0  # extra buffer
+
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-loop", "1", "-t", f"{cover_duration:.2f}", "-framerate", str(fps), "-i", cover_path,
+            "-loop", "1", "-t", f"{main_duration:.2f}", "-framerate", str(fps), "-i", image_path,
+            "-i", audio_path,
+            "-filter_complex", f"[0:v][1:v]xfade=transition=fade:duration={fade_duration:.2f}:offset={fade_offset:.2f}[v]",
+            "-map", "[v]",
+            "-map", "2:a",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "320k",
+            "-t", f"{duration:.2f}",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path
+        ]
+    else:
+        # Fallback to single visual loop
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-loop", "1",
+            "-framerate", str(fps),
+            "-i", image_path,
+            "-i", audio_path,
+            "-c:v", "libx264",
+            "-tune", "stillimage",
+            "-preset", "veryfast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "320k",
+            "-t", f"{duration:.2f}",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path
+        ]
 
     subprocess.run(cmd, check=True)
     out_size_mb = os.path.getsize(output_path) / (1024 * 1024)
@@ -83,7 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("--image", default=".tmp/shorts_visual_today.png", help="Infographic image path")
     parser.add_argument("--audio", default=".tmp/shorts_narration.mp3", help="Narration audio path")
     parser.add_argument("--output", default=r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4", help="Output video path")
+    parser.add_argument("--cover", default=".tmp/shorts_cover_today.png", help="Cover page image path")
     args = parser.parse_args()
 
-    render_financial_shorts(args.image, args.audio, args.output)
-
+    render_financial_shorts(args.image, args.audio, args.output, cover_path=args.cover)
