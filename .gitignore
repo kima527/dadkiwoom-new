@@ -4,6 +4,9 @@
 *.env*
 credentials.json
 token.json
+client_secrets*.json
+client_secret*.json
+token_*.json
 
 # Python cache & build
 __pycache__/
