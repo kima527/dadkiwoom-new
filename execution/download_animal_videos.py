@@ -54,10 +54,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="YouTube Animal Video Search & Batch Downloader")
     parser.add_argument("--dir", type=str, default=r"D:\download\animal", help="Download directory")
     parser.add_argument("--max", type=int, default=2, help="Max results per keyword")
+    parser.add_argument("--keywords", "-k", nargs="+", default=None, help="Keywords list to search and download")
     args = parser.parse_args()
 
-    # 손녀분이 좋아할 만한 귀여운 동물 키워드 리스트
-    target_animals = ["아기 판다 귀여운 영상", "수달 물장구", "아기 코끼리 재롱"]
+    if args.keywords:
+        # Check if single comma-separated string was passed
+        if len(args.keywords) == 1 and "," in args.keywords[0]:
+            target_animals = [k.strip() for k in args.keywords[0].split(",") if k.strip()]
+        else:
+            target_animals = args.keywords
+    else:
+        # Default cute animal keyword list
+        target_animals = ["아기 판다 귀여운 영상", "수달 물장구", "아기 코끼리 재롱"]
     
     download_animal_videos(keywords=target_animals, max_results=args.max, download_dir=args.dir)
+
 
