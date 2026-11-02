@@ -160,3 +160,4 @@ async def synthesize_all_audio(output_dir: str = ".tmp/audio", voice: str = "ko-
 
 if __name__ == "__main__":
     asyncio.run(synthesize_all_audio())
+

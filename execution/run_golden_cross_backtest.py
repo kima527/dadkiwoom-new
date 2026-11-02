@@ -125,3 +125,4 @@ def generate_golden_cross_backtest_data(output_json: str = ".tmp/backtest_golden
 
 if __name__ == "__main__":
     generate_golden_cross_backtest_data()
+

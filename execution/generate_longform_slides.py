@@ -200,7 +200,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
     )
 
     card_trap = patches.FancyBboxPatch(
-        (8, 14), 84, 56,
+        (6, 12), 88, 60,
         boxstyle="round,pad=1.2,rounding_size=2.0",
         fc='#1A1118', ec='#EF4444', lw=1.8, zorder=3
     )
@@ -212,15 +212,16 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
         ("3. 슬리피지와 수수료의 복리 침식", "잦은 손절(-2~3%)에 거래세와 증권사 수수료가 누적되면, 가랑비에 옷 젖듯 원금이 녹아내립니다.")
     ]
     for idx, (title_t, desc_t) in enumerate(traps):
-        y_pos = 56 - (idx * 16)
+        box_y = 51.5 - (idx * 18.5)
+        box_h = 15.5
         t_box = patches.FancyBboxPatch(
-            (12, y_pos - 4.5), 76, 12,
+            (10, box_y), 80, box_h,
             boxstyle="round,pad=0.8,rounding_size=1.5",
             fc='#24141E', ec='#7F1D1D', lw=1.2, zorder=4
         )
         ax.add_patch(t_box)
-        ax.text(15, y_pos + 2.0, f"[경고] {title_t}", color='#F87171', fontproperties=korean_font_bold, fontsize=18, zorder=5)
-        ax.text(15, y_pos - 2.5, desc_t, color='#CBD5E1', fontproperties=korean_font_prop, fontsize=14, zorder=5)
+        ax.text(14, box_y + box_h - 4.0, f"[경고] {title_t}", color='#F87171', fontproperties=korean_font_bold, fontsize=17, va='center', zorder=5)
+        ax.text(14, box_y + box_h - 7.5, desc_t, color='#CBD5E1', fontproperties=korean_font_prop, fontsize=13.5, va='top', linespacing=1.45, zorder=5)
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p3 = os.path.join(output_dir, "slide_03_trap.png")
@@ -291,7 +292,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
     )
 
     card_sol = patches.FancyBboxPatch(
-        (8, 14), 84, 56,
+        (6, 12), 88, 60,
         boxstyle="round,pad=1.2,rounding_size=2.0",
         fc='#062A1F', ec='#10B981', lw=2.0, zorder=3
     )
@@ -299,22 +300,23 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     filters = [
         ("필터 1: 거래량 150% 폭증 장대양봉 확인",
-         "20일 평균 거래량의 최소 1.5배 이상 터진 장대양봉으로 교차할 때만 진입합니다.\n거래량 없는 골든크로스는 90% 개미 꼬시기용 속임수입니다."),
+         "20일 평균 거래량의 최소 1.5배 이상 터진 장대양봉으로 교차할 때만 진입합니다.\n거래량이 실리지 않은 골든크로스는 90% 개미 유인용 속임수입니다."),
         ("필터 2: 주가가 60일 추세 이평선 위에 위치",
          "중기 생명선인 60일선이 우상향하고 주가가 그 위에 있을 때만 매수합니다.\n역배열 하락 추세에서의 골든크로스는 무조건 패스합니다."),
         ("필터 3: ATR 변동성 기반 기계적 손절(-3.5% Strict Stop)",
          "매수가 기준 ATR(평균진폭) 1.5배 이탈 시 즉시 기계적 손절을 집행하여 대형 하락을 원천 차단합니다.")
     ]
     for idx, (f_title, f_desc) in enumerate(filters):
-        y_pos = 56 - (idx * 16)
+        box_y = 51.5 - (idx * 18.5)
+        box_h = 15.5
         f_box = patches.FancyBboxPatch(
-            (12, y_pos - 4.5), 76, 12,
+            (10, box_y), 80, box_h,
             boxstyle="round,pad=0.8,rounding_size=1.5",
             fc='#0B3B2C', ec='#34D399', lw=1.2, zorder=4
         )
         ax.add_patch(f_box)
-        ax.text(15, y_pos + 2.0, f"[핵심] {f_title}", color='#6EE7B7', fontproperties=korean_font_bold, fontsize=18, zorder=5)
-        ax.text(15, y_pos - 2.5, f_desc, color='#E2E8F0', fontproperties=korean_font_prop, fontsize=13.5, zorder=5)
+        ax.text(14, box_y + box_h - 4.0, f"[핵심] {f_title}", color='#6EE7B7', fontproperties=korean_font_bold, fontsize=17, va='center', zorder=5)
+        ax.text(14, box_y + box_h - 7.5, f_desc, color='#E2E8F0', fontproperties=korean_font_prop, fontsize=13, va='top', linespacing=1.45, zorder=5)
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p5 = os.path.join(output_dir, "slide_05_solution.png")
