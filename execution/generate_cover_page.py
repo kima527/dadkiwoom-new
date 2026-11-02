@@ -144,8 +144,20 @@ def create_shorts_cover_page(
     )
     ax.add_patch(clash_bg)
 
-    # Card Title
-    ax.text(0.50, 0.536, "밤사이 엇갈린 극과 극 선행 시그널", color='#94A3B8',
+    # Card Title and Color/Wording based on market directions
+    sox_col = '#10B981' if sox_pct >= 0 else '#FF4D6D'
+    sox_label = "급등" if sox_pct >= 0 else "급락"
+    k2_col = '#10B981' if k2_pct >= 0 else '#FF4D6D'
+    k2_label = "반등" if k2_pct >= 0 else "급락"
+
+    if sox_pct * k2_pct < 0:
+        card_title = "밤사이 엇갈린 극과 극 선행 시그널"
+    elif sox_pct < 0 and k2_pct < 0:
+        card_title = "밤사이 동반 급락한 글로벌 선행 시그널"
+    else:
+        card_title = "밤사이 동반 급등한 글로벌 선행 시그널"
+
+    ax.text(0.50, 0.536, card_title, color='#94A3B8',
             fontproperties=korean_font_bold, fontsize=18, ha='center', va='center', zorder=4)
 
     # VS Center Circle Badge
@@ -160,15 +172,15 @@ def create_shorts_cover_page(
     # Left Column: Philadelphia Semiconductor Shock
     ax.text(0.28, 0.490, "필라델피아 반도체", color='#CBD5E1',
             fontproperties=korean_font_bold, fontsize=19, ha='center', va='center', zorder=4)
-    ax.text(0.28, 0.442, f"{sox_sign}{sox_pct:.1f}% 폭락", color='#FF4D6D',
+    ax.text(0.28, 0.442, f"{sox_sign}{sox_pct:.1f}% {sox_label}", color=sox_col,
             fontproperties=korean_font_bold, fontsize=31, ha='center', va='center', weight='bold', zorder=4)
     ax.text(0.28, 0.408, f"종가 {sox['price']:,.0f} pt", color='#94A3B8',
             fontproperties=korean_font_bold, fontsize=16, ha='center', va='center', zorder=4)
 
-    # Right Column: Night KOSPI Futures Rebound
+    # Right Column: Night KOSPI Futures
     ax.text(0.72, 0.490, "국내 야간 코스피선물", color='#CBD5E1',
             fontproperties=korean_font_bold, fontsize=19, ha='center', va='center', zorder=4)
-    ax.text(0.72, 0.442, f"{k2_sign}{k2_pct:.1f}% 반등", color='#10B981',
+    ax.text(0.72, 0.442, f"{k2_sign}{k2_pct:.1f}% {k2_label}", color=k2_col,
             fontproperties=korean_font_bold, fontsize=31, ha='center', va='center', weight='bold', zorder=4)
     ax.text(0.72, 0.408, f"종가 {k2['price']:,.2f} pt", color='#94A3B8',
             fontproperties=korean_font_bold, fontsize=16, ha='center', va='center', zorder=4)

@@ -34,7 +34,15 @@ def generate_sns_metadata(
     k2_pct = k2.get("change_pct", 2.13)
     sox_sign = "+" if sox_pct >= 0 else ""
     k2_sign = "+" if k2_pct >= 0 else ""
-    sox_dir = "급등" if sox_pct >= 0 else "폭락"
+    sox_dir = "급등" if sox_pct >= 0 else "급락"
+    k2_dir = "반등" if k2_pct >= 0 else "급락"
+
+    if sox_pct * k2_pct < 0:
+        signal_context = "엇갈린 글로벌 선행 지표"
+    elif sox_pct < 0 and k2_pct < 0:
+        signal_context = "동반 약세를 보인 글로벌 선행 지표"
+    else:
+        signal_context = "동반 강세를 보인 글로벌 선행 지표"
 
     date_str = datetime.now().strftime("%m월 %d일")
 
@@ -51,8 +59,8 @@ def generate_sns_metadata(
     yt_description = f"""[모닝 퀀트 데일리] {date_str} 국내 증시 개장 긴급 점검
 
 오늘 아침 9시 개장 전, 이것 모르면 시초가에 당합니다!
-미국 필라델피아 반도체 지수 {sox_sign}{sox_pct:.1f}% {sox_dir}과 국내 야간 코스피200 선물 {k2_sign}{k2_pct:.1f}% 반등!
-엇갈린 글로벌 선행 지표 속에서 삼성전자, SK하이닉스 계좌를 지키는 '개장 직후 15분 실전 대응 3원칙'을 공개합니다.
+미국 필라델피아 반도체 지수 {sox_sign}{sox_pct:.1f}% {sox_dir}과 국내 야간 코스피200 선물 {k2_sign}{k2_pct:.1f}% {k2_dir}!
+{signal_context} 속에서 삼성전자, SK하이닉스 계좌를 지키는 '개장 직후 15분 실전 대응 3원칙'을 공개합니다.
 
 📌 [오늘 증시 영향 핵심 헤드라인]
 {hl_text if hl_text else '• 미국 반도체 급락 및 기술주 차익 실현 매물 압박'}
@@ -76,8 +84,8 @@ def generate_sns_metadata(
     # 2. Instagram Reels Metadata
     ig_caption = f"""🚨 오늘 아침 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다!
 
-밤사이 필라델피아 반도체 {sox_sign}{sox_pct:.1f}% {sox_dir} vs 국내 야간 코스피 선물 {k2_sign}{k2_pct:.1f}% 반등!
-엇갈린 선행 신호 속에서 계좌를 지키는 실전 매매 3원칙을 1분 만에 짚어드립니다.
+밤사이 필라델피아 반도체 {sox_sign}{sox_pct:.1f}% {sox_dir} vs 국내 야간 코스피 선물 {k2_sign}{k2_pct:.1f}% {k2_dir}!
+{signal_context} 속에서 계좌를 지키는 실전 매매 3원칙을 1분 만에 짚어드립니다.
 
 {hl_text if hl_text else '• 미국 반도체 쇼크 vs 국내 야간 선물 지지력 테스트'}
 
