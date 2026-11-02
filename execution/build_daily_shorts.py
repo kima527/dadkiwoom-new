@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import argparse
 
 # Ensure UTF-8 output
 if sys.stdout.encoding != 'utf-8':
@@ -15,20 +16,26 @@ from generate_cover_page import create_shorts_cover_page
 from generate_financial_chart import create_shorts_infographic
 from generate_market_script import generate_script_and_audio
 from render_financial_shorts import render_financial_shorts
+from distribute_all_sns import distribute_shorts_to_sns
 
-def run_full_pipeline(output_video_path=r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4"):
+def run_full_pipeline(
+    output_video_path: str = r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4",
+    auto_upload: bool = False,
+    youtube_privacy: str = "unlisted",
+    dry_run_upload: bool = False
+):
     """
-    Executes the entire end-to-end Daily Financial YouTube Shorts Pipeline in one click.
-    Features:
+    Executes the entire end-to-end Daily Financial Shorts & Multi-SNS Distribution Pipeline in one click:
       1. US/Domestic Market Data & Headline News Fetch
       2. High-CTR Viral Hook Cover Page Generation (1080x1920)
       3. 9:16 Full HD Dark Mode Infographic Generation (1080x1920)
-      4. Tight 50~55s 4-Stage Script & Edge-TTS Neural Audio Synthesis
+      4. Tight 50s 4-Stage Script & Edge-TTS Neural Audio Synthesis
       5. FFmpeg 60FPS Video Rendering with Cinematic Cover Intro Transition
+      6. [Optional] Automated Multi-SNS Distribution (YouTube Shorts + Instagram Reels)
     """
     start_time = time.time()
     print("=" * 70)
-    print("🚀 [모닝 퀀트] 유튜브 쇼츠 100% 완전 자동 제작 파이프라인 가동")
+    print("🚀 [모닝 퀀트] 유튜브 쇼츠 100% 완전 자동 제작 & SNS 배포 파이프라인 가동")
     print("=" * 70 + "\n")
 
     # Step 1: Data & Anomaly
@@ -77,12 +84,35 @@ def run_full_pipeline(output_video_path=r"D:\DailyQuant\Daily_Quant_Shorts_Sampl
     )
     print()
 
+    # Step 6: Multi-SNS Auto Distribution (Optional)
+    if auto_upload:
+        print(">>> [6/6] 멀티 SNS 자동 배포 엔진 가동...")
+        distribute_shorts_to_sns(
+            video_path=output_video_path,
+            anomaly_json_path=json_path,
+            youtube_privacy=youtube_privacy,
+            dry_run=dry_run_upload
+        )
+        print()
+
     elapsed = time.time() - start_time
     print("=" * 70)
-    print(f"🎉 [제작 성공] 총 소요 시간: {elapsed:.1f}초 (약 {elapsed/60:.1f}분)")
+    print(f"🎉 [파이프라인 전체 완료] 총 소요 시간: {elapsed:.1f}초 (약 {elapsed/60:.1f}분)")
     print(f"📁 완성된 유튜브 쇼츠 파일: {output_video_path}")
     print("=" * 70)
     return True
 
 if __name__ == "__main__":
-    run_full_pipeline()
+    parser = argparse.ArgumentParser(description="Build and Distribute Daily Financial Shorts")
+    parser.add_argument("--output", default=r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4", help="Output video path")
+    parser.add_argument("--upload", action="store_true", help="Auto distribute to YouTube Shorts and Instagram Reels")
+    parser.add_argument("--privacy", default="unlisted", choices=["public", "unlisted", "private"], help="YouTube privacy")
+    parser.add_argument("--dry-run-upload", action="store_true", help="Simulate SNS upload without live transmission")
+    args = parser.parse_args()
+
+    run_full_pipeline(
+        output_video_path=args.output,
+        auto_upload=args.upload,
+        youtube_privacy=args.privacy,
+        dry_run_upload=args.dry_run_upload
+    )
