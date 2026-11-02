@@ -19,7 +19,7 @@ echo ======================================================================
 echo.
 
 cd /d "%~dp0"
-.venv\Scripts\python.exe execution\build_daily_shorts.py --upload --dry-run-upload
+.venv\Scripts\python.exe execution\build_daily_shorts.py --upload
 
 echo.
 echo ======================================================================
@@ -27,3 +27,4 @@ echo   🎉 완료되었습니다! D:\DailyQuant 폴더에서 영상을 확인�
 echo ======================================================================
 echo.
 pause
+
