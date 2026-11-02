@@ -102,8 +102,9 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
         ax.text(16, y_pos + 1.5, f"{icon}  {heading}", color='#FACC15', fontproperties=korean_font_bold, fontsize=19, zorder=5)
         ax.text(16, y_pos - 2.0, desc, color='#E2E8F0', fontproperties=korean_font_prop, fontsize=15, zorder=5)
 
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p1 = os.path.join(output_dir, "slide_01_hook.png")
-    fig.savefig(p1, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    fig.savefig(p1, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p1)
 
@@ -116,52 +117,76 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
         "단기 이동평균선이 중장기 이동평균선을 뚫고 올라갈 때가 최고의 매수 타점이다?"
     )
 
-    # Left: The Rule Explanation
+    # Left: The Rule Explanation (Expanded width & itemized pills to prevent text overflow)
     c_left = patches.FancyBboxPatch(
-        (8, 14), 40, 56,
+        (6, 13), 42, 58,
         boxstyle="round,pad=1.0,rounding_size=2.0",
         fc='#111827', ec='#38BDF8', lw=1.8, zorder=3
     )
     ax.add_patch(c_left)
-    ax.text(28, 62, "교과서 공식: 5일선 > 20일선", color='#38BDF8', fontproperties=korean_font_bold, fontsize=20, ha='center', zorder=4)
-    
-    rules = [
-        "1. 5일선: 최근 1주일간 매수한 투자자의 평균 단가",
-        "2. 20일선: 최근 1개월간 매수한 투자자의 평균 단가",
-        "3. 골든크로스: 단기 매수세가 중기 매수세를 압도하는 순간",
-        "4. 통념: '추세 상승의 시작이므로 무조건 분할 매수하라'"
-    ]
-    for idx, r in enumerate(rules):
-        ax.text(12, 52 - idx * 9, r, color='#CBD5E1', fontproperties=korean_font_prop, fontsize=14, zorder=4)
+    ax.text(27, 64, "교과서 공식: 5일선 > 20일선", color='#38BDF8', fontproperties=korean_font_bold, fontsize=20, ha='center', zorder=4)
 
-    # Right: Diagram of Idealized Golden Cross
+    items = [
+        ("5일선", "최근 1주일간 매수한 투자자의 평균 단가"),
+        ("20일선", "최근 1개월간 매수한 투자자의 평균 단가"),
+        ("골든크로스", "단기 매수세가 중기 매수세를 상향 돌파"),
+        ("교과서 통념", "'추세 상승의 시작이므로 무조건 분할 매수'")
+    ]
+    for idx, (tag, desc) in enumerate(items):
+        y_pos = 54 - idx * 10
+        p_box = patches.FancyBboxPatch(
+            (8.5, y_pos - 1.2), 9.5, 5.0,
+            boxstyle="round,pad=0.4,rounding_size=1.0",
+            fc='#1E293B', ec='#64748B', lw=1.0, zorder=4
+        )
+        ax.add_patch(p_box)
+        ax.text(13.25, y_pos + 1.3, tag, color='#FACC15', fontproperties=korean_font_bold, fontsize=12, ha='center', va='center', zorder=5)
+        ax.text(19.5, y_pos + 1.3, desc, color='#E2E8F0', fontproperties=korean_font_prop, fontsize=12.5, va='center', zorder=5)
+
+    # Right: Diagram of Idealized Golden Cross (Accurate mathematical intersection)
     c_right = patches.FancyBboxPatch(
-        (52, 14), 40, 56,
+        (52, 13), 42, 58,
         boxstyle="round,pad=1.0,rounding_size=2.0",
         fc='#111827', ec='#64748B', lw=1.2, zorder=3
     )
     ax.add_patch(c_right)
-    ax.text(72, 62, "우리가 꿈꾸는 이상적 상승 차트", color='#FACC15', fontproperties=korean_font_bold, fontsize=19, ha='center', zorder=4)
+    ax.text(73, 64, "우리가 꿈꾸는 이상적 상승 차트", color='#FACC15', fontproperties=korean_font_bold, fontsize=19, ha='center', zorder=4)
 
-    # Illustrate 2 crossing curves
-    xs = np.linspace(55, 89, 50)
-    ma20 = 25 + 0.35 * (xs - 55) # steady gradual rise
-    ma5 = 18 + 0.03 * (xs - 55)**2 # sharp curving up
-    ax.plot(xs, ma20, color='#F59E0B', lw=3.5, label='20일선 (중기)', zorder=4)
-    ax.plot(xs, ma5, color='#EF4444', lw=4.0, label='5일선 (단기)', zorder=4)
-    
-    # Mark crossing point
-    cross_x = 68.5
-    cross_y = 25 + 0.35 * (cross_x - 55)
-    ax.scatter([cross_x], [cross_y], color='#FACC15', s=250, zorder=5, edgecolors='#FFFFFF', lw=2)
-    ax.annotate("골든크로스 발생!\n(매수 신호)", xy=(cross_x, cross_y), xytext=(cross_x - 12, cross_y + 12),
-                arrowprops=dict(facecolor='#FACC15', shrink=0.08, width=2, headwidth=8),
-                color='#FACC15', fontproperties=korean_font_bold, fontsize=14, zorder=6)
+    # Mathematical curves
+    xs = np.linspace(55, 88, 100)
+    ma20 = 32.0 + 0.30 * (xs - 55.0)
+    # Intersects exactly at xs=72.0 where ma20=37.1
+    ma5 = 37.1 + 0.85 * (xs - 72.0) + 0.022 * (xs - 72.0)**2
 
-    ax.text(72, 20, "\"하지만 현실의 코스피는 책과 달랐습니다.\"", color='#F87171', fontproperties=korean_font_bold, fontsize=16, ha='center', zorder=5)
+    ax.plot(xs, ma20, color='#F59E0B', lw=3.8, zorder=4)
+    ax.plot(xs, ma5, color='#EF4444', lw=4.2, zorder=4)
 
+    # Line Labels
+    ax.text(89, ma20[-1], "20일선", color='#F59E0B', fontproperties=korean_font_bold, fontsize=13, va='center', zorder=5)
+    ax.text(89, ma5[-1], "5일선", color='#EF4444', fontproperties=korean_font_bold, fontsize=13, va='center', zorder=5)
+
+    # Exact Crossing point at (72.0, 37.1)
+    cross_x = 72.0
+    cross_y = 37.1
+    ax.scatter([cross_x], [cross_y], color='#FACC15', s=350, zorder=6, edgecolors='#FFFFFF', lw=2.5)
+
+    # Clean annotation arrow pointing directly at intersection
+    ax.annotate(
+        "골든크로스 발생!\n(교과서 매수 신호)",
+        xy=(cross_x, cross_y + 1.5),
+        xytext=(cross_x, cross_y + 13.5),
+        arrowprops=dict(facecolor='#FACC15', edgecolor='#FACC15', shrink=0.1, width=2.5, headwidth=9),
+        color='#FACC15', fontproperties=korean_font_bold, fontsize=14,
+        ha='center', va='bottom', zorder=7
+    )
+
+    # Bottom caveat text with ample vertical cushion below curves
+    ax.text(73, 19, "\"하지만 현실의 코스피는 책과 달랐습니다.\"",
+            color='#F87171', fontproperties=korean_font_bold, fontsize=15.5, ha='center', zorder=5)
+
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p2 = os.path.join(output_dir, "slide_02_myth.png")
-    fig.savefig(p2, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    fig.savefig(p2, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p2)
 
@@ -197,8 +222,9 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
         ax.text(15, y_pos + 2.0, f"[경고] {title_t}", color='#F87171', fontproperties=korean_font_bold, fontsize=18, zorder=5)
         ax.text(15, y_pos - 2.5, desc_t, color='#CBD5E1', fontproperties=korean_font_prop, fontsize=14, zorder=5)
 
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p3 = os.path.join(output_dir, "slide_03_trap.png")
-    fig.savefig(p3, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    fig.savefig(p3, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p3)
 
@@ -249,8 +275,9 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     ax.text(70, 19, "결론: 5일선-20일선만 보고 사면 무조건 계좌가 녹는다!", color='#F87171', fontproperties=korean_font_bold, fontsize=15, ha='center', zorder=4)
 
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p4 = os.path.join(output_dir, "slide_04_data.png")
-    fig.savefig(p4, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    fig.savefig(p4, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p4)
 
@@ -289,8 +316,9 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
         ax.text(15, y_pos + 2.0, f"[핵심] {f_title}", color='#6EE7B7', fontproperties=korean_font_bold, fontsize=18, zorder=5)
         ax.text(15, y_pos - 2.5, f_desc, color='#E2E8F0', fontproperties=korean_font_prop, fontsize=13.5, zorder=5)
 
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p5 = os.path.join(output_dir, "slide_05_solution.png")
-    fig.savefig(p5, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    fig.savefig(p5, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p5)
 
@@ -340,8 +368,9 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     ax.text(70, 19, "필터 1개만 넣어도 승률이 38%에서 64%로 치솟는다!", color='#34D399', fontproperties=korean_font_bold, fontsize=15, ha='center', zorder=4)
 
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p6 = os.path.join(output_dir, "slide_06_turnaround.png")
-    fig.savefig(p6, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    fig.savefig(p6, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p6)
 
@@ -380,8 +409,9 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
     ax.text(12, 28, "[2편 예고] \"외인·기관 동시 순매수, 다음 날 따라 사면 왜 털릴까?\"", color='#38BDF8', fontproperties=korean_font_bold, fontsize=18, zorder=4)
     ax.text(12, 20, "뉴스에서 말하는 양매수의 함정과 10만 건 수급 빅데이터 전수조사 결과를 공개합니다. [구독 & 알림 설정] 필수!", color='#CBD5E1', fontproperties=korean_font_prop, fontsize=14, zorder=4)
 
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p7 = os.path.join(output_dir, "slide_07_checklist_outro.png")
-    fig.savefig(p7, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    fig.savefig(p7, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p7)
 
