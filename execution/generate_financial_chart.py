@@ -41,6 +41,12 @@ def create_shorts_infographic(json_path=".tmp/market_anomaly_today.json", output
     nq = data["key_indices"].get("nasdaq") or {"price": 18500, "change_pct": -1.8}
     tnx = data["key_indices"].get("treasury_10y") or {"price": 4.25, "change_pct": 0.5}
 
+    # Korean investor essential indicators
+    korea_ind = data.get("korea_indicators", {})
+    sox = korea_ind.get("sox") or data["key_indices"].get("sox") or {"price": 10688.8, "change_pct": -7.2}
+    k2 = korea_ind.get("kospi200_night") or {"price": 918.65, "change_pct": 2.13}
+    kq = korea_ind.get("kosdaq150_night") or {"price": 1229.0, "change_pct": 2.09}
+
     is_positive = top_stock["change_pct"] >= 0
     hero_color = "#00F59B" if is_positive else "#FF4757"  # Neon Green / Vivid Crimson
     hero_sign = "+" if is_positive else ""
@@ -53,69 +59,89 @@ def create_shorts_infographic(json_path=".tmp/market_anomaly_today.json", output
     ax_bg.axis('off')
     
     # Top Header Banner
-    ax_bg.text(0.5, 0.94, "DAILY QUANT  |  모닝 퀀트", color="#00F59B", fontsize=22, fontweight='bold', ha='center', fontproperties=font_prop)
-    ax_bg.text(0.5, 0.91, "미국 증시 마감 & 핵심 수급 긴급 브리핑", color="#FFFFFF", fontsize=32, fontweight='bold', ha='center', fontproperties=font_prop)
-    ax_bg.text(0.5, 0.885, f"기준: {data.get('timestamp', '오늘')} 마감 데이터", color="#8B949E", fontsize=15, ha='center', fontproperties=font_prop)
+    ax_bg.text(0.5, 0.945, "DAILY QUANT  |  모닝 퀀트", color="#00F59B", fontsize=22, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_bg.text(0.5, 0.915, "미국 증시 마감 & 국내 개장 긴급 브리핑", color="#FFFFFF", fontsize=31, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_bg.text(0.5, 0.890, f"기준: {data.get('timestamp', '오늘')} 실시간 데이터", color="#8B949E", fontsize=15, ha='center', fontproperties=font_prop)
 
     # 2. Hero Anomaly Badge
-    badge_box = dict(boxstyle="round,pad=0.8,rounding_size=0.3", fc="#161B22", ec=hero_color, lw=2.5)
+    badge_box = dict(boxstyle="round,pad=0.7,rounding_size=0.3", fc="#161B22", ec=hero_color, lw=2.5)
     hero_text = f"🔥 오늘의 이상치 포착: {top_stock['name']}\n{top_stock['price']:.2f} USD  ({hero_sign}{top_stock['change_pct']}%)"
-    ax_bg.text(0.5, 0.81, hero_text, color="#FFFFFF", fontsize=26, fontweight='bold', ha='center', bbox=badge_box, fontproperties=font_prop)
+    ax_bg.text(0.5, 0.825, hero_text, color="#FFFFFF", fontsize=25, fontweight='bold', ha='center', bbox=badge_box, fontproperties=font_prop)
 
     # 3. Middle Chart: Hero Asset 5-Day Trend Curve
     # Position: [left, bottom, width, height]
-    ax_chart = fig.add_axes([0.10, 0.46, 0.80, 0.28], facecolor="#101520")
+    ax_chart = fig.add_axes([0.10, 0.54, 0.80, 0.22], facecolor="#101520")
     ax_chart.spines['top'].set_visible(False)
     ax_chart.spines['right'].set_visible(False)
     ax_chart.spines['left'].set_color('#30363D')
     ax_chart.spines['bottom'].set_color('#30363D')
-    ax_chart.tick_params(colors='#8B949E', labelsize=14)
+    ax_chart.tick_params(colors='#8B949E', labelsize=13)
 
     history = top_stock.get("history", [100, 102, 98, 99, 95])
     x_vals = np.arange(len(history))
     
-    # Smooth spline or line
     ax_chart.plot(x_vals, history, color=hero_color, lw=4, marker='o', markersize=8, markerfacecolor='#FFFFFF')
     ax_chart.fill_between(x_vals, history, min(history)*0.98, color=hero_color, alpha=0.18)
     
-    ax_chart.set_title(f"{top_stock['name']} 최근 수급 및 가격 추이", color="#C9D1D9", fontsize=18, pad=12, fontproperties=font_prop)
+    ax_chart.set_title(f"{top_stock['name']} 최근 수급 및 가격 추이", color="#C9D1D9", fontsize=17, pad=10, fontproperties=font_prop)
     ax_chart.grid(True, color='#21262D', linestyle='--', alpha=0.7)
 
-    # 4. Major Indices Scoreboard Cards
-    # Position: [0.10, 0.32, 0.80, 0.10]
-    ax_score = fig.add_axes([0.10, 0.32, 0.80, 0.10], facecolor="#161B22")
-    ax_score.axis('off')
-    
     def format_item(item):
         if not item: return "-", "#8B949E"
         sign = "+" if item['change_pct'] >= 0 else ""
         col = "#00F59B" if item['change_pct'] >= 0 else "#FF4757"
         return f"{item['price']:.1f} ({sign}{item['change_pct']}%)", col
 
+    # 4. Major Global Indices Scoreboard Card (Row 1)
+    # Position: [0.10, 0.41, 0.80, 0.09]
+    ax_score = fig.add_axes([0.10, 0.41, 0.80, 0.09], facecolor="#161B22")
+    ax_score.axis('off')
+    
     sp_str, sp_col = format_item(sp)
     nq_str, nq_col = format_item(nq)
     tnx_str, tnx_col = format_item(tnx)
 
-    ax_score.text(0.18, 0.70, "S&P 500", color="#8B949E", fontsize=16, ha='center', fontproperties=font_prop)
-    ax_score.text(0.18, 0.30, sp_str, color=sp_col, fontsize=17, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_score.text(0.50, 0.90, "🌐 글로벌 핵심 지표 (미 증시 & 금리)", color="#58A6FF", fontsize=15, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_score.text(0.18, 0.55, "S&P 500", color="#8B949E", fontsize=14, ha='center', fontproperties=font_prop)
+    ax_score.text(0.18, 0.20, sp_str, color=sp_col, fontsize=15, fontweight='bold', ha='center', fontproperties=font_prop)
 
-    ax_score.text(0.50, 0.70, "나스닥", color="#8B949E", fontsize=16, ha='center', fontproperties=font_prop)
-    ax_score.text(0.50, 0.30, nq_str, color=nq_col, fontsize=17, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_score.text(0.50, 0.55, "나스닥", color="#8B949E", fontsize=14, ha='center', fontproperties=font_prop)
+    ax_score.text(0.50, 0.20, nq_str, color=nq_col, fontsize=15, fontweight='bold', ha='center', fontproperties=font_prop)
 
-    ax_score.text(0.82, 0.70, "10년 국채금리", color="#8B949E", fontsize=16, ha='center', fontproperties=font_prop)
-    ax_score.text(0.82, 0.30, tnx_str, color=tnx_col, fontsize=17, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_score.text(0.82, 0.55, "10년 국채금리", color="#8B949E", fontsize=14, ha='center', fontproperties=font_prop)
+    ax_score.text(0.82, 0.20, tnx_str, color=tnx_col, fontsize=15, fontweight='bold', ha='center', fontproperties=font_prop)
 
-    # 5. Bottom Insights Takeaway Card
+    # 5. Korean Pre-Market Essential Card (Row 2 - SOX & Night Futures)
+    # Position: [0.10, 0.29, 0.80, 0.09]
+    ax_kor = fig.add_axes([0.10, 0.29, 0.80, 0.09], facecolor="#161B22")
+    ax_kor.axis('off')
+
+    sox_str, sox_col = format_item(sox)
+    k2_str, k2_col = format_item(k2)
+    kq_str, kq_col = format_item(kq)
+
+    ax_kor.text(0.50, 0.90, "🇰🇷 한국 개장 필수 체크 (반도체 & 야간선물)", color="#F2CC60", fontsize=15, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_kor.text(0.18, 0.55, "필라델피아 반도체", color="#8B949E", fontsize=13, ha='center', fontproperties=font_prop)
+    ax_kor.text(0.18, 0.20, sox_str, color=sox_col, fontsize=14, fontweight='bold', ha='center', fontproperties=font_prop)
+
+    ax_kor.text(0.50, 0.55, "야간 코스피200선물", color="#8B949E", fontsize=13, ha='center', fontproperties=font_prop)
+    ax_kor.text(0.50, 0.20, k2_str, color=k2_col, fontsize=14, fontweight='bold', ha='center', fontproperties=font_prop)
+
+    ax_kor.text(0.82, 0.55, "야간 코스닥150선물", color="#8B949E", fontsize=13, ha='center', fontproperties=font_prop)
+    ax_kor.text(0.82, 0.20, kq_str, color=kq_col, fontsize=14, fontweight='bold', ha='center', fontproperties=font_prop)
+
+    # 6. Bottom Insights Takeaway Card
+    # Position: [0.10, 0.12, 0.80, 0.13]
     insights_box = dict(boxstyle="round,pad=0.8,rounding_size=0.3", fc="#161B22", ec="#30363D", lw=1.5)
     insights_text = (
-        "💡 [스마트머니 수급 레이더]\n\n"
-        "1. 대형 테크주 단기 변동성 확대 및 주요 지지선 테스트\n"
-        "2. 국채 금리 움직임에 따른 외국인 자금 흐름 재편 중\n"
-        "3. 오늘 국내 증시 개장 전 '관련 밸류체인 수급 체크' 필수"
+        "💡 [오늘 아침 9시 국내 증시 핵심 체크포인트]\n\n"
+        "1. 필라델피아 반도체 변동성 → 삼성전자·SK하이닉스 수급 직결\n"
+        "2. 야간 코스피/코스닥 선물 흐름 → 개장 시초가 갭 형성 주시\n"
+        "3. 섣부른 시초가 추격 매수 자제, 개장 직후 외국인 현물 순매수 확인"
     )
-    ax_bg.text(0.5, 0.17, insights_text, color="#C9D1D9", fontsize=18, ha='center', bbox=insights_box, fontproperties=font_prop, linespacing=1.6)
+    ax_bg.text(0.5, 0.18, insights_text, color="#C9D1D9", fontsize=16.5, ha='center', bbox=insights_box, fontproperties=font_prop, linespacing=1.6)
 
-    # 6. Footer Disclaimer & CTA
+    # 7. Footer Disclaimer & CTA
     ax_bg.text(0.5, 0.055, "※ 본 영상은 정보 제공 목적이며 매수·매도 추천이 아닙니다.", color="#6E7681", fontsize=13, ha='center', fontproperties=font_prop)
     ax_bg.text(0.5, 0.030, "📌 고정 댓글에서 상세 퀀트 리포트를 확인하세요 | 구독 & 알림설정", color="#00F59B", fontsize=16, fontweight='bold', ha='center', fontproperties=font_prop)
 

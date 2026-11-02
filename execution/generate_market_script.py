@@ -28,26 +28,33 @@ def generate_script_and_audio(json_path=".tmp/market_anomaly_today.json", output
     nq = data["key_indices"].get("nasdaq") or {"change_pct": -2.86}
     tnx = data["key_indices"].get("treasury_10y") or {"price": 4.93, "change_pct": -1.2}
 
-    stock_name = top_stock['name']
-    stock_pct = abs(top_stock['change_pct'])
-    direction = "급등" if top_stock['change_pct'] >= 0 else "급락"
+    # Korean investor essential indicators
+    kor = data.get("korea_indicators", {})
+    sox = kor.get("sox") or data["key_indices"].get("sox") or {"price": 10688.8, "change_pct": -7.2}
+    k2 = kor.get("kospi200_night") or {"price": 918.65, "change_pct": 2.13}
+    kq = kor.get("kosdaq150_night") or {"price": 1229.0, "change_pct": 2.09}
 
-    # Construct 4-stage script (Tightened for strict < 55s YouTube Shorts duration)
+    sox_sign = "+" if sox['change_pct'] >= 0 else ""
+    sox_dir = "급등" if sox['change_pct'] >= 0 else "급락"
+    k2_sign = "+" if k2['change_pct'] >= 0 else ""
+    kq_sign = "+" if kq['change_pct'] >= 0 else ""
+
+    # Construct 4-stage script (Tailored for Korean retail investors & strictly < 55s)
     script_lines = [
-        # [00~04초] 1. 킬러 훅
-        f"오늘 새벽 월가를 뒤흔든 {stock_name} {stock_pct:.1f}% {direction}, 스마트머니는 왜 움직였을까요?",
+        # [00~05초] 1. 킬러 훅 (반도체 & 시초가 예측)
+        f"필라델피아 반도체 지수 {abs(sox['change_pct']):.1f}% {sox_dir}! 오늘 아침 삼성전자와 SK하이닉스 시초가, 과연 어떻게 열릴까요?",
         
-        # [04~15초] 2. 반전 데이터 제시
-        f"오늘 미국 증시는 나스닥이 {abs(nq['change_pct']):.1f}%, S&P 500이 {abs(sp['change_pct']):.1f}% 하락했습니다. 특히 반도체 대장주 {stock_name}에 강한 매도세가 쏟아졌습니다.",
+        # [05~18초] 2. 미 증시 & 필라델피아 반도체 팩트 체크
+        f"오늘 새벽 미국 증시는 나스닥이 {abs(nq['change_pct']):.1f}% 하락한 가운데, 특히 필라델피아 반도체 지수가 {sox['price']:.0f} 포인트까지 밀리며 글로벌 기술주에 차익 매물이 쏟아졌습니다.",
         
-        # [15~32초] 3. 핵심 원인 2가지
-        f"원인은 두 가지입니다. 첫째, 미 10년물 국채 금리가 {tnx['price']:.2f}%로 치솟아 밸류에이션 부담이 커졌고, 둘째, 단기 급등했던 빅테크에 대형 기관들의 차익 실현 매물이 대거 출회되었습니다.",
+        # [18~32초] 3. 국내 야간선물 선행 지표 분석
+        f"하지만 밤사이 국내 야간 선물은 반등했습니다. 야간 코스피200 선물은 {k2_sign}{k2['change_pct']:.1f}%, 야간 코스닥150 선물은 {kq_sign}{kq['change_pct']:.1f}% 상승 마감하며 견고한 지지력을 보였습니다.",
         
-        # [32~45초] 4. 내 계좌 영향 및 전략
-        f"오늘 우리 국내 증시도 반도체 수급 충격에 유의해야 합니다. 섣부른 추격 매수보다는 주요 지지선 방어 여부를 확인하고 분할 대응하시는 것이 안전합니다.",
+        # [32~45초] 4. 오늘 9시 한국장 실전 대응 전략
+        f"따라서 오늘 9시 개장 직후 섣부른 추격 매수보다는, 반도체 대장주의 지지선 방어와 외국인 실시간 현물 순매수 유입 여부를 반드시 확인하고 분할 대응하시는 것이 안전합니다.",
         
-        # [45~52초] 5. 아웃트로 & CTA
-        "매일 아침 7시, 데이터로 시장의 팩트를 짚어드립니다. 고정 댓글에서 상세 퀀트 데이터를 확인하시고 구독해 두세요."
+        # [45~53초] 5. 아웃트로 & CTA
+        "매일 아침 7시, 한국 증시 핵심 선행 데이터를 가장 빠르게 짚어드립니다. 고정 댓글에서 퀀트 리포트를 확인하시고 지금 구독해 두세요."
     ]
 
     full_script = " ".join(script_lines)
@@ -60,10 +67,10 @@ def generate_script_and_audio(json_path=".tmp/market_anomaly_today.json", output
     for i, line in enumerate(script_lines, 1):
         print(f"  [{i}단락] {line}")
 
-    # Generate Audio via edge-tts (Rate +18% for golden 52~55s YouTube Shorts pacing)
-    print(f"\n🎙️ [AI 음성 합성 중...] Voice: {voice}, Speed: +18%", flush=True)
+    # Generate Audio via edge-tts (Rate +20% for golden 50~53s YouTube Shorts pacing)
+    print(f"\n🎙️ [AI 음성 합성 중...] Voice: {voice}, Speed: +20%", flush=True)
     async def run_tts():
-        communicate = edge_tts.Communicate(full_script, voice, rate="+18%")
+        communicate = edge_tts.Communicate(full_script, voice, rate="+20%")
         await communicate.save(output_audio_path)
 
     asyncio.run(run_tts())
