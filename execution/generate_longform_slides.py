@@ -269,10 +269,13 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
     p_pts = curve.get("pure_golden_cross", [])
     if p_pts:
         xs = np.linspace(52, 88, len(p_pts))
-        y_pts = 22 + (np.array(p_pts) - 50) / 60 * 35
-        ax.plot(xs, y_pts, color='#EF4444', lw=3.0, zorder=4)
-        ax.fill_between(xs, 22, y_pts, color='#EF4444', alpha=0.15, zorder=3)
-        ax.text(88, y_pts[-1] - 4, f"{pure.get('total_return_pct', -24.5)}%", color='#EF4444', fontproperties=korean_font_bold, fontsize=16, ha='right', zorder=5)
+        arr_p = np.array(p_pts)
+        y_pts = 24.0 + (arr_p - 50.0) / 60.0 * 32.0
+        y_pts = np.clip(y_pts, 22.0, 56.0)
+        ax.plot(xs, y_pts, color='#EF4444', lw=3.2, zorder=4)
+        ax.fill_between(xs, 22.0, y_pts, color='#EF4444', alpha=0.15, zorder=3)
+        ax.scatter([xs[-1]], [y_pts[-1]], color='#EF4444', s=80, zorder=6)
+        ax.text(88, y_pts[-1] - 3.5, f"{pure.get('total_return_pct', -24.5)}%", color='#EF4444', fontproperties=korean_font_bold, fontsize=17, ha='right', va='top', zorder=5)
 
     ax.text(70, 19, "결론: 5일선-20일선만 보고 사면 무조건 계좌가 녹는다!", color='#F87171', fontproperties=korean_font_bold, fontsize=15, ha='center', zorder=4)
 
@@ -363,10 +366,13 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
     f_pts = curve.get("quant_filtered", [])
     if f_pts:
         xs = np.linspace(52, 88, len(f_pts))
-        y_pts = 24 + (np.array(f_pts) - 100) / 320 * 36
+        arr_f = np.array(f_pts)
+        y_pts = 25.0 + (arr_f - 100.0) / 318.4 * 30.0
+        y_pts = np.clip(y_pts, 24.0, 56.0)
         ax.plot(xs, y_pts, color='#10B981', lw=3.8, zorder=4)
-        ax.fill_between(xs, 24, y_pts, color='#10B981', alpha=0.18, zorder=3)
-        ax.text(88, y_pts[-1] + 3, f"+{flt.get('total_return_pct', 318.4)}%", color='#10B981', fontproperties=korean_font_bold, fontsize=18, ha='right', zorder=5)
+        ax.fill_between(xs, 25.0, y_pts, color='#10B981', alpha=0.18, zorder=3)
+        ax.scatter([xs[-1]], [y_pts[-1]], color='#34D399', s=90, zorder=6)
+        ax.text(88, y_pts[-1] + 2.5, f"+{flt.get('total_return_pct', 318.4)}%", color='#10B981', fontproperties=korean_font_bold, fontsize=18, ha='right', va='bottom', zorder=5)
 
     ax.text(70, 19, "필터 1개만 넣어도 승률이 38%에서 64%로 치솟는다!", color='#34D399', fontproperties=korean_font_bold, fontsize=15, ha='center', zorder=4)
 

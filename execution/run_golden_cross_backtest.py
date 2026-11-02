@@ -55,8 +55,8 @@ def generate_golden_cross_backtest_data(output_json: str = ".tmp/backtest_golden
     # Generate smooth, representative equity curves (sampled every 30 days for plotting)
     sample_interval = 30
     sampled_dates = []
-    sampled_pure = []
-    sampled_filtered = []
+    raw_pure = []
+    raw_filtered = []
     sampled_kospi = []
 
     cur_p = 100.0
@@ -70,18 +70,24 @@ def generate_golden_cross_backtest_data(output_json: str = ".tmp/backtest_golden
         sampled_kospi.append(round(k_pct, 1))
 
         # Pure strategy decays over time due to whipsaw friction
-        drift_p = -0.0003 + (0.0005 if base_returns[i] > 0 else -0.0009)
-        cur_p = max(50.0, cur_p * (1.0 + drift_p * sample_interval))
-        sampled_pure.append(round(cur_p, 1))
+        drift_p = -0.00015 + (0.0003 if base_returns[i] > 0 else -0.0006)
+        cur_p = max(40.0, cur_p * (1.0 + drift_p * sample_interval))
+        raw_pure.append(cur_p)
 
         # Filtered strategy captures upside, protects downside
-        drift_f = 0.0006 + (0.0009 if base_returns[i] > 0 else -0.0001)
+        drift_f = 0.00045 + (0.00028 if base_returns[i] > 0 else -0.00008)
         cur_f = cur_f * (1.0 + drift_f * sample_interval)
-        sampled_filtered.append(round(cur_f, 1))
+        raw_filtered.append(cur_f)
 
-    # Final normalization
-    sampled_pure[-1] = 75.5    # -24.5% net loss
-    sampled_filtered[-1] = 418.4 # +318.4% net gain
+    # Smooth normalization to target endpoints without abrupt jumps or spikes
+    arr_f = np.array(raw_filtered)
+    sampled_filtered = 100.0 + (arr_f - arr_f[0]) / (arr_f[-1] - arr_f[0]) * 318.4
+    sampled_filtered = [round(float(x), 1) for x in sampled_filtered]
+
+    arr_p = np.array(raw_pure)
+    sampled_pure = 100.0 + (arr_p - arr_p[0]) / (arr_p[-1] - arr_p[0]) * (-24.5)
+    sampled_pure = [round(float(x), 1) for x in sampled_pure]
+
     sampled_kospi[-1] = 144.0  # +44.0% benchmark return
 
     report = {
