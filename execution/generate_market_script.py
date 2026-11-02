@@ -12,10 +12,15 @@ if sys.stdout.encoding != 'utf-8':
     except Exception:
         pass
 
-def generate_script_and_audio(json_path=".tmp/market_anomaly_today.json", output_script_path=".tmp/shorts_script.txt", output_audio_path=".tmp/shorts_narration.mp3", voice="ko-KR-InJoonNeural"):
+def generate_script_and_audio(
+    json_path=".tmp/market_anomaly_today.json",
+    output_script_path=".tmp/shorts_script.txt",
+    output_audio_path=".tmp/shorts_narration.mp3",
+    voice="ko-KR-InJoonNeural"
+):
     """
-    Generates a 50~55s YouTube Shorts script adhering strictly to the 4-stage formula,
-    and synthesizes natural neural speech with edge-tts.
+    Generates a tight 48~52s YouTube Shorts script adhering strictly to the 4-stage formula,
+    delivering the concrete '15-minute response rule', and synthesizes natural neural speech with edge-tts.
     """
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"JSON data not found: {json_path}")
@@ -35,26 +40,26 @@ def generate_script_and_audio(json_path=".tmp/market_anomaly_today.json", output
     kq = kor.get("kosdaq150_night") or {"price": 1229.0, "change_pct": 2.09}
 
     sox_sign = "+" if sox['change_pct'] >= 0 else ""
-    sox_dir = "급등" if sox['change_pct'] >= 0 else "급락"
+    sox_dir = "급등" if sox['change_pct'] >= 0 else "폭락"
     k2_sign = "+" if k2['change_pct'] >= 0 else ""
     kq_sign = "+" if kq['change_pct'] >= 0 else ""
 
-    # Construct 4-stage script (Tailored for Korean retail investors & strictly < 55s)
+    # Construct 4-stage script (Tight, high-retention, strictly 48~52s)
     script_lines = [
-        # [00~05초] 1. 킬러 훅 (반도체 & 시초가 예측)
-        f"필라델피아 반도체 지수 {abs(sox['change_pct']):.1f}% {sox_dir}! 오늘 아침 삼성전자와 SK하이닉스 시초가, 과연 어떻게 열릴까요?",
+        # [00~05초] 1. 킬러 훅 (반도체 충격 & 시초가 질문)
+        f"필라델피아 반도체 지수 {abs(sox['change_pct']):.1f}% {sox_dir}! 오늘 아침 삼성전자와 SK하이닉스 시초가, 어떻게 대응해야 할까요?",
         
-        # [05~18초] 2. 미 증시 헤드라인 & 필라델피아 반도체 팩트 체크
-        f"오늘 새벽 뉴욕 증시는 반도체 쇼크와 기술주 매물 확대로 나스닥이 {abs(nq['change_pct']):.1f}% 급락했습니다. 특히 필라델피아 반도체 지수가 {sox['price']:.0f} 포인트까지 밀리며 글로벌 기술주에 비상이 걸렸습니다.",
+        # [05~16초] 2. 미 증시 헤드라인 & 필라델피아 반도체 팩트
+        f"오늘 새벽 뉴욕 증시는 반도체 쇼크로 나스닥이 {abs(nq['change_pct']):.1f}% 급락했고, 필라델피아 반도체 지수도 {sox['price']:.0f} 포인트까지 밀렸습니다.",
         
-        # [18~32초] 3. 국내 야간선물 선행 지표 분석
-        f"하지만 밤사이 국내 야간 선물은 반등했습니다. 야간 코스피200 선물은 {k2_sign}{k2['change_pct']:.1f}%, 야간 코스닥150 선물은 {kq_sign}{kq['change_pct']:.1f}% 상승 마감하며 견고한 지지력을 보였습니다.",
+        # [16~28초] 3. 국내 야간선물 선행 지표 반등 확인
+        f"하지만 밤사이 국내 야간 선물은 반등했습니다. 야간 코스피200은 {k2_sign}{k2['change_pct']:.1f}%, 코스닥150 선물도 {kq_sign}{kq['change_pct']:.1f}% 상승 마감했습니다.",
         
-        # [32~44초] 4. 오늘 9시 한국장 실전 대응 전략
-        f"따라서 오늘 9시 개장 직후 섣부른 추격 매수보다는, 반도체 지지선 방어와 외국인 실시간 순매수 유입을 확인하고 분할 대응하시는 것이 안전합니다.",
+        # [28~42초] 4. 오늘 9시 한국장 실전 대응 '15분 원칙'
+        f"따라서 오늘 9시 개장 직후 15분간은 섣부른 추격 매수를 멈추고 관망하세요. 9시 15분까지 외인 실시간 순매수와 당일 시가 지지 여부를 확인한 뒤 분할 진입해야 계좌를 지킵니다.",
         
-        # [44~52초] 5. 아웃트로 & CTA
-        "매일 아침 7시, 증시 핵심 선행 데이터를 가장 빠르게 짚어드립니다. 고정 댓글 확인하시고 지금 구독해 두세요."
+        # [42~50초] 5. 아웃트로 & CTA
+        "매일 아침 7시, 핵심 선행 데이터를 전해드립니다. 고정 댓글 확인하시고 지금 구독해 두세요."
     ]
 
     full_script = " ".join(script_lines)
@@ -67,10 +72,10 @@ def generate_script_and_audio(json_path=".tmp/market_anomaly_today.json", output
     for i, line in enumerate(script_lines, 1):
         print(f"  [{i}단락] {line}")
 
-    # Generate Audio via edge-tts (Rate +20% for golden 50~53s YouTube Shorts pacing)
-    print(f"\n🎙️ [AI 음성 합성 중...] Voice: {voice}, Speed: +20%", flush=True)
+    # Generate Audio via edge-tts (Rate +22% for golden 48~51s YouTube Shorts pacing)
+    print(f"\n🎙️ [AI 음성 합성 중...] Voice: {voice}, Speed: +22%", flush=True)
     async def run_tts():
-        communicate = edge_tts.Communicate(full_script, voice, rate="+20%")
+        communicate = edge_tts.Communicate(full_script, voice, rate="+22%")
         await communicate.save(output_audio_path)
 
     asyncio.run(run_tts())

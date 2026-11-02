@@ -201,19 +201,19 @@ def create_shorts_infographic(json_path=".tmp/market_anomaly_today.json", output
     ax_check.add_patch(box_check)
 
     # Card Title (Centered)
-    ax_check.text(0.50, 0.87, "◆ [오늘 아침 9시 국내 증시 핵심 체크포인트]", color="#58A6FF", fontsize=18, fontweight='bold', ha='center', fontproperties=font_prop)
+    ax_check.text(0.50, 0.87, "◆ [오늘 9시 개장 직후 15분 실전 대응 3원칙]", color="#58A6FF", fontsize=18, fontweight='bold', ha='center', fontproperties=font_prop)
 
     # Divider line
     ax_check.plot([0.04, 0.96], [0.77, 0.77], color="#30363D", lw=1.5)
 
     # Strictly LEFT-ALIGNED 1, 2, 3 Checkpoints at x = 0.05
-    line1 = "1. 필라델피아 반도체 변동성  →  삼성전자·SK하이닉스 수급 직결"
-    line2 = "2. 야간 코스피/코스닥 선물 흐름  →  개장 시초가 갭 형성 주시"
-    line3 = "3. 섣부른 시초가 추격 매수 자제, 개장 직후 외국인 현물 순매수 확인"
+    line1 = "1. [09:00~09:15 관망] 시초가 갭 덫 주의, 섣부른 추격 매수 절대 금지"
+    line2 = "2. [외인 실시간 수급] 9시 15분까지 선물·현물 동시 순매수 확인"
+    line3 = "3. [당일 시가 지지선] 15분 뒤 시가(Open) 안착 시 분할 매수 대응"
 
-    ax_check.text(0.05, 0.58, line1, color="#F0F6FC", fontsize=16.5, fontweight='bold', ha='left', va='center', fontproperties=font_prop)
-    ax_check.text(0.05, 0.38, line2, color="#F0F6FC", fontsize=16.5, fontweight='bold', ha='left', va='center', fontproperties=font_prop)
-    ax_check.text(0.05, 0.18, line3, color="#00F59B", fontsize=16.5, fontweight='bold', ha='left', va='center', fontproperties=font_prop)
+    ax_check.text(0.05, 0.58, line1, color="#FF7B72", fontsize=16, fontweight='bold', ha='left', va='center', fontproperties=font_prop)
+    ax_check.text(0.05, 0.38, line2, color="#58A6FF", fontsize=16, fontweight='bold', ha='left', va='center', fontproperties=font_prop)
+    ax_check.text(0.05, 0.18, line3, color="#00F59B", fontsize=16, fontweight='bold', ha='left', va='center', fontproperties=font_prop)
 
     # 7. Footer Disclaimer & CTA
     ax_bg.text(0.5, 0.055, "※ 본 영상은 정보 제공 목적이며 매수·매도 추천이 아닙니다.", color="#6E7681", fontsize=13, ha='center', fontproperties=font_prop)
