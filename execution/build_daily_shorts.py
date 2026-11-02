@@ -79,8 +79,8 @@ def run_full_pipeline(
         audio_path=audio_path,
         output_path=output_video_path,
         cover_path=cover_path,
-        cover_duration=2.5,
-        fade_duration=0.4
+        cover_duration=4.0,
+        fade_duration=0.5
     )
     print()
 

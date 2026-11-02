@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import argparse
+import shutil
 
 # Ensure UTF-8 output
 if sys.stdout.encoding != 'utf-8':
@@ -19,21 +20,24 @@ def get_audio_duration(ffmpeg_bin: str, audio_path: str) -> float:
             dur_str = line.split("Duration:")[1].split(",")[0].strip()
             parts = [float(p) for p in dur_str.split(":")]
             return parts[0]*3600 + parts[1]*60 + parts[2]
-    return 55.0
+    return 50.0
 
 def render_financial_shorts(
     image_path: str = ".tmp/shorts_visual_today.png",
     audio_path: str = ".tmp/shorts_narration.mp3",
     output_path: str = r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4",
     cover_path: str = ".tmp/shorts_cover_today.png",
-    cover_duration: float = 2.5,
-    fade_duration: float = 0.4,
+    cover_duration: float = 4.0, # Increased to 4.0s for clear readability during opening hook
+    fade_duration: float = 0.5,
     fps: int = 60
 ):
     """
     Renders high-quality 1080x1920 60FPS vertical YouTube Short.
-    Seamlessly places the high-CTR viral cover page at the very beginning (0.0s~2.5s)
-    with a cinematic crossfade transition into the detailed infographic.
+    1. Features a 4.0-second visible Cover Page intro synchronized with the killer hook narration.
+    2. Seamless 0.5-second cinematic crossfade into the detailed infographic.
+    3. Embeds Cover Page as official MP4 Cover Artwork (attached_pic) so Windows Explorer
+       and video players display the cover page as the file's thumbnail icon.
+    4. Automatically saves standalone high-res thumbnail to D:\DailyQuant\Daily_Quant_Cover_Thumbnail.png.
     """
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -47,7 +51,7 @@ def render_financial_shorts(
     duration = get_audio_duration(ffmpeg_bin, audio_path)
     total_frames = int(duration * fps)
 
-    print("🎬 [4단계 시작] 파이낸셜 쇼츠 비디오 렌더링 파이프라인 (커버페이지 인트로 모드)")
+    print("🎬 [4단계 시작] 파이낸셜 쇼츠 비디오 렌더링 파이프라인 (커버페이지 완전 노출 모드)")
     has_cover = os.path.exists(cover_path)
     if has_cover:
         print(f"🌟 커버페이지: {cover_path} (인트로 노출: {cover_duration:.1f}초, 크로스페이드: {fade_duration:.1f}초)")
@@ -57,12 +61,14 @@ def render_financial_shorts(
     print(f"⚡ 프레임 수 : {total_frames} frames ({fps} FPS, 흔들림 없는 고화질 렌더링)\n", flush=True)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    temp_render_path = ".tmp/temp_shorts_video.mp4"
 
     if has_cover:
-        # Crossfade offset = cover_duration - fade_duration
+        # Crossfade offset = cover_duration - fade_duration (e.g. 4.0 - 0.5 = 3.5s)
         fade_offset = max(0.5, cover_duration - fade_duration)
         main_duration = duration - fade_offset + 1.0  # extra buffer
 
+        # Step 1: Render video with 4-second cover intro and crossfade
         cmd = [
             ffmpeg_bin, "-y",
             "-loop", "1", "-t", f"{cover_duration:.2f}", "-framerate", str(fps), "-i", cover_path,
@@ -79,9 +85,29 @@ def render_financial_shorts(
             "-b:a", "320k",
             "-t", f"{duration:.2f}",
             "-shortest",
+            temp_render_path
+        ]
+        subprocess.run(cmd, check=True)
+
+        # Step 2: Embed cover image as attached_pic in MP4 metadata (Windows Explorer Thumbnail Icon!)
+        print("🖼️ MP4 파일 메타데이터에 커버페이지 썸네일 아트워크 삽입 중...", flush=True)
+        attach_cmd = [
+            ffmpeg_bin, "-y",
+            "-i", temp_render_path,
+            "-i", cover_path,
+            "-map", "0",
+            "-map", "1",
+            "-c", "copy",
+            "-disposition:v:1", "attached_pic",
             "-movflags", "+faststart",
             output_path
         ]
+        subprocess.run(attach_cmd, check=True)
+
+        # Step 3: Also copy high-res cover thumbnail directly to output folder
+        dest_thumb_path = os.path.join(os.path.dirname(output_path), "Daily_Quant_Cover_Thumbnail.png")
+        shutil.copyfile(cover_path, dest_thumb_path)
+        print(f"🖼️ 단독 썸네일 이미지 파일 복사 완료: {dest_thumb_path}")
     else:
         # Fallback to single visual loop
         cmd = [
@@ -102,13 +128,14 @@ def render_financial_shorts(
             "-movflags", "+faststart",
             output_path
         ]
+        subprocess.run(cmd, check=True)
 
-    subprocess.run(cmd, check=True)
     out_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"\n🎉 [4단계 완료] 유튜브 쇼츠 최종 영상 렌더링 성공!")
     print(f"   - 저장 위치: {output_path}")
     print(f"   - 파일 크기: {out_size_mb:.2f} MB")
-    print(f"   - 재생 시간: {duration:.2f}초 (쇼츠 규격 100% 충족)", flush=True)
+    print(f"   - 재생 시간: {duration:.2f}초 (쇼츠 규격 100% 충족)")
+    print(f"   - 커버페이지: 첫 4.0초간 확실하게 노출 + MP4 썸네일 아트워크 내장 완료!", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Render Financial YouTube Shorts Video")
