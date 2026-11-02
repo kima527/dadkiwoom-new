@@ -68,6 +68,14 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
     slides = []
 
     # =========================================================================
+    # SLIDE 0: COVER / OPENING INTRO (16:9 Full HD)
+    # =========================================================================
+    from generate_longform_thumbnail import generate_longform_thumbnail
+    p0 = os.path.join(output_dir, "slide_00_cover.png")
+    generate_longform_thumbnail(json_path=json_path, output_path=p0)
+    slides.append(p0)
+
+    # =========================================================================
     # SLIDE 1: INTRO HOOK
     # =========================================================================
     fig, ax = create_base_slide(

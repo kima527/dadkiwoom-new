@@ -72,6 +72,11 @@ def render_longform_video(
             return False
 
         part_files.append(os.path.abspath(part_out))
+        if idx == 0:
+            import shutil
+            cover_video_out = r"D:\DailyQuant\LongForm_Ep1_Cover_Video.mp4"
+            shutil.copyfile(part_out, cover_video_out)
+            print(f"🌟 [단독 커버영상(Cover Video) 추출 완료] -> {cover_video_out}")
 
     # Step 2: Concatenate all parts
     print("\n🔗 [전체 파트 병합 중] FFmpeg Concat Demuxer 가동...")

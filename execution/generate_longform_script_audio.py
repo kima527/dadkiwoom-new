@@ -14,6 +14,16 @@ if sys.stdout.encoding != 'utf-8':
 
 SCRIPTS = [
     {
+        "slide_index": 0,
+        "slide_id": "slide_00_cover",
+        "title": "오프닝 커버: 퀀트 검증소 1부 팩트체크",
+        "text": (
+            "오늘의 퀀트 팩트체크 제1편! "
+            "골든크로스 10년 맹신, 과연 내 계좌를 불려주었을까요? "
+            "10년간의 코스피 전수조사 백테스트, 지금 그 진실을 공개합니다!"
+        )
+    },
+    {
         "slide_index": 1,
         "slide_id": "slide_01_hook",
         "title": "도입부 훅: 골든크로스의 배신",
@@ -129,7 +139,7 @@ async def synthesize_all_audio(output_dir: str = ".tmp/audio", voice: str = "ko-
         text = item["text"]
         out_mp3 = os.path.join(output_dir, f"slide_{idx:02d}.mp3")
         
-        print(f"🎙️ [{idx}/7] 음성 합성 중... ({item['title']})")
+        print(f"🎙️ [{idx}/{len(SCRIPTS)-1}] 음성 합성 중... ({item['title']})")
         # Rate +10%, Pitch 0Hz for crisp, professional delivery
         communicate = edge_tts.Communicate(text, voice, rate="+10%")
         await communicate.save(out_mp3)

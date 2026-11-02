@@ -59,15 +59,20 @@ def generate_longform_thumbnail(
 
     # Plot miniature decorative equity curve in right background
     if p_curve and f_curve:
-        xs = np.linspace(48, 96, len(p_curve))
-        # Normalize to height 20 to 65
-        p_norm = 25 + (np.array(p_curve) - 50) / 70 * 20
-        f_norm = 28 + (np.array(f_curve) - 100) / 320 * 45
+        xs = np.linspace(50, 94, len(p_curve))
+        # Keep curves safely inside canvas (height 20 to 65)
+        p_arr = np.array(p_curve)
+        f_arr = np.array(f_curve)
+        p_norm = 22.0 + (p_arr - 50.0) / 60.0 * 24.0
+        f_norm = 24.0 + (f_arr - 100.0) / 318.4 * 42.0
+        p_norm = np.clip(p_norm, 18.0, 50.0)
+        f_norm = np.clip(f_norm, 20.0, 66.0)
         
         # Area fill under filtered curve
-        ax.fill_between(xs, 15, f_norm, color='#10B981', alpha=0.12, zorder=2)
+        ax.fill_between(xs, 14.0, f_norm, color='#10B981', alpha=0.15, zorder=2)
         ax.plot(xs, f_norm, color='#10B981', lw=4.5, alpha=0.9, zorder=3)
-        ax.plot(xs, p_norm, color='#EF4444', lw=3.0, alpha=0.75, linestyle='--', zorder=3)
+        ax.plot(xs, p_norm, color='#EF4444', lw=3.0, alpha=0.8, linestyle='--', zorder=3)
+        ax.scatter([xs[-1]], [f_norm[-1]], color='#34D399', s=80, zorder=4)
 
     # Top Category Pill Badge
     badge_box = patches.FancyBboxPatch(
