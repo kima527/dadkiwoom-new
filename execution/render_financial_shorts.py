@@ -25,11 +25,12 @@ def get_audio_duration(ffmpeg_bin: str, audio_path: str) -> float:
 def render_financial_shorts(
     image_path: str = ".tmp/shorts_visual_today.png",
     audio_path: str = ".tmp/shorts_narration.mp3",
-    output_path: str = r"D:\download\Daily_Quant_Shorts_Sample.mp4",
+    output_path: str = r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4",
     fps: int = 60
 ):
     """
-    Renders high-quality 1080x1920 60FPS vertical YouTube Short with cinematic zoompan.
+    Renders high-quality 1080x1920 60FPS vertical YouTube Short.
+    Rock-solid stability with zero vibration/jitter for crystal-clear readability.
     """
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -43,30 +44,25 @@ def render_financial_shorts(
     duration = get_audio_duration(ffmpeg_bin, audio_path)
     total_frames = int(duration * fps)
 
-    print("🎬 [4단계 시작] 파이낸셜 쇼츠 비디오 렌더링 파이프라인")
+    print("🎬 [4단계 시작] 파이낸셜 쇼츠 비디오 렌더링 파이프라인 (안정화 모드)")
     print(f"🖼️ 인포그래픽: {image_path}")
     print(f"🎙️ 내레이션 : {audio_path} (길이: {duration:.2f}초)")
     print(f"💾 출력 파일 : {output_path}")
-    print(f"⚡ 프레임 수 : {total_frames} frames ({fps} FPS)\n", flush=True)
+    print(f"⚡ 프레임 수 : {total_frames} frames ({fps} FPS, 상하 흔들림 완전 제거)\n", flush=True)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    # Subtle cinematic zoom: zooms from 1.00 to 1.05 over the video duration
-    # zoompan filter in ffmpeg
-    vf_filter = (
-        f"zoompan=z='min(zoom+0.00008,1.05)':d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps={fps},"
-        f"format=yuv420p"
-    )
 
     cmd = [
         ffmpeg_bin, "-y",
         "-loop", "1",
+        "-framerate", str(fps),
         "-i", image_path,
         "-i", audio_path,
-        "-vf", vf_filter,
         "-c:v", "libx264",
+        "-tune", "stillimage",
         "-preset", "veryfast",
         "-crf", "18",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "320k",
         "-t", f"{duration:.2f}",
@@ -86,7 +82,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Render Financial YouTube Shorts Video")
     parser.add_argument("--image", default=".tmp/shorts_visual_today.png", help="Infographic image path")
     parser.add_argument("--audio", default=".tmp/shorts_narration.mp3", help="Narration audio path")
-    parser.add_argument("--output", default=r"D:\download\Daily_Quant_Shorts_Sample.mp4", help="Output video path")
+    parser.add_argument("--output", default=r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4", help="Output video path")
     args = parser.parse_args()
 
     render_financial_shorts(args.image, args.audio, args.output)

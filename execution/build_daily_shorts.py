@@ -15,7 +15,7 @@ from generate_market_script import generate_script_and_audio
 from render_financial_shorts import render_financial_shorts
 import json
 
-def run_full_pipeline(output_video_path=r"D:\download\Daily_Quant_Shorts_Sample.mp4"):
+def run_full_pipeline(output_video_path=r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4"):
     """
     Executes the entire end-to-end Daily Financial YouTube Shorts Pipeline in one click.
     """

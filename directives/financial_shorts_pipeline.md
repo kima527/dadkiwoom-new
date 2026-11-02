@@ -21,7 +21,7 @@ Execute a 100% automated, repeatable, high-CPM YouTube Shorts video production p
 5. `execution/build_daily_shorts.py`: Master one-click end-to-end runner.
 
 ### Storage & Outputs
-- Deliverable Video: `D:\download\Daily_Quant_Shorts_Sample.mp4`
+- Deliverable Video: `D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4`
 - Intermediate Cache: `.tmp/` (auto-regenerated on each run)
   - `.tmp/market_anomaly_today.json`
   - `.tmp/shorts_visual_today.png`
