@@ -32,3 +32,4 @@ echo   D:\DailyQuant\PreMarket_Urgent_Shorts.mp4
 echo ======================================================================
 echo.
 pause
+
