@@ -14,6 +14,7 @@ if sys.stdout.encoding != 'utf-8':
 from fetch_premarket_anomaly import fetch_premarket_anomaly_data
 from generate_premarket_chart import create_premarket_visual
 from storyteller_premarket import generate_premarket_script_and_audio
+from send_telegram_shorts import send_shorts_to_telegram
 
 def run_premarket_shorts_pipeline(
     output_video_path: str = r"D:\DailyQuant\PreMarket_Urgent_Shorts.mp4",
@@ -89,6 +90,20 @@ def run_premarket_shorts_pipeline(
 
     elapsed = time.time() - start_time
     file_size_mb = os.path.getsize(output_video_path) / (1024 * 1024)
+
+    # Step 5: Instant Mobile Telegram Delivery (Method B)
+    print(">>> [5/5] 📲 스마트폰 텔레그램으로 영상 및 복사용 쇼츠 텍스트 즉시 발송 중...")
+    try:
+        nxt_item = data.get("nxt_premarket_leader", {})
+        stk_nm = nxt_item.get("name", "SK하이닉스")
+        tg_title = f"개장 10분 전! 08:50 프리마켓 {stk_nm} 수급 폭발 & 시초가 갭 속보 #Shorts"
+        send_shorts_to_telegram(
+            video_path=output_video_path,
+            title=tg_title,
+            tags=["#Shorts", "#주식", "#국내증시", "#프리마켓", "#시초가", f"#{stk_nm}"]
+        )
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 예외: {e}")
 
     print("\n" + "=" * 70)
     print("🎉 [08:50 긴급 숏츠 제작 완료]")

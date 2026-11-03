@@ -17,6 +17,7 @@ from generate_financial_chart import create_shorts_infographic
 from generate_market_script import generate_script_and_audio
 from render_financial_shorts import render_financial_shorts
 from distribute_all_sns import distribute_shorts_to_sns
+from send_telegram_shorts import send_shorts_to_telegram
 
 def run_full_pipeline(
     output_video_path: str = r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4",
@@ -82,6 +83,22 @@ def run_full_pipeline(
         cover_duration=4.0,
         fade_duration=0.5
     )
+    print()
+
+    # Step 6: Instant Mobile Telegram Delivery (Method B)
+    print(">>> [6/6] 📲 스마트폰 텔레그램으로 영상 및 추천 제목/태그 즉시 발송 중...")
+    try:
+        top_stock = report.get("top_anomaly", {})
+        top_name = top_stock.get("name", "미 증시").split(" ")[0]
+        sox_val = report.get("key_indices", {}).get("sox", {}).get("change_pct", -3.4)
+        m_title = f"유가 7% 폭락했는데 나스닥은 왜 무너졌을까? 오늘 장전 필수 1분 브리핑 #Shorts"
+        send_shorts_to_telegram(
+            video_path=output_video_path,
+            title=m_title,
+            tags=["#Shorts", "#주식", "#나스닥", "#유가폭락", "#반도체", f"#{top_name}"]
+        )
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 예외: {e}")
     print()
 
     # Step 6: Multi-SNS Auto Distribution (Optional)
