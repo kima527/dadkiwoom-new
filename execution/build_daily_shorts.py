@@ -85,32 +85,40 @@ def run_full_pipeline(
     )
     print()
 
-    # Step 6: Instant Mobile Telegram Delivery (Method B)
-    print(">>> [6/6] 📲 스마트폰 텔레그램으로 영상 및 추천 제목/태그 즉시 발송 중...")
-    try:
-        top_stock = report.get("top_anomaly", {})
-        top_name = top_stock.get("name", "미 증시").split(" ")[0]
-        sox_val = report.get("key_indices", {}).get("sox", {}).get("change_pct", -3.4)
-        m_title = f"유가 7% 폭락했는데 나스닥은 왜 무너졌을까? 오늘 장전 필수 1분 브리핑 #Shorts"
-        send_shorts_to_telegram(
-            video_path=output_video_path,
-            title=m_title,
-            tags=["#Shorts", "#주식", "#나스닥", "#유가폭락", "#반도체", f"#{top_name}"]
-        )
-    except Exception as e:
-        print(f"⚠️ 텔레그램 전송 예외: {e}")
-    print()
-
-    # Step 6: Multi-SNS Auto Distribution (Optional)
+    yt_url = None
+    # Step 5: Multi-SNS Auto Distribution
     if auto_upload:
-        print(">>> [6/6] 멀티 SNS 자동 배포 엔진 가동...")
-        distribute_shorts_to_sns(
+        print(">>> [5/6] 🚀 유튜브 쇼츠 무인 자동 배포 엔진 가동...")
+        dist_res = distribute_shorts_to_sns(
             video_path=output_video_path,
             anomaly_json_path=json_path,
             youtube_privacy=youtube_privacy,
             dry_run=dry_run_upload
         )
+        if dist_res and isinstance(dist_res, dict):
+            yt_url = dist_res.get("youtube")
         print()
+
+    # Step 6: Instant Mobile Telegram Notification (with live YouTube link)
+    print(">>> [6/6] 📲 스마트폰 텔레그램으로 완료 알림 및 원본 백업 발송 중...")
+    try:
+        top_stock = report.get("top_anomaly", {})
+        top_name = top_stock.get("name", "기술주").split(" ")[0]
+        m_title = "오늘 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다! #Shorts"
+        if os.path.exists(".tmp/sns_metadata_today.json"):
+            with open(".tmp/sns_metadata_today.json", "r", encoding="utf-8") as f:
+                s_data = json.load(f)
+                m_title = s_data.get("youtube", {}).get("title", m_title)
+
+        send_shorts_to_telegram(
+            video_path=output_video_path,
+            title=m_title,
+            tags=["#Shorts", "#주식", "#국내증시", "#모닝퀀트", f"#{top_name}"],
+            youtube_url=yt_url
+        )
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 예외: {e}")
+    print()
 
     elapsed = time.time() - start_time
     print("=" * 70)

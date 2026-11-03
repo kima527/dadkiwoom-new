@@ -24,13 +24,13 @@ def get_telegram_creds():
 
 def send_shorts_to_telegram(
     video_path: str,
-    title: str = "개장 10분 전! 08:50 프리마켓 & 시초가 갭 속보 #Shorts",
+    title: str = "오늘 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다! #Shorts",
     tags: list = None,
-    summary_text: str = ""
+    youtube_url: str = None
 ):
     """
     Sends the rendered YouTube Shorts MP4 directly to the user's Telegram.
-    Includes ready-to-copy YouTube title, tags, and summary for 1-click mobile upload.
+    Includes the live YouTube link if uploaded, or ready-to-copy text for manual review.
     """
     token, chat_id = get_telegram_creds()
     if not token or not chat_id:
@@ -42,19 +42,31 @@ def send_shorts_to_telegram(
         return False
 
     if tags is None:
-        tags = ["#Shorts", "#주식", "#국내증시", "#프리마켓", "#시초가", "#SK하이닉스"]
+        tags = ["#Shorts", "#주식", "#국내증시", "#모닝퀀트"]
 
     tag_str = " ".join(tags)
 
-    # Clean caption for mobile screen
-    caption = (
-        f"🚨 <b>[유튜브 쇼츠 업로드용 1초 전송]</b>\n\n"
-        f"📌 <b>추천 제목 (복사해서 붙여넣기):</b>\n"
-        f"<code>{title}</code>\n\n"
-        f"🏷️ <b>추천 태그:</b>\n"
-        f"<code>{tag_str}</code>\n\n"
-        f"💡 <i>영상 우측 상단 [공유] ➡️ [YouTube] 누르면 1초 만에 쇼츠 업로드 완료!</i>"
-    )
+    # Dynamic caption depending on whether auto-uploaded to YouTube
+    if youtube_url and "youtube.com" in youtube_url:
+        caption = (
+            f"🎉 <b>[유튜브 쇼츠 100% 자동 업로드 완료!]</b>\n\n"
+            f"📺 <b>유튜브에서 바로 보기:</b>\n"
+            f"👉 {youtube_url}\n\n"
+            f"📌 <b>게시된 제목:</b>\n"
+            f"<code>{title}</code>\n\n"
+            f"🏷️ <b>태그:</b>\n"
+            f"<code>{tag_str}</code>\n\n"
+            f"✅ <i>컴퓨터가 유튜브에 자동 게시를 마쳤습니다. (첨부 영상은 모니터링/보관용 원본 파일입니다)</i>"
+        )
+    else:
+        caption = (
+            f"🚨 <b>[유튜브 쇼츠 자동 제작 완료]</b>\n\n"
+            f"📌 <b>영상 제목:</b>\n"
+            f"<code>{title}</code>\n\n"
+            f"🏷️ <b>태그:</b>\n"
+            f"<code>{tag_str}</code>\n\n"
+            f"💡 <i>(첨부 영상을 확인해 보세요)</i>"
+        )
 
     url = f"https://api.telegram.org/bot{token}/sendVideo"
     print(f"📲 [텔레그램 전송 시작] 영상 파일: {video_path} ({os.path.getsize(video_path) / (1024*1024):.2f} MB)...")

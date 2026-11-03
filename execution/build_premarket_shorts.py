@@ -93,23 +93,14 @@ def run_premarket_shorts_pipeline(
     elapsed = time.time() - start_time
     file_size_mb = os.path.getsize(output_video_path) / (1024 * 1024)
 
-    # Step 5: Instant Mobile Telegram Delivery (Method B)
-    print(">>> [5/6] 📲 스마트폰 텔레그램으로 영상 및 복사용 쇼츠 텍스트 즉시 발송 중...")
     nxt_item = data.get("nxt_premarket_leader", {})
     stk_nm = nxt_item.get("name", "SK하이닉스")
     tg_title = f"개장 10분 전! 08:50 프리마켓 {stk_nm} 수급 폭발 & 시초가 갭 속보 #Shorts"
-    try:
-        send_shorts_to_telegram(
-            video_path=output_video_path,
-            title=tg_title,
-            tags=["#Shorts", "#주식", "#국내증시", "#프리마켓", "#시초가", f"#{stk_nm}"]
-        )
-    except Exception as e:
-        print(f"⚠️ 텔레그램 전송 예외: {e}")
+    yt_url = None
 
-    # Step 6: 100% Unattended YouTube Shorts Auto Upload
+    # Step 5: 100% Unattended YouTube Shorts Auto Upload
     if auto_upload:
-        print(">>> [6/6] 🚀 유튜브 쇼츠 무인 자동 업로드 진행 중...")
+        print(">>> [5/6] 🚀 유튜브 쇼츠 무인 자동 업로드 진행 중...")
         try:
             from upload_youtube_shorts import upload_youtube_shorts
             meta_dict = {
@@ -125,9 +116,21 @@ def run_premarket_shorts_pipeline(
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta_dict, f, ensure_ascii=False, indent=2)
 
-            upload_youtube_shorts(video_path=output_video_path, meta_path=meta_path, privacy_status=privacy_status)
+            yt_url = upload_youtube_shorts(video_path=output_video_path, meta_path=meta_path, privacy_status=privacy_status)
         except Exception as e:
             print(f"⚠️ 유튜브 자동 업로드 예외: {e}")
+
+    # Step 6: Instant Mobile Telegram Notification (with live YouTube link)
+    print(">>> [6/6] 📲 스마트폰 텔레그램으로 완료 알림 및 원본 영상 발송 중...")
+    try:
+        send_shorts_to_telegram(
+            video_path=output_video_path,
+            title=tg_title,
+            tags=["#Shorts", "#주식", "#국내증시", "#프리마켓", "#시초가", f"#{stk_nm}"],
+            youtube_url=yt_url
+        )
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 예외: {e}")
 
     print("\n" + "=" * 70)
     print("🎉 [08:50 긴급 숏츠 제작 및 배포 완료]")
