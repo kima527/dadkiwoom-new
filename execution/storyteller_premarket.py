@@ -36,18 +36,29 @@ class PreMarketStoryteller:
         nxt_driver = nxt.get("driver", "차세대 HBM 독점 공급 소식")
 
         gaps = self.data.get("opening_expected_gaps", [])
-        gap1 = gaps[0] if len(gaps) > 0 else {"name": "한미반도체", "expected_change_pct": 6.4}
-        gap2 = gaps[1] if len(gaps) > 1 else {"name": "삼성전자", "expected_change_pct": 2.1}
+        gap1 = gaps[0] if len(gaps) > 0 else {"name": "한진칼우", "expected_change_pct": 30.0}
+        gap2 = gaps[1] if len(gaps) > 1 else {"name": "AP위성", "expected_change_pct": 29.9}
+
+        nxt_abs = abs(nxt_pct)
+        if nxt_pct >= 0:
+            nxt_ment = f"{nxt_name}가 거래대금 {nxt_amount}을 터뜨리며 플러스 {nxt_abs:.1f}% 상승 마감했습니다."
+        else:
+            nxt_ment = f"{nxt_name}에 거래대금 {nxt_amount}이 몰렸지만, 마이너스 {nxt_abs:.1f}% 조정을 받으며 마감했습니다."
+
+        g1_sign = "플러스" if gap1.get("expected_change_pct", 0) >= 0 else "마이너스"
+        g1_pct = abs(gap1.get("expected_change_pct", 0))
+        g2_sign = "플러스" if gap2.get("expected_change_pct", 0) >= 0 else "마이너스"
+        g2_pct = abs(gap2.get("expected_change_pct", 0))
 
         lines = [
             # [1단계: 개장 카운트다운 훅]
             "개장 10분 전 긴급 속보! 방금 8시 50분에 마감된 넥스트레이드 프리마켓에서 돈이 가장 많이 몰린 종목 1위는?",
 
-            # [2단계: NXT 프리마켓 1위 팩트]
-            f"{nxt_name}가 거래대금 {nxt_amount}을 터뜨리며 플러스 {nxt_pct:.1f}% 갭상승 마감했습니다.",
+            # [2단계: NXT 프리마켓 1위 팩트 (상승/하락 동적 반영)]
+            nxt_ment,
 
             # [3단계: 9시 시초가 갭상승 & 테마 촉매]
-            f"원인은 장전 터진 {nxt_driver} 때문인데요. 9시 정규장 동시호가에서도 {gap1['name']}가 플러스 {gap1['expected_change_pct']:.1f}%, {gap2['name']}가 플러스 {gap2['expected_change_pct']:.1f}% 갭을 띄우고 있습니다.",
+            f"원인은 {nxt_driver} 때문인데요. 9시 정규장 동시호가에서도 {gap1['name']}가 {g1_sign} {g1_pct:.1f}%, {gap2['name']}가 {g2_sign} {g2_pct:.1f}% 갭을 띄우고 있습니다.",
 
             # [4단계: 시초가 갭메우기 낚시 주의 & 15분 행동 강령]
             "하지만 9시 땡 치자마자 추격 매수하면 9시 5분 갭메우기 하락에 그대로 물릴 수 있습니다. 9시 15분까지 시가 지지선과 외국인 수급을 반드시 확인하고 분할 진입하세요!",
