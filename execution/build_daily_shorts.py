@@ -29,7 +29,7 @@ def run_full_pipeline(
       1. US/Domestic Market Data & Headline News Fetch
       2. High-CTR Viral Hook Cover Page Generation (1080x1920)
       3. 9:16 Full HD Dark Mode Infographic Generation (1080x1920)
-      4. Tight 50s 4-Stage Script & Edge-TTS Neural Audio Synthesis
+      4. Storytelling Specialist 6-Stage Narrative Script & Edge-TTS Neural Audio Synthesis
       5. FFmpeg 60FPS Video Rendering with Cinematic Cover Intro Transition
       6. [Optional] Automated Multi-SNS Distribution (YouTube Shorts + Instagram Reels)
     """
@@ -65,8 +65,8 @@ def run_full_pipeline(
     create_shorts_infographic(json_path, image_path)
     print()
 
-    # Step 4: Script & Audio
-    print(">>> [4/5] 4단계 황금 구조 대본 및 신경망 AI 내레이션 음성 합성 중...")
+    # Step 4: Storytelling Expert Script & Audio
+    print(">>> [4/5] 🎭 수석 스토리텔링 전문가 가동: 6단계 황금 서사 대본 및 AI 신경망 음성 합성 중...")
     script_path = ".tmp/shorts_script.txt"
     audio_path = ".tmp/shorts_narration.mp3"
     generate_script_and_audio(json_path, script_path, audio_path)

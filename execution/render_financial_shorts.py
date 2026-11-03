@@ -37,7 +37,7 @@ def render_financial_shorts(
     2. Seamless 0.5-second cinematic crossfade into the detailed infographic.
     3. Embeds Cover Page as official MP4 Cover Artwork (attached_pic) so Windows Explorer
        and video players display the cover page as the file's thumbnail icon.
-    4. Automatically saves standalone high-res thumbnail to D:\DailyQuant\Daily_Quant_Cover_Thumbnail.png.
+    4. Automatically saves standalone high-res thumbnail to D:\\DailyQuant\\Daily_Quant_Cover_Thumbnail.png.
     """
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
