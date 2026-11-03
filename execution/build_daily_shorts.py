@@ -21,8 +21,8 @@ from send_telegram_shorts import send_shorts_to_telegram
 
 def run_full_pipeline(
     output_video_path: str = r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4",
-    auto_upload: bool = False,
-    youtube_privacy: str = "unlisted",
+    auto_upload: bool = True,
+    youtube_privacy: str = "public",
     dry_run_upload: bool = False
 ):
     """
@@ -122,8 +122,9 @@ def run_full_pipeline(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build and Distribute Daily Financial Shorts")
     parser.add_argument("--output", default=r"D:\DailyQuant\Daily_Quant_Shorts_Sample.mp4", help="Output video path")
-    parser.add_argument("--upload", action="store_true", help="Auto distribute to YouTube Shorts and Instagram Reels")
-    parser.add_argument("--privacy", default="unlisted", choices=["public", "unlisted", "private"], help="YouTube privacy")
+    parser.add_argument("--upload", action="store_true", default=True, help="Auto distribute to YouTube Shorts and Instagram Reels")
+    parser.add_argument("--no-upload", dest="upload", action="store_false", help="Disable auto upload")
+    parser.add_argument("--privacy", default="public", choices=["public", "unlisted", "private"], help="YouTube privacy")
     parser.add_argument("--dry-run-upload", action="store_true", help="Simulate SNS upload without live transmission")
     args = parser.parse_args()
 

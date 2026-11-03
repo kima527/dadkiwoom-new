@@ -18,7 +18,9 @@ from send_telegram_shorts import send_shorts_to_telegram
 
 def run_premarket_shorts_pipeline(
     output_video_path: str = r"D:\DailyQuant\PreMarket_Urgent_Shorts.mp4",
-    output_thumbnail_path: str = r"D:\DailyQuant\PreMarket_Urgent_Thumbnail.png"
+    output_thumbnail_path: str = r"D:\DailyQuant\PreMarket_Urgent_Thumbnail.png",
+    auto_upload: bool = True,
+    privacy_status: str = "public"
 ):
     """
     Executes the 08:50 Pre-Market & Opening Gap Urgent Shorts Pipeline:
@@ -92,11 +94,11 @@ def run_premarket_shorts_pipeline(
     file_size_mb = os.path.getsize(output_video_path) / (1024 * 1024)
 
     # Step 5: Instant Mobile Telegram Delivery (Method B)
-    print(">>> [5/5] 📲 스마트폰 텔레그램으로 영상 및 복사용 쇼츠 텍스트 즉시 발송 중...")
+    print(">>> [5/6] 📲 스마트폰 텔레그램으로 영상 및 복사용 쇼츠 텍스트 즉시 발송 중...")
+    nxt_item = data.get("nxt_premarket_leader", {})
+    stk_nm = nxt_item.get("name", "SK하이닉스")
+    tg_title = f"개장 10분 전! 08:50 프리마켓 {stk_nm} 수급 폭발 & 시초가 갭 속보 #Shorts"
     try:
-        nxt_item = data.get("nxt_premarket_leader", {})
-        stk_nm = nxt_item.get("name", "SK하이닉스")
-        tg_title = f"개장 10분 전! 08:50 프리마켓 {stk_nm} 수급 폭발 & 시초가 갭 속보 #Shorts"
         send_shorts_to_telegram(
             video_path=output_video_path,
             title=tg_title,
@@ -105,8 +107,30 @@ def run_premarket_shorts_pipeline(
     except Exception as e:
         print(f"⚠️ 텔레그램 전송 예외: {e}")
 
+    # Step 6: 100% Unattended YouTube Shorts Auto Upload
+    if auto_upload:
+        print(">>> [6/6] 🚀 유튜브 쇼츠 무인 자동 업로드 진행 중...")
+        try:
+            from upload_youtube_shorts import upload_youtube_shorts
+            meta_dict = {
+                "youtube": {
+                    "title": tg_title,
+                    "description": f"08:50 장전 프리마켓 실시간 수급 1위 {stk_nm} 긴급 점검!\n9시 개장 직전 시초가 갭과 외국인 수급 변곡점을 45초 만에 확인하세요.\n\n#Shorts #주식 #국내증시 #시초가매매 #{stk_nm} #프리마켓",
+                    "tags": ["Shorts", "주식", "국내증시", "프리마켓", "시초가매매", stk_nm],
+                    "categoryId": "27",
+                    "privacyStatus": privacy_status
+                }
+            }
+            meta_path = ".tmp/premarket_sns_metadata.json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta_dict, f, ensure_ascii=False, indent=2)
+
+            upload_youtube_shorts(video_path=output_video_path, meta_path=meta_path, privacy_status=privacy_status)
+        except Exception as e:
+            print(f"⚠️ 유튜브 자동 업로드 예외: {e}")
+
     print("\n" + "=" * 70)
-    print("🎉 [08:50 긴급 숏츠 제작 완료]")
+    print("🎉 [08:50 긴급 숏츠 제작 및 배포 완료]")
     print(f"   - 영상 경로: {output_video_path}")
     print(f"   - 썸네일 경로: {output_thumbnail_path}")
     print(f"   - 영상 크기: {file_size_mb:.2f} MB")
@@ -115,5 +139,11 @@ def run_premarket_shorts_pipeline(
     return output_video_path
 
 if __name__ == "__main__":
-    run_premarket_shorts_pipeline()
+    import argparse
+    parser = argparse.ArgumentParser(description="Build and Upload 08:50 Pre-Market Shorts")
+    parser.add_argument("--upload", action="store_true", help="Auto upload to YouTube Shorts")
+    parser.add_argument("--privacy", default="public", choices=["public", "unlisted", "private"], help="YouTube privacy")
+    args = parser.parse_args()
+
+    run_premarket_shorts_pipeline(auto_upload=args.upload, privacy_status=args.privacy)
 

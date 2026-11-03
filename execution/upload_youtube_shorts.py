@@ -60,76 +60,26 @@ def get_youtube_service(
                 return None
 
             print("🔑 최초 1회 브라우저 구글 로그인 인증을 진행합니다...", flush=True)
-            import subprocess
-            import wsgiref.simple_server
-            from google_auth_oauthlib.flow import _ExclusiveWSGIServer, _RedirectWSGIApp, _WSGIRequestHandler
-
-            os.makedirs(".tmp", exist_ok=True)
-            url_file = ".tmp/youtube_auth_url.txt"
             flow = InstalledAppFlow.from_client_secrets_file(client_secrets_file, SCOPES)
-            
-            success_msg = (
-                "<html><head><meta charset='utf-8'></head>"
-                "<body style='font-family:sans-serif;text-align:center;padding-top:60px;background:#181818;color:#fff;'>"
-                "<h2>🎉 유튜브 쇼츠 인증이 성공적으로 완료되었습니다!</h2>"
-                "<p>이 브라우저 탭을 닫고 콘솔 화면을 확인해 주세요.</p>"
-                "</body></html>"
-            )
-            wsgi_app = _RedirectWSGIApp(success_msg)
-            port_to_try = 8080
             try:
-                local_server = wsgiref.simple_server.make_server(
-                    "localhost",
-                    port_to_try,
-                    wsgi_app,
-                    server_class=_ExclusiveWSGIServer,
-                    handler_class=_WSGIRequestHandler,
+                creds = flow.run_local_server(
+                    port=8080,
+                    authorization_prompt_message="👉 브라우저가 열리지 않으면 아래 링크를 직접 열어주세요:\n{url}\n",
+                    success_message="🎉 인증이 성공적으로 완료되었습니다! 이 창을 닫으셔도 좋습니다.",
+                    prompt="consent",
+                    access_type="offline",
+                    open_browser=True
                 )
-            except Exception:
-                local_server = wsgiref.simple_server.make_server(
-                    "localhost",
-                    0,
-                    wsgi_app,
-                    server_class=_ExclusiveWSGIServer,
-                    handler_class=_WSGIRequestHandler,
+            except Exception as e:
+                print(f"포트 8080 재시도 ({e})...", flush=True)
+                creds = flow.run_local_server(
+                    port=0,
+                    authorization_prompt_message="👉 브라우저가 열리지 않으면 아래 링크를 직접 열어주세요:\n{url}\n",
+                    success_message="🎉 인증이 성공적으로 완료되었습니다! 이 창을 닫으셔도 좋습니다.",
+                    prompt="consent",
+                    access_type="offline",
+                    open_browser=True
                 )
-
-            flow.redirect_uri = f"http://localhost:{local_server.server_port}/"
-            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
-
-            with open(url_file, "w", encoding="utf-8") as f:
-                f.write(auth_url)
-
-            # 바탕화면 바로가기 파일 자동 갱신
-            desktop_dir = r"C:\Users\zoela\OneDrive\바탕 화면"
-            try:
-                with open(os.path.join(desktop_dir, "1. 유튜브 인증 로그인.url"), "w", encoding="utf-8") as f:
-                    f.write(f"[InternetShortcut]\nURL={auth_url}\n")
-                with open(os.path.join(desktop_dir, "1. 유튜브 인증 열기.html"), "w", encoding="utf-8") as f:
-                    f.write(f"<!DOCTYPE html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='0; url={auth_url}'></head><body><script>window.location.href='{auth_url}';</script></body></html>")
-            except Exception as e:
-                print(f"바탕화면 헬퍼 생성 예외: {e}")
-
-            print("\n" + "=" * 70, flush=True)
-            print("👉 아래 URL로 접속하여 인증을 완료해 주세요:", flush=True)
-            print(auth_url, flush=True)
-            print("=" * 70 + "\n", flush=True)
-
-            # Windows 브라우저 팝업
-            try:
-                import webbrowser
-                webbrowser.open(auth_url)
-                subprocess.Popen(f'cmd.exe /c start "" "{auth_url}"', shell=True)
-            except Exception as e:
-                print(f"브라우저 자동 팝업 예외: {e}")
-
-            try:
-                local_server.handle_request()
-                auth_resp = wsgi_app.last_request_uri.replace("http:", "https:")
-                flow.fetch_token(authorization_response=auth_resp)
-                creds = flow.credentials
-            finally:
-                local_server.server_close()
 
         # Save credentials for future automated runs
         with open(token_file, "w", encoding="utf-8") as token:
