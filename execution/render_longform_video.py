@@ -30,8 +30,8 @@ def render_longform_video(
         timing_data = json.load(f)
 
     print("=" * 70)
-    print("🎬 [롱폼 1편 렌더링 시작] 16:9 Full HD (1920x1080) 비디오 인코딩")
-    print(f"📁 총 슬라이드 수: {len(timing_data)}개 파트")
+    print("🎬 [롱폼 1편 렌더링 시작] 16:9 QHD (2560x1440) 초고화질 비디오 인코딩 (VP9 활성화)")
+    print(f"📁 총 슬라이드 수: {len(timing_data)}개 파트 (비트레이트 16M+ 고화질)")
     print("=" * 70 + "\n")
 
     part_files = []
@@ -58,11 +58,15 @@ def render_longform_video(
             "-i", os.path.abspath(slide_img),
             "-i", os.path.abspath(audio_path),
             "-c:v", "libx264",
-            "-tune", "stillimage",
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-preset", "medium",
+            "-crf", "16",
+            "-b:v", "16M",
+            "-maxrate", "25M",
+            "-bufsize", "32M",
             "-pix_fmt", "yuv420p",
-            "-s", "1920x1080",
+            "-s", "2560x1440",
+            "-c:a", "aac",
+            "-b:a", "320k",
             "-shortest",
             os.path.abspath(part_out)
         ]

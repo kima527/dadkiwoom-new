@@ -68,18 +68,25 @@ def render_financial_shorts(
         fade_offset = max(0.5, cover_duration - fade_duration)
         main_duration = duration - fade_offset + 1.0  # extra buffer
 
-        # Step 1: Render video with 4-second cover intro and crossfade
+        # Step 1: Render video with 4-second cover intro and crossfade in 1440x2560 Vertical QHD (VP9 Trigger)
         cmd = [
             ffmpeg_bin, "-y",
             "-loop", "1", "-t", f"{cover_duration:.2f}", "-framerate", str(fps), "-i", cover_path,
             "-loop", "1", "-t", f"{main_duration:.2f}", "-framerate", str(fps), "-i", image_path,
             "-i", audio_path,
-            "-filter_complex", f"[0:v][1:v]xfade=transition=fade:duration={fade_duration:.2f}:offset={fade_offset:.2f}[v]",
+            "-filter_complex", (
+                f"[0:v]scale=1440:2560:flags=lanczos[v0];"
+                f"[1:v]scale=1440:2560:flags=lanczos[v1];"
+                f"[v0][v1]xfade=transition=fade:duration={fade_duration:.2f}:offset={fade_offset:.2f}[v]"
+            ),
             "-map", "[v]",
             "-map", "2:a",
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "18",
+            "-preset", "medium",
+            "-crf", "16",
+            "-b:v", "16M",
+            "-maxrate", "25M",
+            "-bufsize", "32M",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", "320k",
@@ -109,17 +116,20 @@ def render_financial_shorts(
         shutil.copyfile(cover_path, dest_thumb_path)
         print(f"🖼️ 단독 썸네일 이미지 파일 복사 완료: {dest_thumb_path}")
     else:
-        # Fallback to single visual loop
+        # Fallback to single visual loop in 1440x2560 QHD
         cmd = [
             ffmpeg_bin, "-y",
             "-loop", "1",
             "-framerate", str(fps),
             "-i", image_path,
             "-i", audio_path,
+            "-vf", "scale=1440:2560:flags=lanczos",
             "-c:v", "libx264",
-            "-tune", "stillimage",
-            "-preset", "veryfast",
-            "-crf", "18",
+            "-preset", "medium",
+            "-crf", "16",
+            "-b:v", "16M",
+            "-maxrate", "25M",
+            "-bufsize", "32M",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", "320k",

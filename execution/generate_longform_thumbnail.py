@@ -32,8 +32,8 @@ def generate_longform_thumbnail(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     os.makedirs(".tmp", exist_ok=True)
 
-    # 1920x1080 (16:9, DPI=120 -> 16x9 inches)
-    fig, ax = plt.subplots(figsize=(16, 9), dpi=120)
+    # 2560x1440 QHD (16:9, DPI=160 -> 16x9 inches)
+    fig, ax = plt.subplots(figsize=(16, 9), dpi=160)
     fig.patch.set_facecolor('#0B0F19')
     ax.set_facecolor('#0B0F19')
     ax.set_xlim(0, 100)
@@ -143,9 +143,9 @@ def generate_longform_thumbnail(
     ax.text(80, 72, "가짜 신호 70% 걸러내는 비기", color='#E2E8F0', fontproperties=korean_font_prop, fontsize=15, ha='center', zorder=7)
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    plt.savefig(output_path, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    plt.savefig(output_path, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     # Also save to .tmp
-    plt.savefig(".tmp/longform_ep1_thumbnail.png", dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    plt.savefig(".tmp/longform_ep1_thumbnail.png", dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
 
     print(f"🖼️ [16:9 썸네일 완성] 저장 완료 -> {output_path}")

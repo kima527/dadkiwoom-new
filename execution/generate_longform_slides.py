@@ -23,8 +23,8 @@ if not os.path.exists('C:/Windows/Fonts/malgunbd.ttf'):
     korean_font_bold = korean_font_prop
 
 def create_base_slide(chapter_tag: str, title: str, subtitle: str = ""):
-    """Creates a base 16:9 canvas with cyber-dark theme, header and grid."""
-    fig, ax = plt.subplots(figsize=(16, 9), dpi=120)
+    """Creates a base 16:9 canvas with cyber-dark theme, header and grid (2560x1440 QHD)."""
+    fig, ax = plt.subplots(figsize=(16, 9), dpi=160)
     fig.patch.set_facecolor('#0B0F19')
     ax.set_facecolor('#0B0F19')
     ax.set_xlim(0, 100)
@@ -112,7 +112,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p1 = os.path.join(output_dir, "slide_01_hook.png")
-    fig.savefig(p1, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    fig.savefig(p1, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p1)
 
@@ -194,7 +194,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p2 = os.path.join(output_dir, "slide_02_myth.png")
-    fig.savefig(p2, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    fig.savefig(p2, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p2)
 
@@ -233,7 +233,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p3 = os.path.join(output_dir, "slide_03_trap.png")
-    fig.savefig(p3, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    fig.savefig(p3, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p3)
 
@@ -289,7 +289,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p4 = os.path.join(output_dir, "slide_04_data.png")
-    fig.savefig(p4, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    fig.savefig(p4, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p4)
 
@@ -331,7 +331,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p5 = os.path.join(output_dir, "slide_05_solution.png")
-    fig.savefig(p5, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    fig.savefig(p5, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p5)
 
@@ -386,7 +386,7 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p6 = os.path.join(output_dir, "slide_06_turnaround.png")
-    fig.savefig(p6, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    fig.savefig(p6, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p6)
 
@@ -427,11 +427,11 @@ def generate_all_slides(output_dir: str = ".tmp/slides", json_path: str = ".tmp/
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     p7 = os.path.join(output_dir, "slide_07_checklist_outro.png")
-    fig.savefig(p7, dpi=120, facecolor=fig.get_facecolor(), edgecolor='none')
+    fig.savefig(p7, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     slides.append(p7)
 
-    print(f"🎬 [슬라이드 제작 완료] 총 {len(slides)}개 16:9 Full HD 슬라이드 생성 완료 -> {output_dir}")
+    print(f"🎬 [슬라이드 제작 완료] 총 {len(slides)}개 16:9 QHD (2560x1440) 슬라이드 생성 완료 -> {output_dir}")
     return slides
 
 if __name__ == "__main__":
