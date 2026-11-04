@@ -46,42 +46,30 @@ def generate_sns_metadata(
 
     date_str = datetime.now().strftime("%m월 %d일")
 
-    # 1. YouTube Shorts Metadata
-    yt_title = f"오늘 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다! #Shorts"
-    # Ensure title is strictly under 100 characters for YouTube
-    if len(yt_title) > 95:
-        yt_title = yt_title[:90] + " #Shorts"
+    # 1. YouTube Shorts Metadata (User Specified Formula)
+    yt_title = "장 열리기 전 필수시청 꼭 알아야 할 주식 시장 핵심 뉴스 3가지 #shorts"
 
-    hl_text = ""
-    if headlines:
-        hl_text = "\n".join([f"• {h}" for h in headlines[:2]])
+    yt_description = f"""바쁜 출근길, 오늘 아침 주식 시장 트렌드를 딱 3가지로 압축해 드립니다. 
+이 3가지만 알고 장에 들어가도 뇌동매매를 피할 수 있습니다. #주식시황 #증시전망 #오늘의뉴스 #경제뉴스 #투자 #주린이
 
-    yt_description = f"""[모닝 퀀트 데일리] {date_str} 국내 증시 개장 긴급 점검
-
-오늘 아침 9시 개장 전, 이것 모르면 시초가에 당합니다!
-미국 필라델피아 반도체 지수 {sox_sign}{sox_pct:.1f}% {sox_dir}과 국내 야간 코스피200 선물 {k2_sign}{k2_pct:.1f}% {k2_dir}!
-{signal_context} 속에서 삼성전자, SK하이닉스 계좌를 지키는 '개장 직후 15분 실전 대응 3원칙'을 공개합니다.
-
-📌 [오늘 증시 영향 핵심 헤드라인]
-{hl_text if hl_text else '• 미국 반도체 급락 및 기술주 차익 실현 매물 압박'}
-
-📊 [09:00~09:15 실전 대응 3원칙]
-1. 09:00~09:15 관망: 시초가 갭 덫을 피하는 노매매 원칙
-2. 외인 실시간 수급: 9시 15분까지 선물·현물 동시 순매수 확인
-3. 당일 시가(Open) 지지: 15분 뒤 시가 안착 시 분할 매수 대응
+📌 [{date_str} 오늘 아침 핵심 체크 3가지]
+1. 글로벌 지표: 필라델피아 반도체 지수 ({sox_sign}{sox_pct:.1f}%) & 빅테크 수급
+2. 국내 야간 선물: 코스피200 야간선물 ({k2_sign}{k2_pct:.1f}%) 시초가 영향
+3. 실전 대응: 09:00~09:15 외국인 수급 변곡점 및 15분 매매 원칙
 
 ※ 본 영상은 데이터 기반 분석 정보이며 매매 권유가 아닙니다.
 매일 아침 7시, 가장 빠른 증시 선행 데이터를 전해드립니다. 구독과 알림 설정해 두세요!
 
-#Shorts #주식 #국내증시 #코스피 #코스닥 #삼성전자 #SK하이닉스 #반도체 #야간선물 #필라델피아반도체 #주식투자 #퀀트투자 #모닝퀀트
-""".strip()
+#Shorts #주식 #국내증시 #코스피 #삼성전자 #SK하이닉스 #모닝퀀트""".strip()
 
     yt_tags = [
-        "Shorts", "쇼츠", "주식", "코스피", "코스닥", "삼성전자", "SK하이닉스",
-        "필라델피아반도체", "야간선물", "모닝퀀트", "주식초보", "재테크", "시초가매매"
+        "Shorts", "shorts", "주식시황", "증시전망", "오늘의뉴스", "경제뉴스",
+        "투자", "주린이", "주식", "코스피", "코스닥", "삼성전자", "SK하이닉스",
+        "필라델피아반도체", "야간선물", "모닝퀀트", "시초가매매"
     ]
 
     # 2. Instagram Reels Metadata
+    hl_text = "\n".join([f"• {h}" for h in headlines[:2]]) if headlines else ""
     ig_caption = f"""🚨 오늘 아침 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다!
 
 밤사이 필라델피아 반도체 {sox_sign}{sox_pct:.1f}% {sox_dir} vs 국내 야간 코스피 선물 {k2_sign}{k2_pct:.1f}% {k2_dir}!

@@ -104,7 +104,7 @@ def run_full_pipeline(
     try:
         top_stock = report.get("top_anomaly", {})
         top_name = top_stock.get("name", "기술주").split(" ")[0]
-        m_title = "오늘 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다! #Shorts"
+        m_title = "장 열리기 전 필수시청 꼭 알아야 할 주식 시장 핵심 뉴스 3가지 #shorts"
         if os.path.exists(".tmp/sns_metadata_today.json"):
             with open(".tmp/sns_metadata_today.json", "r", encoding="utf-8") as f:
                 s_data = json.load(f)

@@ -24,7 +24,7 @@ def get_telegram_creds():
 
 def send_shorts_to_telegram(
     video_path: str,
-    title: str = "오늘 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다! #Shorts",
+    title: str = "장 열리기 전 필수시청 꼭 알아야 할 주식 시장 핵심 뉴스 3가지 #shorts",
     tags: list = None,
     youtube_url: str = None
 ):

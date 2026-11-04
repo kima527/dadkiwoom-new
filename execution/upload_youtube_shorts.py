@@ -102,8 +102,11 @@ def upload_youtube_shorts(
         return False
 
     # Load metadata
-    title = "오늘 9시 개장 직전, ‘15분 원칙’ 모르면 시초가에 다 털립니다! #Shorts"
-    description = ""
+    title = "장 열리기 전 필수시청 꼭 알아야 할 주식 시장 핵심 뉴스 3가지 #shorts"
+    description = (
+        "바쁜 출근길, 오늘 아침 주식 시장 트렌드를 딱 3가지로 압축해 드립니다. \n"
+        "이 3가지만 알고 장에 들어가도 뇌동매매를 피할 수 있습니다. #주식시황 #증시전망 #오늘의뉴스 #경제뉴스 #투자 #주린이"
+    )
     tags = ["Shorts", "주식", "코스피", "모닝퀀트"]
     category_id = "27"
 
