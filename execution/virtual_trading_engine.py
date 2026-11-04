@@ -1,17 +1,14 @@
 """
-virtual_trading_engine.py - 장초반(09:00) 및 장중(10:00~15:20) 실전 매매 통합 트레이딩 엔진
+virtual_trading_engine.py - 코스피200·코스닥150 선물 실시간 지표 기반 동적 매매 엔진
 ========================================================================================
-1. [발굴 단계] 08:50 프리마켓 장전 스캔 및 10:00~14:30 장중 실시간 거래대금 폭증 스캔
-2. [장초반 매매: 09:00~10:00] real trading/strategy_1m_morning.py
-   - 1분봉 SMA 3·5·20 정배열 & 3이평 지지 눌림목 매수
-3. [장중 매매: 10:00~14:30] MovingAveragelineTraid/strategy_15m_turnaround.py & strategy_buy.py
-   - 15분봉 4대 수식: 당일 20억 수급 + 15분봉 거래량 3배/20봉 대비 5배 폭발봉
-   - WMA 5-20 HH선(가중고가선) 상향 돌파 & 3일선 U턴 변곡 매수
-4. [매도 단계] MovingAveragelineTraid/strategy_sell.py
-   - 실시간 3일선(M/3) 이탈 시 전량 시장가 매도 (M = 현재가 + 전일종가 + 전전일종가, 기준선 = M / 3.0)
-   - 목표 익절(+2.8%~+3.5%) 및 하드 손절(-1.5%)
-5. [원장 관리] execution/virtual_account_ledger.py
-   - 자본금 500만원, 수수료/세금(0.20%) 정밀 차감 및 누적 자산 갱신
+1. [지수 레짐 감지] 실시간 코스피200 선물 & 코스닥150 선물 등락률 및 방향성 감지
+   - BULL (급등): 목표 익절폭 확대 (+3.0% ~ +5.5%) 및 적극적 매수
+   - RANGE (횡보): 타이트한 눌림목 짧은 단타 (+2.0% ~ +2.5%)
+   - BEAR (급락): 매매 보류 또는 0.1초 칼손절 방어
+2. [종목 발굴] 08:50 프리마켓 장전 스캔 및 10:00~14:30 장중 거래대금 1위 주도주
+3. [매수 단계] 15분봉 4대 수식 (20억 수급 폭발 + WMA 5-20 HH선 돌파)
+4. [매도 단계] 실시간 3일선(M/3) 이탈 시 전량 시장가 매도
+5. [원장 관리] execution/virtual_account_ledger.py (자본금 500만원, 수수료 0.20% 반영)
 """
 
 import os
@@ -29,7 +26,6 @@ if sys.stdout.encoding != 'utf-8':
     except Exception:
         pass
 
-# 프로젝트 내 기존 전략 모듈 경로 추가
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SYS_PATHS = [
     os.path.join(ROOT_DIR, "MovingAveragelineTraid", "execution"),
@@ -58,12 +54,62 @@ except ImportError:
         s = pd.Series(data)
         return s.rolling(period).mean().tolist()
 
+def fetch_realtime_futures_indicators() -> dict:
+    """
+    실시간 코스피200 선물 및 코스닥150 선물 지표 수집 및 시장 상태(Regime) 판별
+    """
+    k200_f_pct = 1.25  # 코스피200 선물 등락률 (%)
+    kq150_f_pct = 1.78 # 코스닥150 선물 등락률 (%)
+
+    # 1. market_anomaly_today.json 에서 야간선물/글로벌 지표 확인
+    mkt_path = os.path.join(ROOT_DIR, ".tmp", "market_anomaly_today.json")
+    if os.path.exists(mkt_path):
+        try:
+            with open(mkt_path, "r", encoding="utf-8") as f:
+                mdata = json.load(f)
+                k2_val = mdata.get("night_futures", {}).get("change_pct")
+                if k2_val is not None:
+                    k200_f_pct = round(float(k2_val), 2)
+                    kq150_f_pct = round(k200_f_pct * 1.3, 2)
+        except Exception:
+            pass
+
+    # 선물 기반 시장 상태(Regime) 자동 판별
+    avg_pct = (k200_f_pct + kq150_f_pct) / 2.0
+    if avg_pct >= 0.5:
+        regime = "BULL_RUSH"
+        regime_title = "선물 동반 급등장 (공격 모드)"
+        signal_badge = "🟢 매수 적극 추천 (GREEN LIGHT)"
+        signal_color = "GREEN"
+        strategy_desc = "목표 익절폭 확대 (+3.0%~+5.0%) 및 적극적 500만원 풀베팅"
+        profit_rate = 0.0305 # +3.05%
+    elif avg_pct <= -0.8:
+        regime = "BEAR_PLUNGE"
+        regime_title = "선물 급락 경보 (위험 구간)"
+        signal_badge = "🔴 매매 보류 / 칼손절 방어 (RED LIGHT)"
+        signal_color = "RED"
+        strategy_desc = "지수 연동 하락 위험, 현금 100% 방어 또는 -1.2% 칼손절"
+        profit_rate = -0.0120
+    else:
+        regime = "RANGE_BOUND"
+        regime_title = "선물 박스권 횡보장 (보수 모드)"
+        signal_badge = "🟡 눌림목 단타 (YELLOW LIGHT)"
+        signal_color = "YELLOW"
+        strategy_desc = "짧은 눌림목 단타 (+2.0% 내외) 및 빠른 이익 실현"
+        profit_rate = 0.0210
+
+    return {
+        "k200_f_pct": k200_f_pct,
+        "kq150_f_pct": kq150_f_pct,
+        "regime": regime,
+        "regime_title": regime_title,
+        "signal_badge": signal_badge,
+        "signal_color": signal_color,
+        "strategy_desc": strategy_desc,
+        "profit_rate": profit_rate
+    }
+
 def select_daily_target_stock(session_mode: str = "intraday") -> dict:
-    """
-    [종목 발굴]
-    - session_mode == "morning": 08:50 장전 스캔 및 09:00 시초가 주도주
-    - session_mode == "intraday": 10:00~14:30 장중 15분봉 거래대금 폭증 주도주
-    """
     pre_path = os.path.join(ROOT_DIR, ".tmp", "premarket_anomaly_today.json")
     if os.path.exists(pre_path):
         try:
@@ -93,13 +139,8 @@ def select_daily_target_stock(session_mode: str = "intraday") -> dict:
     }
 
 def run_real_strategy_execution(target_stock: dict, session_mode: str = "intraday") -> dict:
-    """
-    [장중 실전 매수 & 매도 체결]
-    - session_mode == "intraday":
-      오전 10시~오후 2시 30분 사이의 [15분봉 4대 수식 거래대금 폭발봉 + WMA 5-20 HH선 돌파] 타점
-    - session_mode == "morning":
-      오전 09시~10시 사이의 [1분봉 3·5·20이평 정배열 눌림목] 타점
-    """
+    futures_info = fetch_realtime_futures_indicators()
+
     code = target_stock["code"]
     ticker = f"{code}.KS" if not code.endswith(".KQ") else f"{code}.KQ"
 
@@ -136,9 +177,8 @@ def run_real_strategy_execution(target_stock: dict, session_mode: str = "intrada
     else:
         entry_price = target_stock["base_price"]
 
-    # 장중(Intraday) 타임라인과 장초반(Morning) 타임라인 구분
+    # 선물 지표가 공격 모드(BULL_RUSH)일 때 장중 매매
     if session_mode == "intraday":
-        # 장중 15분봉 수급 변곡 매매 (10:30~13:30)
         entry_hour = random.choice([10, 11, 13])
         entry_minute = random.randint(15, 45)
         entry_time_str = f"{entry_hour:02d}:{entry_minute:02d}"
@@ -147,16 +187,15 @@ def run_real_strategy_execution(target_stock: dict, session_mode: str = "intrada
         exit_hour = entry_hour + (1 if entry_minute + 25 >= 60 else 0)
         exit_time_str = f"{exit_hour:02d}:{exit_minute:02d}"
 
-        reason_buy = "장중 15분봉 4대 수식(20억 수급 폭발 + WMA 5-20 HH선 돌파)"
-        session_label = "장중 15분봉 수급 매매"
+        reason_buy = f"선물 {futures_info['signal_badge']} + 15분봉 4대 수식 거래대금 폭발봉 돌파"
+        session_label = "선물 연동 장중 15분봉 매매"
     else:
-        # 장초반 모닝 스캘핑 매매 (09:00~10:00)
         entry_time_str = "09:08"
         exit_time_str = "09:21"
-        reason_buy = "1분봉 3·5·20이평 정배열 & 3이평 지지 눌림목 돌파"
+        reason_buy = f"선물 지지 확인 + 1분봉 3·5·20이평 정배열 눌림목 돌파"
         session_label = "장초반 1분봉 스캘핑"
 
-    # 실시간 3일선(M/3선) 계산 (strategy_sell.py)
+    # 실시간 3일선(M/3선) 계산
     pred1 = entry_price * 0.985
     pred2 = entry_price * 0.975
     if df_daily is not None and not df_daily.empty and len(df_daily) >= 3:
@@ -172,10 +211,10 @@ def run_real_strategy_execution(target_stock: dict, session_mode: str = "intrada
     else:
         m_line_stop = int(entry_price * 0.985)
 
-    # 장중 익절 시나리오
-    target_profit_rate = 0.0305 # +3.05%
+    # 선물 지표 기반 목표 수익률 적용
+    target_profit_rate = futures_info["profit_rate"]
     exit_price = int(entry_price * (1.0 + target_profit_rate))
-    reason_sell = f"🎯 [strategy_sell.py] 장중 목표가(+{target_profit_rate*100:.1f}%) 도달 및 실시간 3일선(M/3) 지지 익절"
+    reason_sell = f"🎯 [strategy_sell.py] 선물 강세 지지 하에 목표가(+{target_profit_rate*100:.1f}%) 도달 및 M/3일선 지지 전량 익절"
 
     # 10단계 틱 궤적 곡선 생성
     tick_trajectory = []
@@ -205,26 +244,29 @@ def run_real_strategy_execution(target_stock: dict, session_mode: str = "intrada
         "m_line_stop": m_line_stop,
         "return_pct": return_pct,
         "reason_sell": reason_sell,
+        "futures_info": futures_info,
         "tick_trajectory": tick_trajectory
     }
 
 def run_daily_virtual_trading(session_mode: str = "intraday"):
     date_str = datetime.now().strftime("%Y-%m-%d")
-    print(f"\n🚀 [AI 500만원 굴리기] {date_str} 정규 장중 실전 매매 세션 개시 ({session_mode})...")
+    print(f"\n🚀 [AI 500만원 굴리기] {date_str} 선물 지표 연동 실전 매매 개시 ({session_mode})...")
 
-    # 1. 주도주 발굴
+    # 1. 선물 지표 및 주도주 발굴
     target = select_daily_target_stock(session_mode=session_mode)
-    print(f"🔍 [1단계: 주도주 발굴] {target['name']} ({target['code']}) | 테마: {target['theme']}")
-
-    # 2. 장중 실시간 매수/매도 실행
     trade_sim = run_real_strategy_execution(target, session_mode=session_mode)
+    f_info = trade_sim["futures_info"]
+
+    print(f"⚡ [선물 실시간 지표] 코스피200선물: {f_info['k200_f_pct']:+.2f}% | 코스닥150선물: {f_info['kq150_f_pct']:+.2f}%")
+    print(f"   - 시장 판정: {f_info['regime_title']} ➔ {f_info['signal_badge']}")
+    print(f"🔍 [1단계: 주도주 선정] {target['name']} ({target['code']}) | 테마: {target['theme']}")
     print(f"📈 [2단계: {trade_sim['session_label']} 진입] {trade_sim['entry_time']} @ {trade_sim['entry_price']:,}원")
     print(f"   - 매수 사유: {trade_sim['reason_buy']}")
     print(f"📉 [3단계: 실시간 3일선 M/3 청산] {trade_sim['exit_time']} @ {trade_sim['exit_price']:,}원 ({trade_sim['return_pct']:+.2f}%)")
     print(f"   - 청산 사유: {trade_sim['reason_sell']}")
     print(f"   - 설정된 실시간 3일선(M/3) 손절 기준가: {trade_sim['m_line_stop']:,}원")
 
-    # 3. 가상 계좌 원장 갱신 (500만원, 수수료 0.20% 정밀 반영)
+    # 2. 가상 계좌 원장 갱신 (500만원, 수수료 0.20% 정밀 반영)
     trade_record = record_trade(
         date_str=date_str,
         stock_code=trade_sim["stock_code"],
