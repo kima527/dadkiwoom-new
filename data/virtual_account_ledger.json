@@ -1,0 +1,33 @@
+{
+  "challenge_name": "AI 500만원 주식 굴리기 30일 챌린지",
+  "created_at": "2026-11-04 21:42:43",
+  "initial_seed": 5000000,
+  "current_asset": 5123361,
+  "cumulative_pnl": 123361,
+  "cumulative_return_pct": 2.47,
+  "current_day": 1,
+  "win_count": 1,
+  "loss_count": 0,
+  "win_rate_pct": 100.0,
+  "trades": [
+    {
+      "day": 1,
+      "date": "2026-11-04",
+      "stock_code": "000660",
+      "stock_name": "SK하이닉스",
+      "qty": 3,
+      "entry_time": "09:08",
+      "entry_price": 1445800,
+      "exit_time": "09:21",
+      "exit_price": 1489900,
+      "buy_amount": 4337400,
+      "sell_amount": 4469700,
+      "net_pnl": 123361,
+      "return_pct": 2.84,
+      "asset_after_trade": 5123361,
+      "cum_return_pct": 2.47,
+      "reason_buy": "08:50 프리마켓 거래대금 1위 폭발 및 기관·외인 쌍끌이 수급 유입",
+      "reason_sell": "🎯 목표 수익률(+3.05%) 도달 및 3분봉 데드크로스 전량 익절"
+    }
+  ]
+}
