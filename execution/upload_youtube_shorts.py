@@ -168,6 +168,20 @@ def upload_youtube_shorts(
     video_id = response.get("id")
     video_url = f"https://youtube.com/shorts/{video_id}"
 
+    # Save last uploaded video info
+    try:
+        os.makedirs(".tmp", exist_ok=True)
+        with open(".tmp/last_uploaded_youtube.json", "w", encoding="utf-8") as lf:
+            json.dump({
+                "video_id": video_id,
+                "video_url": video_url,
+                "title": title,
+                "privacy": privacy_status,
+                "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }, lf, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
     print("\n" + "=" * 65)
     print("🎉 [유튜브 쇼츠 업로드 성공!]")
     print(f"🔗 쇼츠 링크: {video_url}")
