@@ -33,6 +33,19 @@ from kiwoom_rest_api.koreanstock.stockinfo import StockInfo
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# 🛡️ 키움증권 REST API 리밋 방어용 전역 레이트 리미터 (초당 최대 4회 = 0.25초 강제 딜레이)
+_LAST_KIWOOM_CALL_TIME = 0.0
+_MIN_KIWOOM_INTERVAL = 0.25  # 키움 공식 1초당 5회 제한 대비 100% 안전 보장
+
+def _enforce_kiwoom_rate_limit():
+    global _LAST_KIWOOM_CALL_TIME
+    now = time.time()
+    elapsed = now - _LAST_KIWOOM_CALL_TIME
+    if elapsed < _MIN_KIWOOM_INTERVAL:
+        time.sleep(_MIN_KIWOOM_INTERVAL - elapsed)
+    _LAST_KIWOOM_CALL_TIME = time.time()
+
+
 class KiwoomRealClient:
     def __init__(self):
         # 실전용 API 주소 고정 (https://api.kiwoom.com)
@@ -55,6 +68,7 @@ class KiwoomRealClient:
         def _patch_api_instance(api_instance):
             original_execute = api_instance._execute_request
             def patched_execute(method: str, resource_url: str = None, **kwargs):
+                _enforce_kiwoom_rate_limit()
                 if "json" in kwargs and kwargs["json"] is not None:
                     kwargs["json"]["acnt_no"] = config.KIWOOM_ACCOUNT_NUM
                     if hasattr(config, 'KIWOOM_ACCOUNT_PWD') and config.KIWOOM_ACCOUNT_PWD:
@@ -75,7 +89,10 @@ class KiwoomRealClient:
             api_instance._execute_request = patched_execute
 
         _patch_api_instance(self.account_api)
+        _patch_api_instance(self.chart_api)
         _patch_api_instance(self.order_api)
+        _patch_api_instance(self.rank_api)
+        _patch_api_instance(self.stock_info_api)
 
     # ═══════════════════════════════════════════════════════════
     # 🔒 종목코드 정규화 (모든 API 호출 전 반드시 이 메서드를 거침)
