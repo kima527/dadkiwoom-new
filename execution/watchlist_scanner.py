@@ -103,10 +103,10 @@ def collect_market_candidates(api, max_candidates: int = 45) -> List[Dict[str, A
                 except ValueError:
                     flu_rt = 0.0
 
-                # 지수 폭락장 방어 필터: 당일 너무 깊게 무너진 종목(-2.5% 이하)이나 상한가 임박(+24% 초과) 과열주 제외
-                if flu_rt < -2.5 or flu_rt > 24.0:
+                # 지수 폭락장 & 고점 추격 방어 필터: 당일 음봉 심화(-1.5% 이하) 또는 이미 급등 과열(+9.5% 초과) 종목 원천 제외
+                if flu_rt < -1.5 or flu_rt > 9.5:
                     continue
-                if cur_prc < 1500 or cur_prc > 300000:  # 동전주 및 30만원 초과 초고가 황제주(소액 계좌 분할매수 불가) 제외
+                if cur_prc < 2000 or cur_prc > 250000:  # 동전주 및 25만원 초과 초고가 황제주(소액 계좌 분할매수 불가) 제외
                     continue
 
                 candidates_map[code] = {
@@ -114,7 +114,7 @@ def collect_market_candidates(api, max_candidates: int = 45) -> List[Dict[str, A
                     "name": name,
                     "price": cur_prc,
                     "flu_rt": flu_rt,
-                    "pre_score": max(50 - rank_idx, 10) + (15 if flu_rt >= 1.5 else 0)
+                    "pre_score": max(50 - rank_idx, 10) + (18 if 1.0 <= flu_rt <= 6.5 else 0)
                 }
         except Exception as e:
             logger.debug(f"거래대금 상위 조회 중 예외({mkt}): {e}")
@@ -148,8 +148,8 @@ def collect_market_candidates(api, max_candidates: int = 45) -> List[Dict[str, A
                 except ValueError:
                     flu_rt = 0.0
 
-                # 적정 상승 모멘텀 구간 (+0.5% ~ +20.0%) 및 1,500원~300,000원 적정 호가대 우대
-                if not (0.5 <= flu_rt <= 20.0) or cur_prc < 1500 or cur_prc > 300000:
+                # 초동 상승 모멘텀 구간 (+0.5% ~ +9.5%) 및 2,000원~250,000원 적정 호가대 우대 (+10% 이상 과열 추격 차단)
+                if not (0.5 <= flu_rt <= 9.5) or cur_prc < 2000 or cur_prc > 250000:
                     continue
 
                 if code in candidates_map:
@@ -206,9 +206,25 @@ def evaluate_holy_grail_fit(code: str, name: str, hint_price: float, api) -> Opt
             return None
 
         day3_m_line, _, pred1, _ = calculate_day3_m_line(df_daily, curr_price)
-        # M/3선 아래에 크게 밀린 종목은 즉시 탈락 (M/3선 위 또는 -0.5% 돌파 임박만 통과)
-        if day3_m_line > 0 and curr_price < day3_m_line * 0.995:
+        # M/3선 아래에 크게 밀린 종목은 즉시 탈락 (M/3선 위 또는 -0.3% 돌파 임박만 통과)
+        if day3_m_line > 0 and curr_price < day3_m_line * 0.997:
             return None
+
+        # 당일 등락률 검증: 이미 +9.5% 초과 급등한 고점 과열주나 -1.0% 미만 약세주는 제외
+        day_ret_pct = ((curr_price - pred1) / pred1 * 100.0) if pred1 > 0 else 0.0
+        if day_ret_pct < -1.0 or day_ret_pct > 9.5:
+            return None
+
+        # 🛡️ [시가총액 탄력 구간 필터 (1,000억 ~ 8조 원)]:
+        # 시총 8조 초과 초대형 둔중주(KB금융 60조, 셀트리온 45조, 현대모비스 33조, 한국전력 20조 등) 및
+        # 시총 1,000억 미만 소형 잡주를 배제하고 장중 파동 탄력이 가장 뛰어난 중·대형 주도주만 엄선!
+        mcap_eok = 0.0
+        if hasattr(api, "get_market_cap"):
+            mcap_won = float(api.get_market_cap(code) or 0.0)
+            if mcap_won > 0:
+                mcap_eok = mcap_won / 100_000_000.0
+                if mcap_eok < 1000.0 or mcap_eok > 80000.0:
+                    return None
 
         # ── [Stage 2] 60분봉 조회 및 관문선/기준선/20선 지지 정밀 판정 ──
         df_60m = api.get_60m_candles(code)
@@ -237,9 +253,17 @@ def evaluate_holy_grail_fit(code: str, name: str, hint_price: float, api) -> Opt
         gijun_line = float(last_60m.get("theme_gijun", np.nan))
         is_gate_up = bool(last_60m.get("gate_up_turnaround", False))
         open_60m = float(last_60m.get("open", curr_price))
+        high_60m = float(last_60m.get("high", curr_price))
         low_60m = float(last_60m.get("low", curr_price))
 
         if np.isnan(sma5) or np.isnan(sma20) or sma20 <= 0:
+            return None
+
+        # 🛡️ [60분봉 윗꼬리 매물 저항 필터]: 윗꼬리 비율이 42%를 초과하는 종목은 세력 차익 매물 출회로 간주하여 제외
+        c_range_60m = max(high_60m - low_60m, 1.0)
+        upper_shadow_60m = max(high_60m - max(open_60m, curr_price), 0.0)
+        upper_shadow_ratio = upper_shadow_60m / c_range_60m
+        if upper_shadow_ratio > 0.42:
             return None
 
         # 1) 60분봉 이평선 정배열/20선 지지 평가 (30점 만점)
@@ -252,38 +276,38 @@ def evaluate_holy_grail_fit(code: str, name: str, hint_price: float, api) -> Opt
         elif is_bull_support:
             score_align = 24.0
             align_tag = "🟡20선상단지지"
-        elif curr_price >= sma20 * 0.985 and sma5 >= sma20 * 0.980:
+        elif curr_price >= sma20 * 0.988 and sma5 >= sma20 * 0.985:
             score_align = 12.0
             align_tag = "🟠20선돌파임박"
         else:
             # 60분봉 역배열/20선 하단 종목은 제외
             return None
 
-        # 2) 관문선 지지/변곡 및 기준선(M선) 돌파 타점 평가 (40점 만점)
+        # 2) 관문선 지지/변곡 및 기준선(M선) 돌파 초기 맥점 평가 (40점 만점)
         gate_support = is_gate_up or (not np.isnan(gate_line) and gate_line > 0 and curr_price >= gate_line * 0.990 and low_60m <= gate_line * 1.015)
         gijun_diff_pct = ((curr_price - gijun_line) / gijun_line * 100.0) if (not np.isnan(gijun_line) and gijun_line > 0) else -99.0
         gate_diff_pct = ((curr_price - gate_line) / gate_line * 100.0) if (not np.isnan(gate_line) and gate_line > 0) else -99.0
 
-        # 기준선 대비 +10% 초과 급등 과열 종목은 고점 추격 방지를 위해 제외
-        if gijun_diff_pct > 10.0:
+        # 기준선 대비 +5.5% 초과 이격 과열 종목은 고점 추격 방지를 위해 제외 (strategy.py의 +3.5%~+4.5% 맥점과 완벽 동기화)
+        if gijun_diff_pct > 5.5:
             return None
 
         is_immediate_buy_zone = False
-        if 0.0 <= gijun_diff_pct <= 4.0 and is_bull_support:
+        if 0.0 <= gijun_diff_pct <= 3.5 and is_bull_support:
             score_target = 40.0
-            target_tag = f"🚀기준선돌파타점(+{gijun_diff_pct:.2f}%)"
+            target_tag = f"🚀기준선돌파초기맥점(+{gijun_diff_pct:.2f}%)"
             is_immediate_buy_zone = True
-        elif gate_support and is_bull_support:
+        elif gate_support and is_bull_support and gijun_diff_pct <= 3.5:
             score_target = 38.0
             target_tag = f"🔥관문선변곡/지지타점({gate_diff_pct:+.2f}%)"
             is_immediate_buy_zone = True
         elif -1.8 <= gijun_diff_pct < 0.0:
-            score_target = 30.0
+            score_target = 32.0
             target_tag = f"⚡기준선돌파임박({gijun_diff_pct:+.2f}%)"
         elif -1.5 <= gate_diff_pct <= 2.5:
-            score_target = 26.0
+            score_target = 28.0
             target_tag = f"🎯관문선사정권({gate_diff_pct:+.2f}%)"
-        elif 4.0 < gijun_diff_pct <= 8.5:
+        elif 3.5 < gijun_diff_pct <= 5.5:
             score_target = 20.0
             target_tag = f"🟢기준선상단순항(+{gijun_diff_pct:.2f}%)"
         else:
@@ -302,15 +326,16 @@ def evaluate_holy_grail_fit(code: str, name: str, hint_price: float, api) -> Opt
         curr_vol = float(last_daily.get("volume", 0.0))
         vol_ratio_prev, _ = calculate_pred_volume_ratio(df_daily, curr_vol)
         score_power = 0.0
-        if curr_price >= open_60m:
+        if curr_price >= open_60m and upper_shadow_ratio <= 0.25:
             score_power += 8.0
+        elif curr_price >= open_60m:
+            score_power += 5.0
         if vol_ratio_prev >= 30.0:
             score_power += 7.0
         elif vol_ratio_prev >= 10.0:
             score_power += 4.0
 
         total_fit_score = round(score_align + score_target + score_m3 + score_power, 1)
-        day_ret_pct = ((curr_price - pred1) / pred1 * 100.0) if pred1 > 0 else 0.0
 
         if not name or name.startswith("종목_"):
             name = api.get_stock_name(code)
@@ -320,6 +345,7 @@ def evaluate_holy_grail_fit(code: str, name: str, hint_price: float, api) -> Opt
             "name": name,
             "price": curr_price,
             "day_ret_pct": round(day_ret_pct, 2),
+            "mcap_eok": round(mcap_eok, 0),
             "fit_score": total_fit_score,
             "is_immediate_buy_zone": is_immediate_buy_zone,
             "align_tag": align_tag,
@@ -346,12 +372,12 @@ def scan_and_save_holy_grail_watchlist(api, max_picks: int = 12, exclude_codes: 
     logger.info(" 🔍 [통합 성배 타점 스캐너 가동] 지수 조정 방어 & 즉시 매수 타점 부합 주도주 탐색 중...")
     logger.info("===============================================================================")
 
-    raw_candidates = collect_market_candidates(api, max_candidates=42)
+    raw_candidates = collect_market_candidates(api, max_candidates=60)
     if not raw_candidates:
         logger.warning("⚠️ 시장 후보군 조회 결과가 비어 있습니다. 기존 저장된 관심종목이 있으면 유지합니다.")
         return load_saved_watchlist()
 
-    logger.info(f"⚡ 1차 수급/양봉 필터 통과 주도주 {len(raw_candidates)}개 대상 [일봉 추세 ➔ M/3선 ➔ 60분봉 관문/기준선] 정밀 검증...")
+    logger.info(f"⚡ 1차 수급/양봉 필터 통과 주도주 {len(raw_candidates)}개 대상 [일봉 추세 ➔ 시총(1천억~8조) ➔ M/3선 ➔ 60분봉 관문/기준선] 정밀 검증...")
 
     matched: List[Dict[str, Any]] = []
     for cand in raw_candidates:
@@ -375,9 +401,10 @@ def scan_and_save_holy_grail_watchlist(api, max_picks: int = 12, exclude_codes: 
             code = p["code"]
             watchlist_dict[code] = p
             zone_badge = "🔥[즉시타점]" if p["is_immediate_buy_zone"] else "⚡[돌파임박]"
+            mcap_str = f"시총:{p.get('mcap_eok', 0):,.0f}억 | " if p.get("mcap_eok", 0) > 0 else ""
             logger.info(
                 f"  {idx:2d}위. {zone_badge} [{p['name']}({code})] 적합도: {p['fit_score']}점 | "
-                f"현재가: {p['price']:,.0f}원({p['day_ret_pct']:+.2f}%) | 60분: {p['align_tag']} | "
+                f"{mcap_str}현재가: {p['price']:,.0f}원({p['day_ret_pct']:+.2f}%) | 60분: {p['align_tag']} | "
                 f"M/3선: {p['m3_line']:,.0f}({p['m3_diff_pct']:+.2f}%) | {p['target_tag']}"
             )
         logger.info("-------------------------------------------------------------------------------")

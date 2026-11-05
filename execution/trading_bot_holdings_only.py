@@ -136,18 +136,40 @@ def get_session_volume_target() -> tuple[float, str]:
     else:
         return 3.0, "KRX 정규장(3.0%)"
 
+def get_krx_tick_size(price: float) -> int:
+    """한국거래소 호가 단위 반환"""
+    if price is None or np.isnan(price) or price <= 0:
+        return 1
+    if price < 2000: return 1
+    elif price < 5000: return 5
+    elif price < 20000: return 10
+    elif price < 50000: return 50
+    elif price < 200000: return 100
+    elif price < 500000: return 500
+    else: return 1000
+
 def align_to_tick(price: float) -> int:
     """한국거래소 및 대체거래소 호가 단위 정렬"""
     if price is None or np.isnan(price) or price <= 0:
         return 0
-    if price < 2000: tick = 1
-    elif price < 5000: tick = 5
-    elif price < 20000: tick = 10
-    elif price < 50000: tick = 50
-    elif price < 200000: tick = 100
-    elif price < 500000: tick = 500
-    else: tick = 1000
+    tick = get_krx_tick_size(price)
     return int((int(price) // tick) * tick)
+
+def get_smart_buy_price(price: float) -> int:
+    """
+    ⚡ [실전 호가 역선택 방지 스마트 지정가 산출 (+1~2호가 공격적 지정가, 상한 슬리피지 +0.3% 제한)]
+    진짜 급등하는 대장주가 돌파 순간 1~2호가 위로 튀어 미체결('Ghost Lock')되는 현상을 원천 방지하고,
+    힘없이 밀리는 가짜 돌파만 체결되는 역선택(Adverse Selection)을 차단합니다.
+    """
+    base_p = align_to_tick(price)
+    if base_p <= 0:
+        return 0
+    tick = get_krx_tick_size(base_p)
+    if (tick * 2) / base_p <= 0.003:
+        return base_p + (tick * 2)
+    elif tick / base_p <= 0.0035:
+        return base_p + tick
+    return base_p
 
 
 class SafeHoldingsThemeGateBot:
@@ -188,6 +210,7 @@ class SafeHoldingsThemeGateBot:
         self.strategies: dict[str, ThemeGate60mStrategy] = {}
         self.active_holdings: dict = {}
         self.auto_watchlist_picks: dict[str, dict] = {}
+        self.pending_buy_orders: dict[str, dict] = {}
         self.last_watchlist_scan_time: float = 0.0
         self.sold_today_stocks: set[str] = set()
         self.current_trading_date = datetime.now().date()
@@ -217,11 +240,66 @@ class SafeHoldingsThemeGateBot:
                 pass
         return f"종목_{code}"
 
+    def _check_and_cleanup_unfilled_orders(self, real_holdings: dict):
+        """
+        🛡️ [90초 미체결 매수 주문 자동 취소 및 유령 잠금(Ghost Lock) 해제]
+        매수 주문 발송 후 90초 내에 체결되지 않고 허공에 떠 있는 미체결 주문은 즉시 취소하고,
+        미체결 상태로 1종목 슬롯을 점유하던 전략 상태를 이전 상태(IDLE 등)로 안전 롤백합니다.
+        """
+        if not (self.is_real and not self.dry_run and self.api and self.pending_buy_orders):
+            return
+
+        try:
+            unexecuted_list = self.api.get_unexecuted_orders() or []
+            unexec_by_code: dict[str, dict] = {}
+            for u in unexecuted_list:
+                c = str(u.get('stock_code', '')).strip()
+                u_qty = int(u.get('unfilled_qty', 0) or 0)
+                if c and u_qty > 0:
+                    unexec_by_code[c] = u
+
+            now_ts = time.time()
+            for code, p_info in list(self.pending_buy_orders.items()):
+                name = self.get_stock_name(code)
+                acc_qty = int(real_holdings.get(code, {}).get('qty', 0))
+                if code not in unexec_by_code:
+                    # 미체결 목록에 없으면 전량 체결 완료된 것!
+                    logger.info(f"✅ [매수 실체결 확인 완료] [{name}({code})] {p_info.get('action')} 주문 체결 완료 (실계좌 보유: {acc_qty}주)")
+                    self.pending_buy_orders.pop(code, None)
+                    continue
+
+                elapsed_sec = now_ts - float(p_info.get('timestamp', now_ts))
+                if elapsed_sec >= 90.0:
+                    u_item = unexec_by_code[code]
+                    ord_no = str(u_item.get('order_no', p_info.get('order_no', '')))
+                    u_qty = int(u_item.get('unfilled_qty', p_info.get('qty', 0)))
+                    logger.warning(
+                        f"⏱️ [미체결 90초 초과 자동 취소] [{name}({code})] 주문번호:{ord_no} 미체결잔량:{u_qty}주 "
+                        f"➔ 유령 잠금(Ghost Lock) 방지를 위해 주문을 취소하고 슬롯을 복원합니다."
+                    )
+                    if ord_no and u_qty > 0:
+                        self.api.cancel_order(ord_no, code, u_qty)
+
+                    strat = self.strategies.get(code)
+                    if strat:
+                        if acc_qty <= 1:
+                            # 단 1주도 신규 체결되지 않았으므로 주문 이전 상태로 완벽 롤백 (슬롯 즉시 해제!)
+                            self._rollback_strategy_state(strat, p_info.get('order'), p_info.get('prev_pos'), p_info.get('prev_cash'))
+                            logger.info(f"   🔓 [{name}({code})] 미체결 전량 취소 완료 ➔ 전략 상태 IDLE 복원 및 1종목 슬롯 개방!")
+                        else:
+                            # 일부 수량 부분 체결된 경우 실계좌 체결 수량으로 동기화하여 매도 감시 유지
+                            strat.position.total_qty = acc_qty
+                            logger.info(f"   ➕ [{name}({code})] 부분 체결 수량({acc_qty}주) 실계좌 동기화 완료 (잔여 미체결분 취소)")
+                    self.pending_buy_orders.pop(code, None)
+        except Exception as e:
+            logger.debug(f"미체결 주문 점검 중 예외: {e}")
+
     def refresh_holdings(self):
         """실전 계좌 보유종목 + 통합 성배 로직 최적합 자동발굴 관심종목 통합 갱신"""
         if self.is_real:
             real_holdings = self.api.get_account_holdings()
             cash = self.api.get_cash_balance()
+            self._check_and_cleanup_unfilled_orders(real_holdings)
         else:
             real_holdings = {
                 '005930': {'qty': 1, 'buy_price': 70000, 'current_price': 71000},
@@ -483,24 +561,35 @@ class SafeHoldingsThemeGateBot:
                 self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                 return
 
-            buy_price = align_to_tick(order.price) if order.price > 0 else 0
+            # ⚡ 돌파 역선택(Adverse Selection) 및 미체결 방지: +1~2호가 공격적 스마트 지정가 산출 (상한 슬리피지 +0.3% 이내)
+            buy_price = get_smart_buy_price(order.price) if order.price > 0 else 0
 
             if self.dry_run:
                 if strat and strat.position.base_account_qty > 0:
                     strat.position.total_qty += strat.position.base_account_qty
                     logger.info(f"   ➕ [수량 흡수] 기존 관심용 1주({strat.position.base_account_qty}주)를 포지션에 합산 ➔ 총 {strat.position.total_qty}주 보유")
                     strat.position.base_account_qty = 0
-                logger.info(f"🛡️ [DRY-RUN 모의 체결] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {order.qty}주 | 가격: {buy_price:,.0f}원 (실제 주문 미전송)")
+                logger.info(f"🛡️ [DRY-RUN 모의 체결] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {order.qty}주 | 스마트지정가: {buy_price:,.0f}원 (실제 주문 미전송)")
                 return
 
-            logger.info(f"🚀 [실전 매수 발송] [{name}({code})] {order.action} | 세션: {session_name} ({exchange_hint}) | 수량: {order.qty}주 | 가격: {buy_price:,.0f}원")
+            logger.info(f"🚀 [실전 매수 발송(+1~2호가 스마트지정가)] [{name}({code})] {order.action} | 세션: {session_name} ({exchange_hint}) | 수량: {order.qty}주 | 지정가: {buy_price:,.0f}원")
             if self.is_real and self.api:
                 order_no = self.api.place_buy_order(code, order.qty, price=buy_price, order_type="00")
                 if not order_no:
                     logger.error(f"   ❌ [매수 주문 실패/거부] [{name}({code})] API 응답 없음 ➔ 전략 상태를 주문 이전으로 안전 롤백합니다.")
                     self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                     return
-                logger.info(f"   ✅ [매수 접수 완료] 주문번호: {order_no}")
+                logger.info(f"   ✅ [매수 접수 완료] 주문번호: {order_no} (90초 미체결 감시 타이머 가동)")
+                self.pending_buy_orders[code] = {
+                    'order_no': str(order_no),
+                    'action': order.action,
+                    'qty': order.qty,
+                    'price': buy_price,
+                    'timestamp': time.time(),
+                    'prev_pos': copy.deepcopy(prev_pos) if prev_pos is not None else None,
+                    'prev_cash': prev_cash,
+                    'order': order
+                }
 
             # 주문 성공 확인 후 기존 관심용 1주 포지션 흡수
             if strat and strat.position.base_account_qty > 0:
@@ -510,6 +599,7 @@ class SafeHoldingsThemeGateBot:
 
         # 3. 매도 집행 (계좌 전량 100% 매도)
         elif order.action in ["TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]:
+            self.pending_buy_orders.pop(code, None)
             account_holding_qty = 0
             if self.is_real and self.api:
                 cur_holdings = self.api.get_account_holdings()
@@ -795,6 +885,8 @@ class SafeHoldingsThemeGateBot:
             logger.info("🔓 [1종목 집중 매매 슬롯 OPEN] 현재 활성 보유 종목 없음 (슬롯 0/1 비어있음) ➔ 기준선(M선)/관문선 옥석 가리기 1위 종목 진입 대기")
 
         buy_candidates = []
+        total_eval_count = 0
+        bear_align_count = 0
 
         for code in list(self.strategies.keys()):
             name = self.get_stock_name(code)
@@ -887,6 +979,7 @@ class SafeHoldingsThemeGateBot:
 
                 now_t = datetime.now().time()
                 is_eod_window = (dtime(15, 15, 0) <= now_t <= dtime(15, 30, 0) and exchange_hint == "KRX")
+                is_opening_whipsaw_window = (dtime(9, 0, 0) <= now_t < dtime(9, 3, 0) and exchange_hint == "KRX")
                 cur_qty = h_info.get('qty', 0)
                 pre_holding_qty = cur_qty if (self.is_real and not self.dry_run) else max(cur_qty, prev_pos.total_qty)
 
@@ -905,13 +998,15 @@ class SafeHoldingsThemeGateBot:
                 else:
                     order = None
 
-                # 60분봉 정배열/지지 상태 가시화
+                # 60분봉 정배열/지지 상태 가시화 및 폭락장(역배열 비율) 브레드스 집계
+                total_eval_count += 1
                 if sma5_val > sma20_val > sma60_val:
                     align_str = "🟢완전정배열(5>20>60)"
                 elif close_val >= sma20_val * 0.995:
                     align_str = "🟡20선상단지지"
                 else:
                     align_str = "🔴역배열/매물저항"
+                    bear_align_count += 1
 
                 # 60분봉 기준선 변곡선 상태 실시간 모니터링 가시화
                 if gijun_val > 0:
@@ -979,8 +1074,16 @@ class SafeHoldingsThemeGateBot:
                     # 2) 2차 불타기 매수: 이미 활성 운용 중인 종목이므로 즉시 집행
                     elif order.action == "BUY_2":
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
-                    # 3) 신규 1차 매수: 동시 돌파 우선순위 스코어링 평가 리스트에 수집
+                    # 3) 신규 1차 매수: 시초 3분(09:00~09:03) 동시호가 휩소 방어 검사 후 우선순위 스코어링 수집
                     elif order.action == "BUY_1":
+                        if is_opening_whipsaw_window and not self.dry_run:
+                            logger.info(
+                                f"   🛡️ [09:00~09:03 시초가 휩소 방어] [{name}({code})] 시초 동시호가 차익 매물 소화 대기 중 "
+                                f"➔ 09:03:00 이후 돌파 유지 확인 시 진입 (상태 안전 복원)"
+                            )
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
+
                         p_score, p_details = self.calculate_priority_score(
                             code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1, df_daily=df_daily, df_120t=df_120t
                         )
@@ -1017,34 +1120,49 @@ class SafeHoldingsThemeGateBot:
                     # 상태 안전 원복 (스냅샷 기반 포지션/예수금/거래내역 완벽 복구)
                     self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
             else:
-                # 슬롯 0/1 비어있음! 최고 우선순위 점수 종목 선정
+                # 슬롯 0/1 비어있음! 최고 우선순위 점수 종목 선정 및 최소 커트라인(평시 65점 / 폭락장 75점) 검증
                 buy_candidates.sort(key=lambda x: x['priority_score'], reverse=True)
                 winner = buy_candidates[0]
                 w_d = winner['details']
-                logger.info(
-                    f"👑 [동시 기준선 돌파 1픽 선정] 총 {len(buy_candidates)}개 돌파 후보 중 [{winner['name']}({winner['code']})] "
-                    f"우선순위 1위 ({winner['priority_score']:.1f}점/100점) 선정 및 매수 집행! "
-                    f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}% 돌파({w_d.get('score_speed', 0.0):.0f}점), "
-                    f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
-                    f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%({w_d.get('score_anchor', 0.0):.0f}점), "
-                    f"120틱WMA: {w_d.get('score_120t', 0.0):.0f}점, 모멘텀: {w_d.get('score_morning', 0.0):.0f}점]"
-                )
 
-                self.execute_order(
-                    winner['code'],
-                    winner['name'],
-                    winner['order'],
-                    prev_pos=winner['prev_pos'],
-                    prev_cash=winner['prev_cash']
-                )
+                bear_ratio = (bear_align_count / total_eval_count) if total_eval_count > 0 else 0.0
+                is_market_slump = (total_eval_count >= 4 and bear_ratio >= 0.60)
+                min_required_score = 75.0 if is_market_slump else 65.0
+                market_mode_tag = f"폭락/조정장 방어모드(역배열 {bear_ratio*100:.0f}%)" if is_market_slump else "정상장 모드"
 
-                # 2위 이하 탈락 후보들은 슬롯 마감 대기 및 상태 원복 (스냅샷 기반 완벽 복구)
-                for other in buy_candidates[1:]:
+                if winner['priority_score'] < min_required_score:
                     logger.info(
-                        f"   ⏸️ [{other['name']}({other['code']})] (우선순위: {other['priority_score']:.1f}점) - "
-                        f"1위 [{winner['name']}] 진입으로 슬롯 마감 ➔ 다음 회차 대기"
+                        f"🛡️ [우선순위 커트라인 미달 매수 보류] 1위 후보 [{winner['name']}({winner['code']})] "
+                        f"점수 {winner['priority_score']:.1f}점 < 최소 커트라인 {min_required_score:.1f}점 ({market_mode_tag}) "
+                        f"➔ 거래량/캔들 순도가 부족한 억지 매매를 차단하고 현금을 100% 보존합니다."
                     )
-                    self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
+                    for cand in buy_candidates:
+                        self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
+                else:
+                    logger.info(
+                        f"👑 [동시 기준선 돌파 1픽 선정] 총 {len(buy_candidates)}개 돌파 후보 중 [{winner['name']}({winner['code']})] "
+                        f"우선순위 1위 ({winner['priority_score']:.1f}점/100점 | 커트라인 {min_required_score:.0f}점 통과) 선정 및 매수 집행! "
+                        f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}% 돌파({w_d.get('score_speed', 0.0):.0f}점), "
+                        f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
+                        f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%({w_d.get('score_anchor', 0.0):.0f}점), "
+                        f"120틱WMA: {w_d.get('score_120t', 0.0):.0f}점, 모멘텀: {w_d.get('score_morning', 0.0):.0f}점]"
+                    )
+
+                    self.execute_order(
+                        winner['code'],
+                        winner['name'],
+                        winner['order'],
+                        prev_pos=winner['prev_pos'],
+                        prev_cash=winner['prev_cash']
+                    )
+
+                    # 2위 이하 탈락 후보들은 슬롯 마감 대기 및 상태 원복 (스냅샷 기반 완벽 복구)
+                    for other in buy_candidates[1:]:
+                        logger.info(
+                            f"   ⏸️ [{other['name']}({other['code']})] (우선순위: {other['priority_score']:.1f}점) - "
+                            f"1위 [{winner['name']}] 진입으로 슬롯 마감 ➔ 다음 회차 대기"
+                        )
+                        self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
 
     def start_loop(self, interval_sec: int = 30):
         """실시간 반복 감시 시작"""
