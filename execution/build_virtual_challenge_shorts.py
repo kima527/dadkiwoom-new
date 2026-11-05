@@ -30,6 +30,18 @@ from upload_youtube_shorts import upload_youtube_shorts
 from send_telegram_shorts import send_shorts_to_telegram
 
 def run_challenge_pipeline(auto_upload: bool = False, privacy_status: str = "public") -> str:
+    from virtual_account_ledger import load_ledger
+    ledger = load_ledger()
+    official_start = ledger.get("official_start_date", "2026-11-06")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if today_str < official_start:
+        print("\n" + "=" * 70)
+        print(f"⏸️ [안내] AI 500만원 주식 굴리기 챌린지 공식 시작일은 [{official_start}] 입니다.")
+        print("   금일 17:30 배치는 건너뛰며, 내일부터 Day 1이 공식 시작됩니다.")
+        print("=" * 70 + "\n")
+        return ""
+
     start_time = time.time()
     print("=" * 70)
     print("🤖 [AI 500만원 주식 굴리기 30일 챌린지] 무인 자동화 파이프라인 개시")
@@ -138,3 +150,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_challenge_pipeline(auto_upload=args.upload, privacy_status=args.privacy)
+
