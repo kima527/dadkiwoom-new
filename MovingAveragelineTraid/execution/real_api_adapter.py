@@ -356,10 +356,11 @@ class RealAPIAdapter:
         holdings_dict = {}
         try:
             holdings = self.real_client.get_holdings()
-            for h in holdings:
+            for h in (holdings or []):
                 code = h.get('code', '').lstrip('A')
                 if code:
                     holdings_dict[code] = {
+                        'name': str(h.get('name', '')).strip(),
                         'qty': int(h.get('quantity', h.get('qty', 0))),
                         'buy_price': float(h.get('buy_price', 0)),
                         'current_price': float(h.get('current_price', 0)),

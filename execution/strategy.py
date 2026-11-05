@@ -10,6 +10,18 @@ try:
 except ImportError:
     from execution.indicators import calculate_day3_m_line
 
+def calculate_wma(series: pd.Series, period: int = 60) -> pd.Series:
+    """WMA(가중이동평균) 고속 연산 (120틱 WMA 순차돌파 및 고점 반전 연산)"""
+    if series is None or len(series) < period:
+        return pd.Series(np.nan, index=getattr(series, 'index', None))
+    clean_series = series.ffill().bfill()
+    weights = np.arange(1, period + 1, dtype=float)
+    w_sum = weights.sum()
+    return clean_series.rolling(window=period, min_periods=period).apply(
+        lambda p: np.dot(p, weights) / w_sum,
+        raw=True
+    )
+
 class StrategyState(str, Enum):
     IDLE = "IDLE"                                     # 대기 중 (1차 진입 탐색)
     FIRST_BUY_DONE = "FIRST_BUY_DONE"                 # 1차 매수 완료 (50% 보유)
@@ -37,6 +49,9 @@ class PositionTracker:
     first_buy_qty: int = 0
     second_buy_price: float = 0.0
     second_buy_qty: int = 0
+    second_buy_time: float = 0.0
+    max_profit_pct: float = 0.0
+    bep_locked: bool = False
     reentry_qty: int = 0
     reentry_price: float = 0.0
     last_gate_line: float = 0.0
@@ -180,10 +195,24 @@ class ThemeGate60mStrategy:
             if open_p > 0 and tick_close < open_p:
                 return None
 
+            # ⚡ [120틱 WMA 순차돌파 & 실시간 현재가 반영 검증]: kwargs로 전달된 120틱 데이터에 실시간 tick_close 반영
+            df_120t = kwargs.get('df_120t', None)
+            is_120t_breakout = True
+            if df_120t is not None and len(df_120t) >= 65 and 'close' in df_120t:
+                s_120t = df_120t['close'].astype(float).copy()
+                if tick_close > 0:
+                    s_120t.iloc[-1] = tick_close
+                w1 = float(s_120t.iloc[-1])
+                w20 = float(calculate_wma(s_120t, 20).iloc[-1])
+                w60 = float(calculate_wma(s_120t, 60).iloc[-1])
+                if not np.isnan(w20) and not np.isnan(w60) and w20 > 0 and w60 > 0:
+                    # 1이평선(현재가)이 WMA20 및 WMA60 상단에 위치하여 순차돌파 완성 중인지 확인
+                    is_120t_breakout = (w1 >= w20 * 0.998) and (w1 >= w60 * 0.995)
+
             gate_support = is_gate_up or (not np.isnan(gate_line) and close >= gate_line * 0.990 and low <= gate_line * 1.015)
             gijun_breakout = (not np.isnan(gijun_line) and gijun_line > 0 and tick_close >= gijun_line)
             
-            if is_bull_support and (gate_support or gijun_breakout) and (not np.isnan(gate_line) or not np.isnan(gijun_line)):
+            if is_bull_support and is_120t_breakout and (gate_support or gijun_breakout) and (not np.isnan(gate_line) or not np.isnan(gijun_line)):
                 budget = self.cash * 0.50
                 buy_price = tick_close
                 qty = int(budget // buy_price)
@@ -215,43 +244,49 @@ class ThemeGate60mStrategy:
 
         # ─────────────────────────────────────────────────────────────
         # 2. FIRST_BUY_DONE 상태: 2차 매수 (50% 불타기) 대기
-        # (원칙: 관종 1주 및 1차 매수 물량은 2차 매수가 완료된 FULL_POSITION 상태에서만 매도 2대 원칙 적용)
+        # (원칙: 관종 1주 및 1차 매수 물량은 2차 매수가 완료된 FULL_POSITION 상태에서만 매도 6대 원칙 적용,
+        #  단 1차 매수 후 돌파 실패 시 M/3선 이탈 및 -1.5% 하드 손절 방어선 가동)
         # ─────────────────────────────────────────────────────────────
         elif self.position.state == StrategyState.FIRST_BUY_DONE:
-            # 2차 매수 조건 (분할 매수 및 더블 바잉 방지):
-            # 1) 1차 매수를 관문선 지지로 진입한 경우: 60분봉 테마기준선(M선) 상향 돌파 시 2차 매수
+            # 2차 매수 조건 (분할 매수 및 동일가 더블 바잉 원천 방지):
+            # - 모든 2차 매수는 1차 매수가 대비 최소 +0.5% 이상 수익 구간(tick_close >= first_buy_price * 1.005)에서만 발동
+            # 1) 1차 매수를 관문선 지지로 진입한 경우: 60분봉 테마기준선(M선) 상향 돌파(+0.5% 이상 상승 동반) 시 2차 매수
             # 2) 1차 매수를 이미 기준선 돌파로 진입한 경우: 급등관문고가선(HH) 돌파 또는 1차 매수가 대비 +0.5% 이상 추가 상승 시 불타기
             is_breakout = False
             breakout_target = 0.0
             breakout_name = ""
 
+            min_pyramiding_price = self.position.first_buy_price * 1.005 if self.position.first_buy_price > 0 else 0.0
+            has_min_profit_gap = (tick_close >= min_pyramiding_price)
+
             was_first_bought_at_gijun = (self.position.first_buy_price >= gijun_line * 0.998) if (not np.isnan(gijun_line) and gijun_line > 0) else False
 
             if was_first_bought_at_gijun:
-                # 1차를 기준선 돌파로 진입한 경우: 고가선(HH) 돌파 또는 1차 매수가 대비 +0.5% 추가 상승 시 불타기 (더블 바잉 방지)
-                if not np.isnan(gate_high) and gate_high > self.position.first_buy_price and tick_close >= gate_high:
+                # 1차를 기준선 돌파로 진입한 경우: 고가선(HH) 돌파 또는 1차 매수가 대비 +0.5% 추가 상승 시 불타기
+                if has_min_profit_gap and not np.isnan(gate_high) and gate_high > self.position.first_buy_price and tick_close >= gate_high:
                     is_breakout = True
                     breakout_target = gate_high
                     breakout_name = "급등관문고가선(HH)"
-                elif tick_close >= self.position.first_buy_price * 1.005:
+                elif has_min_profit_gap:
                     is_breakout = True
-                    breakout_target = self.position.first_buy_price * 1.005
+                    breakout_target = min_pyramiding_price
                     breakout_name = "1차매수가 대비 +0.5% 추가상승 돌파"
             else:
-                # 1차를 관문선 바닥에서 진입한 경우: 테마기준선(M선) 도달 및 상향 돌파 시 2차 매수
-                if not np.isnan(gijun_line) and gijun_line > 0 and tick_close >= gijun_line:
+                # 1차를 관문선 바닥에서 진입한 경우: 테마기준선(M선) 상향 돌파 및 1차 매수가 대비 최소 +0.5% 이상 상승 시 2차 매수
+                if has_min_profit_gap and not np.isnan(gijun_line) and gijun_line > 0 and tick_close >= gijun_line:
                     is_breakout = True
                     breakout_target = gijun_line
                     breakout_name = "테마기준선(M선)"
 
             if is_breakout:
                 buy_price = tick_close
-                # 2차 매수 수량: 1차 매수 수량과 1:1 동일 수량 추가 매수 (1차 50% + 2차 50% 분할 원칙)
+                # 2차 매수 수량: 1차 매수 수량과 1:1 동일 수량 추가 매수 (수수료/슬리피지 대비 가용 예수금 99% 안전 버퍼 적용)
+                usable_cash = self.cash * 0.99
                 target_qty = self.position.first_buy_qty if self.position.first_buy_qty > 0 else self.position.total_qty
                 if target_qty <= 0:
-                    target_qty = int((self.cash * 0.50) // buy_price)
-                if self.cash < target_qty * buy_price:
-                    target_qty = int(self.cash // buy_price)
+                    target_qty = int((usable_cash * 0.50) // buy_price)
+                if usable_cash < target_qty * buy_price:
+                    target_qty = int(usable_cash // buy_price)
                     
                 qty = target_qty
                 if qty > 0:
@@ -263,6 +298,11 @@ class ThemeGate60mStrategy:
                     self.position.avg_price = (prev_cost + cost) / self.position.total_qty
                     self.position.second_buy_price = buy_price
                     self.position.second_buy_qty = qty
+                    self.position.second_buy_time = time.time()
+                    # 합산 평단가 대비 현재 수익률로 초기 max_profit_pct 설정 (+0.6% 도달 시 3단계 본절/수익 래칫 자동 장전)
+                    init_full_pnl = ((buy_price - self.position.avg_price) / self.position.avg_price) * 100.0 if self.position.avg_price > 0 else 0.0
+                    self.position.max_profit_pct = max(0.0, init_full_pnl)
+                    self.position.bep_locked = (self.position.max_profit_pct >= 0.6)
                     self.position.entry_time = time.time()
                     self.position.last_gate_high = gate_high
                     self.position.state = StrategyState.FULL_POSITION
@@ -278,6 +318,43 @@ class ThemeGate60mStrategy:
                     )
                     self.trade_history.append(order)
                     return order
+            else:
+                # 🛡️ [1차 매수 진입 후 돌파 실패 손절 방어 (50% 자금 보호)]
+                # 실보유 수량이 1주 초과(실제 1차 매수 체결분)인 경우:
+                # 1) M/3 실시간 3일선 하향 이탈
+                # 2) 1차 매수가 대비 -1.5% 하드 손절선 도달 시 즉시 손절하여 50% 자금 동결 방지
+                if self.position.total_qty > 1:
+                    holding_sec = (time.time() - self.position.entry_time) if self.position.entry_time > 0 else 999.0
+                    is_recent_entry = (holding_sec < 180)
+                    m3_thresh = day3_m_line * 0.995 if is_recent_entry else day3_m_line * 0.998
+                    p_rate = ((tick_close - self.position.first_buy_price) / self.position.first_buy_price) * 100.0 if self.position.first_buy_price > 0 else 0.0
+
+                    is_first_buy_sl = False
+                    sl_reason = ""
+                    if day3_m_line > 0 and tick_close < m3_thresh:
+                        is_first_buy_sl = True
+                        sl_reason = f"1차 매수 후 M/3 수식선({day3_m_line:,.0f}원) 하향 이탈 1차 물량 전량 손절 (체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
+                    elif self.position.first_buy_price > 0 and tick_close <= self.position.first_buy_price * 0.985:
+                        is_first_buy_sl = True
+                        sl_reason = f"1차 매수가 대비 -1.5% 하드 손절선 도달 1차 물량 전량 손절 (체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
+
+                    if is_first_buy_sl:
+                        sell_qty = self.position.total_qty
+                        sell_amt = sell_qty * tick_close
+                        self.cash += sell_amt
+                        self.last_sell_time = time.time()
+                        order = TradeOrder(
+                            timestamp=timestamp,
+                            action="STOP_LOSS",
+                            price=tick_close,
+                            qty=sell_qty,
+                            amount=sell_amt,
+                            reason=sl_reason,
+                            stage="IDLE"
+                        )
+                        self.trade_history.append(order)
+                        self.position = PositionTracker()
+                        return order
 
         # ─────────────────────────────────────────────────────────────
         # 3. FULL_POSITION 상태: 매도 2대 원칙 충족 시 전량 매도 -> 즉시 IDLE 복귀 (재매수 없음)
@@ -292,39 +369,112 @@ class ThemeGate60mStrategy:
             action_type = "TAKE_PROFIT"
             exit_price = tick_close
 
+            # 현재 수익률 계산 및 최고 수익률 추적 (ZeroDivisionError 원천 방어)
+            profit_rate = ((exit_price - self.position.avg_price) / self.position.avg_price) * 100.0 if self.position.avg_price > 0 else 0.0
+            if profit_rate > self.position.max_profit_pct:
+                self.position.max_profit_pct = profit_rate
+
+            # 🔒 [3단계 수익 잠금 래칫 (3-Tier Profit Ratchet) 자동 장전]:
+            # 합산 평단가 대비 +0.60% 이상 도달한 순간부터 무위험 본절락(bep_locked) 영구 활성화
+            # (2차 매수 직후 1~2틱 호가 흔들림에 의한 조기 자가청산 방지 및 수수료+세금 완벽 보존)
+            if self.position.max_profit_pct >= 0.6:
+                self.position.bep_locked = True
+
             # 🛡️ 진입 직후 1~2틱 호가 노이즈 털림 방지 (최소 3분간 노이즈 버퍼 적용):
-            is_recent_entry = (self.position.entry_time > 0 and (time.time() - self.position.entry_time < 180))
+            holding_sec = (time.time() - self.position.entry_time) if self.position.entry_time > 0 else 999.0
+            is_recent_entry = (holding_sec < 180)
             m3_thresh = day3_m_line * 0.995 if is_recent_entry else day3_m_line * 0.998
             gijun_thresh = gijun_line * 0.993 if is_recent_entry else gijun_line * 0.995
 
-            # 매도 원칙:
-            # 1) M=종가+nPreDayClose(1)+nPreDayClose(2); M/3 수식선 이탈 즉시 전량 매도
-            if day3_m_line > 0 and tick_close < m3_thresh:
+            # ─────────────────────────────────────────────────────────────
+            # [통합 매도 6대 원칙 (손실 제로 & 수익 극대화 무결점 락)]
+            # ─────────────────────────────────────────────────────────────
+            
+            # 1) 🔒 [무위험 본절/수익 보존 래칫 (3-Tier Profit Ratchet)]:
+            #    - Tier 1 (+0.60% 도달 시): 평단가 * 1.0023 (+0.23% 거래세+수수료 보존선, 0원 손실 탈출)
+            #    - Tier 2 (+1.20% 도달 시): 평단가 * 1.0060 (+0.60% 확정 순수익 잠금선)
+            sec_buy_elapsed = (time.time() - self.position.second_buy_time) if self.position.second_buy_time > 0 else 999.0
+            if self.position.max_profit_pct >= 1.2:
+                bep_price = self.position.avg_price * 1.0060
+                ratchet_label = "확정수익 보존락(+0.60%)"
+            else:
+                bep_price = self.position.avg_price * 1.0023
+                ratchet_label = "무위험 본절락(+0.23% 수수료보존)"
+
+            if self.position.bep_locked and sec_buy_elapsed >= 60.0 and tick_close <= bep_price:
+                is_sell_signal = True
+                action_type = "TAKE_PROFIT" if profit_rate >= 0.2 else "STOP_LOSS"
+                sell_reason = (
+                    f"🔒 {ratchet_label}(BEP Profit Ratchet) 발동: 전량 매도 "
+                    f"(매수가: {self.position.avg_price:,.0f}원, 보존선: {bep_price:,.0f}원, 체결가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                )
+
+            # 2) 🎯 [Tier 3 고점 대비 트레일링 스탑]: +2.0% 이상 상승 후 고점 대비 -0.7% 되밀릴 시 확정 익절
+            elif self.position.max_profit_pct >= 2.0 and (self.position.max_profit_pct - profit_rate) >= 0.7:
+                is_sell_signal = True
+                action_type = "TAKE_PROFIT"
+                sell_reason = (
+                    f"🎯 고점대비 트레일링 스탑 확정 익절 (최고수익: +{self.position.max_profit_pct:.2f}%, "
+                    f"고점대비 되밀림: -{(self.position.max_profit_pct - profit_rate):.2f}%, 현재수익률: {profit_rate:+.2f}%)"
+                )
+
+            # 3) 📉 [120틱 WMA60 피크 하락반전/데드크로스 청산 (실시간 tick_close 반영)]
+            elif kwargs.get('df_120t') is not None and len(kwargs.get('df_120t')) >= 65 and not is_recent_entry:
+                df_120t = kwargs.get('df_120t')
+                if 'close' in df_120t:
+                    s_120t = df_120t['close'].astype(float).copy()
+                    if tick_close > 0:
+                        s_120t.iloc[-1] = tick_close
+                    w20 = calculate_wma(s_120t, 20)
+                    w60 = calculate_wma(s_120t, 60)
+                    if len(w60.dropna()) >= 3:
+                        slope60 = w60.diff()
+                        pct_slope60 = (slope60 / w60.shift(1)) * 100.0
+                        last_slope = pct_slope60.iloc[-1]
+                        prev_slope = pct_slope60.iloc[-2]
+                        has_peaked = (self.position.max_profit_pct >= 0.6) or (profit_rate >= 0.3)
+                        is_true_turn_down = (prev_slope >= 0.001 and last_slope < -0.002 and has_peaked)
+                        prev_diff = w20.iloc[-2] - w60.iloc[-2]
+                        curr_diff = w20.iloc[-1] - w60.iloc[-1]
+                        is_true_dead_cross = (prev_diff > 0 and curr_diff <= 0 and has_peaked and last_slope <= 0.0)
+
+                        if is_true_turn_down or is_true_dead_cross:
+                            is_sell_signal = True
+                            action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
+                            turn_name = "120틱 WMA60 고점 꺾임(Peak Reversal)" if is_true_turn_down else "120틱 WMA20-60 고점 데드크로스"
+                            sell_reason = (
+                                f"📉 {turn_name} 감지 즉시 전량 청산 "
+                                f"(최고수익: +{self.position.max_profit_pct:.2f}%, 체결가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                            )
+
+            # 4) 🌊 [M/3 실시간 3일선 이탈 매도]: M = 종가+nPreDayClose(1)+nPreDayClose(2); M/3 수식선 이탈 즉시 전량 매도
+            if not is_sell_signal and day3_m_line > 0 and tick_close < m3_thresh:
                 is_sell_signal = True
                 diff_pct = ((tick_close - day3_m_line) / day3_m_line) * 100.0
-                profit_rate = ((exit_price - self.position.avg_price) / self.position.avg_price) * 100.0
                 action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
                 sell_reason = (
-                    f"M/3 수식선({day3_m_line:,.0f}원) 하향 이탈 즉시 전량 매도 "
+                    f"🌊 M/3 수식선({day3_m_line:,.0f}원) 하향 이탈 즉시 전량 매도 "
                     f"(현재가: {exit_price:,.0f}원, M/3대비: {diff_pct:+.2f}%, 수익률: {profit_rate:+.2f}%)"
                 )
-            # 2) 60분봉 기준선 변곡선(M선) 넘지 못할 경우 전량 매도 (하향 이탈 또는 돌파 실패)
-            elif not np.isnan(gijun_line) and gijun_line > 0 and tick_close < gijun_thresh:
+
+            # 5) 🏛️ [60분봉 기준선 변곡선(M선) 하향 이탈 매도]
+            elif not is_sell_signal and not np.isnan(gijun_line) and gijun_line > 0 and tick_close < gijun_thresh:
                 is_sell_signal = True
                 diff_pct = ((tick_close - gijun_line) / gijun_line) * 100.0
-                profit_rate = ((exit_price - self.position.avg_price) / self.position.avg_price) * 100.0
                 action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
                 sell_reason = (
-                    f"60분봉 기준선 변곡선({gijun_line:,.0f}원) 미돌파/하향 이탈 즉시 전량 매도 "
+                    f"🏛️ 60분봉 기준선 변곡선({gijun_line:,.0f}원) 미돌파/하향 이탈 즉시 전량 매도 "
                     f"(현재가: {exit_price:,.0f}원, 기준선대비: {diff_pct:+.2f}%, 수익률: {profit_rate:+.2f}%)"
                 )
-            elif day3_m_line <= 0:
-                # Fallback: 관문선 하향 이탈
-                if not np.isnan(gate_line) and close < gate_line * (1.0 - self.gate_sl_pct):
-                    is_sell_signal = True
-                    action_type = "STOP_LOSS"
-                    exit_price = close
-                    sell_reason = "테마급등관문선 하향 이탈 전량 손절"
+
+            # 6) 🛑 [하드 리스크 방어 손절선 (-1.5%)]: 모든 지표를 초월한 계좌 원천 방어
+            elif not is_sell_signal and tick_close <= self.position.avg_price * 0.985:
+                is_sell_signal = True
+                action_type = "STOP_LOSS"
+                sell_reason = (
+                    f"🛑 하드 손절선(-1.5%) 도달 리스크 차단 전량 손절 "
+                    f"(매수가: {self.position.avg_price:,.0f}원, 현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                )
 
             if is_sell_signal:
                 sell_qty = self.position.total_qty
