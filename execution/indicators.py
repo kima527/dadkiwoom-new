@@ -176,11 +176,21 @@ def calculate_all_60m_indicators(df_60m: pd.DataFrame, p1: int = 5, p2: int = 20
     df = detect_gate_inflection(df)
     return df
 
-def calculate_120t_tema_indicators(df_120t: pd.DataFrame) -> pd.DataFrame:
+def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optional[float] = None) -> pd.DataFrame:
     """
-    120틱 캔들 전용 테마(TEMA) 5, 20, 60, 120 계산 및 정배열/데드크로스 감지
-    - 테마 5 > 20 > 60 > 120 완전 정배열: is_tema_aligned_120t (재매수 타점)
-    - 테마 5 < 20 데드크로스: is_tema_dead_5_20 (모든 매도 일원화 타점)
+    120틱 캔들 상·하단 통합 파동 지표 계산 파이프라인:
+    [상단 차트 지표]
+    - theme_gate (노란색 실선: 급등관문선 = CrossUp(TEMA5, TEMA20) 시점의 TEMA5)
+    - theme_gate_high (검정색 점선: 급등관문고가돌파선 = CrossUp(TEMA5, TEMA20) 시점의 고가 H)
+    - theme_gijun (분홍색 실선: 기준선 = 5>20>60 정배열 종가 K의 피크 변곡선)
+    - gate_up_turnaround (노란색 급등관문선 상승 변곡 여부)
+    [하단 차트 지표]
+    - tema5, tema20, tema60, tema120 (테마 5, 20, 60, 120 이평선)
+    - is_tema120_up (테마120/60 장기선이 하락을 멈추고 상승 전환했는지 여부)
+    - is_yellow_cloud (테마60 >= 테마120 노란색 양운 구름대 구간 여부)
+    - is_tema60_120_gc (테마60이 테마120을 상향 돌파하는 골든크로스 발생 여부)
+    - is_tema_aligned_120t (테마 5 > 20 > 60 > 120 완전 정배열)
+    - is_tema_dead_5_20 (테마 5 < 20 데드크로스/꺾임)
     """
     if df_120t is None or df_120t.empty:
         return pd.DataFrame()
@@ -190,11 +200,46 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
         
     df['close'] = pd.to_numeric(df['close'], errors='coerce').ffill().bfill()
-    df['tema5'] = calculate_tema(df['close'], 5)
-    df['tema20'] = calculate_tema(df['close'], 20)
+    for col in ['open', 'high', 'low']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').ffill().bfill()
+        else:
+            df[col] = df['close']
+
+    # 실시간 현재가(current_price)가 전달된 경우 마지막 120틱 봉에 즉시 반영
+    if current_price is not None and float(current_price) > 0 and len(df) > 0:
+        cp = float(current_price)
+        last_idx = df.index[-1]
+        df.loc[last_idx, 'close'] = cp
+        if cp > float(df.loc[last_idx, 'high']):
+            df.loc[last_idx, 'high'] = cp
+        if cp < float(df.loc[last_idx, 'low']):
+            df.loc[last_idx, 'low'] = cp
+
+    # 1) 상단 차트 지표: 노란색 급등관문선(theme_gate), 검정점선 급등관문고가선(theme_gate_high), 분홍색 기준선(theme_gijun)
+    df = calculate_theme_gate_line(df, p1=5, p2=20)
+    df = calculate_theme_gate_high(df, p1=5, p2=20)
+    df = calculate_theme_gijun_line(df, p_fast=5, p_mid=20, p_slow=60)
+    df = detect_gate_inflection(df)
+
+    # 2) 하단 차트 지표: 테마 5, 20, 60, 120 및 양운(노란 구름대) / 기울기 변곡
+    df['tema5'] = df['tema_fast']
+    df['tema20'] = df['tema_slow']
     df['tema60'] = calculate_tema(df['close'], 60)
     df['tema120'] = calculate_tema(df['close'], 120)
-    
+
+    df['tema60_slope'] = df['tema60'].diff()
+    df['tema120_slope'] = df['tema120'].diff()
+
+    # 테마120(또는 테마60)이 하락을 멈추고 상승으로 돌아섰는지 여부
+    df['is_tema120_up'] = (df['tema120_slope'] >= -0.0001) | (
+        (df['tema60_slope'] > 0) & (df['tema5'] >= df['tema20'])
+    )
+
+    # 테마60-120 골든크로스 및 노란색 양운 구름대(tema60 >= tema120)
+    df['is_yellow_cloud'] = df['tema60'] >= df['tema120']
+    df['is_tema60_120_gc'] = (df['tema60'].shift(1) <= df['tema120'].shift(1)) & (df['tema60'] > df['tema120'])
+
     # 5 > 20 > 60 > 120 완전 정배열
     df['is_tema_aligned_120t'] = (
         (df['tema5'] > df['tema20']) & 
@@ -202,7 +247,7 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame) -> pd.DataFrame:
         (df['tema60'] > df['tema120'])
     )
     
-    # 5 < 20 매도 신호
+    # 5 < 20 데드크로스/꺾임 신호
     df['is_tema_dead_5_20'] = df['tema5'] < df['tema20']
     
     return df

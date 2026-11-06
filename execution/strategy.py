@@ -6,9 +6,9 @@ import pandas as pd
 import numpy as np
 
 try:
-    from indicators import calculate_day3_m_line
+    from indicators import calculate_day3_m_line, calculate_120t_tema_indicators
 except ImportError:
-    from execution.indicators import calculate_day3_m_line
+    from execution.indicators import calculate_day3_m_line, calculate_120t_tema_indicators
 
 def calculate_wma(series: pd.Series, period: int = 60) -> pd.Series:
     """WMA(가중이동평균) 고속 연산 (120틱 WMA 순차돌파 및 고점 반전 연산)"""
@@ -57,6 +57,11 @@ class PositionTracker:
     last_gate_line: float = 0.0
     last_gate_high: float = 0.0
     last_gijun_line: float = 0.0
+    entry_mode: str = ""                # "GATE_SUPPORT" (노란선 1차) or "HIGH_BREAKOUT" (검정점선/기준선 1차)
+    first_gijun_cleared: bool = False   # 1번째 분홍색 기준선 돌파 완료 여부
+    cleared_gijun_price: float = 0.0    # 돌파 완료한 1번째 분홍색 기준선 가격
+    second_gijun_price: float = 0.0     # 고점에서 새로 형성된 2번째 분홍색 기준선 가격
+    touched_first_gijun: bool = False   # 1번째 분홍색 기준선 부근(-0.8% 이내) 도달 여부
     reentry_count: int = 0
     base_account_qty: int = 0
     entry_time: float = 0.0
@@ -127,7 +132,53 @@ class ThemeGate60mStrategy:
         else:
             m_val = day3_m_line * 3.0
 
-        
+        # ⚡ [120틱 상·하단 통합 파동 지표 연산]:
+        # 상단: 노란색 급등관문선(gate_120t) + 검정점선 급등관문고가선(gate_high_120t) + 분홍색 기준선(gijun_120t)
+        # 하단: 테마 5, 20, 60, 120 + 테마120 상승변곡(is_tema120_up) + 노란 양운(is_yellow_cloud) + 테마60-120 골든크로스
+        df_120t = kwargs.get('df_120t', None)
+        has_120t_wave = False
+        gate_120t = np.nan
+        gate_high_120t = np.nan
+        gijun_120t = np.nan
+        is_gate_up_120t = False
+        is_tema120_up = True
+        is_yellow_cloud_120t = False
+        is_tema60_120_gc_120t = False
+        is_tema5_20_bull_120t = True
+        is_tema_dead_5_20_120t = False
+        upper_shadow_ratio_120t = 0.0
+
+        if df_120t is not None and not df_120t.empty and len(df_120t) >= 25 and 'close' in df_120t:
+            df_120t_calc = calculate_120t_tema_indicators(df_120t, current_price=tick_close)
+            if not df_120t_calc.empty:
+                has_120t_wave = True
+                last_120t = df_120t_calc.iloc[-1]
+                gate_120t = float(last_120t.get('theme_gate', np.nan))
+                gate_high_120t = float(last_120t.get('theme_gate_high', np.nan))
+                gijun_120t = float(last_120t.get('theme_gijun', np.nan))
+                is_gate_up_120t = bool(last_120t.get('gate_up_turnaround', False))
+                is_tema120_up = bool(last_120t.get('is_tema120_up', True))
+                is_yellow_cloud_120t = bool(last_120t.get('is_yellow_cloud', False))
+                # 최근 3틱봉 이내 테마60-120 골든크로스 발생 또는 노란 양운 유지 여부
+                recent_gc = bool(df_120t_calc['is_tema60_120_gc'].tail(3).any()) if 'is_tema60_120_gc' in df_120t_calc else False
+                is_tema60_120_gc_120t = recent_gc or is_yellow_cloud_120t
+                t5 = float(last_120t.get('tema5', np.nan))
+                t20 = float(last_120t.get('tema20', np.nan))
+                if not np.isnan(t5) and not np.isnan(t20) and t20 > 0:
+                    is_tema5_20_bull_120t = (t5 >= t20 * 0.998)
+                    is_tema_dead_5_20_120t = (t5 < t20 * 0.999)
+                h_120 = float(last_120t.get('high', tick_close))
+                l_120 = float(last_120t.get('low', tick_close))
+                o_120 = float(last_120t.get('open', tick_close))
+                rng_120 = max(h_120 - l_120, 1.0)
+                upper_shadow_ratio_120t = max(h_120 - max(o_120, tick_close), 0.0) / rng_120
+
+        # 유효 관문선(노란선) · 관문고가선(검정점선) · 기준선(분홍선) 결정 (120틱 우선, 부재 시 60분봉 연동)
+        active_gate = gate_120t if (has_120t_wave and not np.isnan(gate_120t) and gate_120t > 0) else gate_line
+        active_gate_high = gate_high_120t if (has_120t_wave and not np.isnan(gate_high_120t) and gate_high_120t > 0) else gate_high
+        active_gijun = gijun_120t if (has_120t_wave and not np.isnan(gijun_120t) and gijun_120t > 0) else gijun_line
+        active_gate_up = is_gate_up_120t or is_gate_up
+
         # ─────────────────────────────────────────────────────────────
         # 0. 최우선 규칙: 일봉 기준 테마 5-20 데드크로스 발생 시 전량 청산 및 종료
         # ─────────────────────────────────────────────────────────────
@@ -163,10 +214,11 @@ class ThemeGate60mStrategy:
                 return None
 
         # ─────────────────────────────────────────────────────────────
-        # 1. IDLE 상태: 1차 매수 (예수금 50%)
-        # 승률 조건:
-        # 1) 60분봉 완전 정배열(5>20>60) 또는 20선(검정선) 상단 지지 안착 (매물대를 발밑에 장착)
-        # 2) 테마급등관문선 상승변곡 또는 관문선 바닥 지지 확인
+        # 1. IDLE 상태: 1차 매수 (예수금 50% — 발목 선취매)
+        # [정석 공식]:
+        # - 정석 1차(일반장 90%): 노란색 급등관문선(active_gate) 상승변곡 또는 바닥 지지 안착 시 1차 50% 매수
+        #   (이후 검정 점선 급등관문고가돌파선 확실한 돌파 확인 시 2차 50% 불타기!)
+        # - 강세 예외 1차(강한 상승 10%): 테마120 상승 전환(is_tema120_up) + 검정 점선(급등관문고가선) 돌파 시 1차 50% 매수
         # ─────────────────────────────────────────────────────────────
         sma5 = row.get('sma5', np.nan)
         sma20 = row.get('sma20', np.nan)
@@ -185,8 +237,6 @@ class ThemeGate60mStrategy:
                 return None
 
             # 🛡️ [매수 필수 방어벽]: M/3 실시간 3일선 상단 지지 확인 (M/3선 하회 시 매수 절대 차단)
-            # 주가가 M/3선 아래에 있는 상태에서 매수하면, 진입 직후 1초만에 M/3선 이탈 매도 조건이 발동하여
-            # '매수 후 즉시 매도(Whipsaw)'가 발생하므로 원천 방지
             if day3_m_line > 0 and tick_close < day3_m_line:
                 return None
 
@@ -201,12 +251,11 @@ class ThemeGate60mStrategy:
             if (upper_shadow / c_range) > 0.45:
                 return None
 
-            # 🛡️ [기준선 과열 추격매수 차단]: 기준선 대비 +4.5% 초과 이격 과열 구간에서는 신규 1차 추격매수 원천 차단
+            # 🛡️ [기준선 과열 추격매수 차단]: 60분봉 기준선 대비 +4.5% 초과 이격 과열 구간에서는 신규 1차 추격매수 원천 차단
             if not np.isnan(gijun_line) and gijun_line > 0 and tick_close > gijun_line * 1.045:
                 return None
 
-            # ⚡ [120틱 WMA 순차돌파 & 실시간 현재가 반영 검증]: kwargs로 전달된 120틱 데이터에 실시간 tick_close 반영
-            df_120t = kwargs.get('df_120t', None)
+            # ⚡ [120틱 WMA/TEMA 순차돌파 & 실시간 현재가 반영 검증]
             is_120t_breakout = True
             if df_120t is not None and len(df_120t) >= 65 and 'close' in df_120t:
                 s_120t = df_120t['close'].astype(float).copy()
@@ -216,18 +265,43 @@ class ThemeGate60mStrategy:
                 w20 = float(calculate_wma(s_120t, 20).iloc[-1])
                 w60 = float(calculate_wma(s_120t, 60).iloc[-1])
                 if not np.isnan(w20) and not np.isnan(w60) and w20 > 0 and w60 > 0:
-                    # 1이평선(현재가)이 WMA20 및 WMA60 상단에 위치하여 순차돌파 완성 중인지 확인
-                    is_120t_breakout = (w1 >= w20 * 0.998) and (w1 >= w60 * 0.995)
+                    is_120t_breakout = ((w1 >= w20 * 0.998) and (w1 >= w60 * 0.995)) or (is_tema5_20_bull_120t and is_tema120_up)
 
-            gate_support = is_gate_up or (not np.isnan(gate_line) and close >= gate_line * 0.990 and low <= gate_line * 1.015)
-            # 기준선 돌파는 초기 맥점 구간(0.0% ~ +3.5% 이내)만 진성 돌파 타점으로 인정 (고점 추격 방지)
+            # 🎯 [정석 1차 타점 A: 노란색 급등관문선(theme_gate) 지지/상승변곡 선취매]
+            # - 120틱 노란색 관문선 지지 또는 60분봉 노란색 관문선 지지 (발목 타점)
+            gate_support_120t = (
+                has_120t_wave
+                and not np.isnan(gate_120t)
+                and gate_120t > 0
+                and (gate_120t * 0.992 <= tick_close <= gate_120t * 1.020)
+                and is_tema5_20_bull_120t
+            )
+            gate_support_60m = is_gate_up or (
+                not np.isnan(gate_line)
+                and gate_line > 0
+                and close >= gate_line * 0.990
+                and low <= gate_line * 1.018
+            )
+            is_yellow_gate_buy = gate_support_120t or gate_support_60m
+
+            # 🚀 [강세 예외 1차 타점 B: 120틱 테마120 상승변곡 + 검정 점선(급등관문고가선) 직행 돌파 또는 기준선 초기 돌파]
+            gate_high_breakout_120t = (
+                has_120t_wave
+                and is_tema120_up
+                and is_tema5_20_bull_120t
+                and upper_shadow_ratio_120t <= 0.35
+                and not np.isnan(gate_high_120t)
+                and gate_high_120t > 0
+                and (gate_high_120t <= tick_close <= gate_high_120t * 1.025)
+            )
             gijun_breakout = (
                 not np.isnan(gijun_line)
                 and gijun_line > 0
                 and (gijun_line <= tick_close <= gijun_line * 1.035)
             )
+            is_strong_breakout_buy = gate_high_breakout_120t or gijun_breakout
             
-            if is_bull_support and is_120t_breakout and (gate_support or gijun_breakout) and (not np.isnan(gate_line) or not np.isnan(gijun_line)):
+            if is_bull_support and is_120t_breakout and (is_yellow_gate_buy or is_strong_breakout_buy):
                 budget = self.cash * 0.50
                 buy_price = tick_close
                 qty = int(budget // buy_price)
@@ -239,12 +313,31 @@ class ThemeGate60mStrategy:
                     self.position.first_buy_price = buy_price
                     self.position.first_buy_qty = qty
                     self.position.entry_time = time.time()
-                    self.position.last_gate_line = gate_line
-                    self.position.last_gate_high = gate_high
-                    self.position.last_gijun_line = gijun_line
+                    self.position.last_gate_line = active_gate
+                    self.position.last_gate_high = active_gate_high
+                    self.position.last_gijun_line = active_gijun
                     self.position.state = StrategyState.FIRST_BUY_DONE
-                    
-                    trigger_str = f"기준선(M선 {gijun_line:,.0f}원) 상향 통과" if gijun_breakout else f"관문선 변곡/지지({gate_line:,.0f}원)"
+
+                    # 진입 시점에 이미 1번째 분홍 기준선 위인지 여부 기록
+                    if not np.isnan(active_gijun) and active_gijun > 0 and buy_price >= active_gijun * 1.001:
+                        self.position.first_gijun_cleared = True
+                        self.position.cleared_gijun_price = active_gijun
+                    else:
+                        self.position.first_gijun_cleared = False
+                        self.position.cleared_gijun_price = active_gijun if (not np.isnan(active_gijun) and active_gijun > 0) else 0.0
+                    self.position.second_gijun_price = 0.0
+
+                    if is_yellow_gate_buy:
+                        self.position.entry_mode = "GATE_SUPPORT"
+                        ref_g = gate_120t if gate_support_120t else gate_line
+                        trigger_str = f"노란색 급등관문선({ref_g:,.0f}원) 바닥지지/변곡 (정석 1차 ➔ 검정점선 돌파 시 2차 대기)"
+                    elif gate_high_breakout_120t:
+                        self.position.entry_mode = "HIGH_BREAKOUT"
+                        trigger_str = f"120틱 테마120 상승변곡 + 검정점선 급등관문고가선({gate_high_120t:,.0f}원) 돌파"
+                    else:
+                        self.position.entry_mode = "HIGH_BREAKOUT"
+                        trigger_str = f"분홍 기준선({gijun_line:,.0f}원) 초기 맥점 돌파"
+
                     order = TradeOrder(
                         timestamp=timestamp,
                         action="BUY_1",
@@ -258,7 +351,8 @@ class ThemeGate60mStrategy:
                     return order
 
         # ─────────────────────────────────────────────────────────────
-        # 2. FIRST_BUY_DONE 상태: 2차 매수 (50% 불타기) 및 1차 물량 3단계 수익 잠금(Ratchet) 방어
+        # 2. FIRST_BUY_DONE 상태: 2차 매수 (50% 불타기 — 검정 점선 급등관문고가돌파선 확실한 돌파 확인)
+        #    및 1차 물량 3단계 수익 잠금(Ratchet) 방어
         # ─────────────────────────────────────────────────────────────
         elif self.position.state == StrategyState.FIRST_BUY_DONE:
             # 1차 매수분 실시간 최고 수익률 추적 및 3단계 수익 잠금 래칫 활성화
@@ -269,43 +363,54 @@ class ThemeGate60mStrategy:
             if self.position.max_profit_pct >= 0.8:
                 self.position.bep_locked = True
 
-            # 2차 매수 조건 (분할 매수 및 동일가 더블 바잉 원천 방지):
-            # - 모든 2차 매수는 1차 매수가 대비 최소 +0.5% 이상 수익 구간에서만 발동
-            # 1) 1차 매수를 관문선 지지로 진입한 경우: 테마기준선(M선) 돌파(+0.5%+) 또는 고가선(HH)/강세 모멘텀(+0.8%+) 돌파 시 2차 불타기
-            # 2) 1차 매수를 기준선 돌파로 진입한 경우: 급등관문고가선(HH) 돌파 또는 1차 매수가 대비 +0.5% 이상 추가 상승 시 불타기
+            # 1번째/2번째 분홍 기준선 상태 실시간 갱신
+            if not np.isnan(active_gijun) and active_gijun > 0:
+                if not self.position.first_gijun_cleared and tick_close >= active_gijun * 1.001:
+                    self.position.first_gijun_cleared = True
+                    self.position.cleared_gijun_price = active_gijun
+                elif self.position.first_gijun_cleared and active_gijun > self.position.cleared_gijun_price * 1.002:
+                    self.position.second_gijun_price = active_gijun
+
+            # 2차 매수 조건 (정석: 노란색 급등관문선 1차 매수 후 ➔ 검정 점선 급등관문고가돌파선 확실한 돌파 확인 시 2차 매수!):
+            # - 확실한 돌파 기준: 양봉 유지(윗꼬리 35% 이하) + 단기 테마 정배열(TEMA5 >= TEMA20) + 최소 수익 갭(+0.4%~+0.5%)
             is_breakout = False
             breakout_target = 0.0
             breakout_name = ""
 
-            min_pyramiding_price = base_p1 * 1.005 if base_p1 > 0 else 0.0
-            strong_pyramiding_price = base_p1 * 1.008 if base_p1 > 0 else 0.0
-            has_min_profit_gap = (tick_close >= min_pyramiding_price)
-            has_strong_profit_gap = (tick_close >= strong_pyramiding_price)
+            min_gate_high_gap = (tick_close >= base_p1 * 1.004) if base_p1 > 0 else False
+            min_pyramiding_gap = (tick_close >= base_p1 * 1.005) if base_p1 > 0 else False
+            is_solid_candle = (upper_shadow_ratio_120t <= 0.35) and is_tema5_20_bull_120t
 
-            was_first_bought_at_gijun = (base_p1 >= gijun_line * 0.998) if (not np.isnan(gijun_line) and gijun_line > 0) else False
+            # 유효 검정 점선(급등관문고가돌파선): 120틱 검정점선 우선, 60분봉 검정점선 병행
+            cand_gate_high = gate_high_120t if (has_120t_wave and not np.isnan(gate_high_120t) and gate_high_120t > base_p1) else gate_high
 
-            if was_first_bought_at_gijun:
-                # 1차를 기준선 돌파로 진입한 경우: 고가선(HH) 돌파 또는 1차 매수가 대비 +0.5% 추가 상승 시 불타기
-                if has_min_profit_gap and not np.isnan(gate_high) and gate_high > base_p1 and tick_close >= gate_high:
+            if self.position.entry_mode == "GATE_SUPPORT" or (not np.isnan(cand_gate_high) and cand_gate_high > base_p1):
+                # 🥇 [정석 2차 불타기 1순위]: 노란색 급등관문선에서 1차 매수 후, 검정 점선(급등관문고가돌파선)을 확실하게 돌파 안착할 때!
+                if min_gate_high_gap and is_solid_candle and not np.isnan(cand_gate_high) and cand_gate_high > 0 and tick_close >= cand_gate_high:
                     is_breakout = True
-                    breakout_target = gate_high
-                    breakout_name = "급등관문고가선(HH)"
-                elif has_min_profit_gap:
+                    breakout_target = cand_gate_high
+                    breakout_name = "검정점선 급등관문고가돌파선(HH) 확실한 돌파"
+                # 🥈 [정석 2차 불타기 2순위]: 120틱 테마60 > 테마120 골든크로스(하단 노란 양운 전환)와 함께 +0.5% 이상 상승 확정 시
+                elif min_pyramiding_gap and is_solid_candle and is_tema60_120_gc_120t:
                     is_breakout = True
-                    breakout_target = min_pyramiding_price
-                    breakout_name = "1차매수가 대비 +0.5% 추가상승 돌파"
+                    breakout_target = base_p1 * 1.005
+                    breakout_name = "120틱 테마60-120 골든크로스(노란 양운 전환) 돌파"
+                # 🥉 [정석 2차 불타기 3순위]: 1번째 분홍색 기준선(M선) 상향 돌파 시
+                elif min_pyramiding_gap and not np.isnan(active_gijun) and active_gijun > 0 and tick_close >= active_gijun:
+                    is_breakout = True
+                    breakout_target = active_gijun
+                    breakout_name = "1번째 분홍 기준선(M선) 돌파"
             else:
-                # 1차를 관문선 바닥에서 진입한 경우:
-                # (A) 테마기준선(M선) 상향 돌파(+0.5% 이상 수익 동반) 또는
-                # (B) 기준선 도달 전이라도 +0.8% 이상 강세 모멘텀(고가선 돌파 또는 M/3·20선 위 양봉 가속) 발생 시 2차 불타기 허용
-                if has_min_profit_gap and not np.isnan(gijun_line) and gijun_line > 0 and tick_close >= gijun_line:
+                # [강세 예외 진입(검정점선/기준선 1차) 후 2차 불타기]:
+                # 테마60-120 골든크로스(노란 양운) 또는 1번째 분홍 기준선 돌파(+0.5% 이상 추가 상승 동반)
+                if min_pyramiding_gap and is_solid_candle and not np.isnan(active_gijun) and active_gijun > base_p1 and tick_close >= active_gijun:
                     is_breakout = True
-                    breakout_target = gijun_line
-                    breakout_name = "테마기준선(M선)"
-                elif has_strong_profit_gap and not np.isnan(gate_high) and gate_high > 0 and tick_close >= gate_high:
+                    breakout_target = active_gijun
+                    breakout_name = "1번째 분홍 기준선(M선) 돌파"
+                elif min_pyramiding_gap and is_solid_candle and is_tema60_120_gc_120t:
                     is_breakout = True
-                    breakout_target = gate_high
-                    breakout_name = "관문고가선(HH) 강세돌파(+0.8%+)"
+                    breakout_target = base_p1 * 1.005
+                    breakout_name = "120틱 테마60-120 골든크로스(노란 양운) 가속 돌파"
 
             if is_breakout:
                 buy_price = tick_close
@@ -333,7 +438,7 @@ class ThemeGate60mStrategy:
                     self.position.max_profit_pct = max(0.0, init_full_pnl)
                     self.position.bep_locked = (self.position.max_profit_pct >= 0.6)
                     self.position.entry_time = time.time()
-                    self.position.last_gate_high = gate_high
+                    self.position.last_gate_high = active_gate_high
                     self.position.state = StrategyState.FULL_POSITION
                     
                     order = TradeOrder(
@@ -342,14 +447,14 @@ class ThemeGate60mStrategy:
                         price=buy_price,
                         qty=qty,
                         amount=cost,
-                        reason=f"{breakout_name} 상향 돌파 2차 50% 추가 매수 (돌파선: {breakout_target:,.0f}원, 체결가: {buy_price:,.0f}원)",
+                        reason=f"{breakout_name} 2차 50% 불타기 매수 완료 (돌파선: {breakout_target:,.0f}원, 체결가: {buy_price:,.0f}원)",
                         stage="FULL_POSITION"
                     )
                     self.trade_history.append(order)
                     return order
             else:
-                # 🛡️ [1차 매수 물량(50%) 전용 3단계 수익 잠금(Ratchet) + 손절 방어]:
-                # 2차 매수 타점 도달 전 꺾이더라도 이미 확보한 수익(+0.8% 본절락 / +1.2% 수익락 / +2.0% 트레일링 스탑)을 완벽 보존!
+                # 🛡️ [1차 매수 물량(50%) 전용 3단계 수익 잠금(Ratchet) + 노란색 관문선/M3선 손절 방어]:
+                # 검정 점선(급등관문고가돌파선)을 뚫지 못하고 무너지더라도 50% 가벼운 비중 상태에서 신속히 수익 보존 또는 짧은 손절!
                 if self.position.total_qty > 1:
                     holding_sec = (time.time() - self.position.entry_time) if self.position.entry_time > 0 else 999.0
                     is_recent_entry = (holding_sec < 180)
@@ -384,12 +489,16 @@ class ThemeGate60mStrategy:
                                 f"체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
                             )
 
-                    # 3) 🌊 M/3 실시간 3일선 하향 이탈 또는 🛑 -1.5% 하드 손절
+                    # 3) 🌊 M/3 실시간 3일선 하향 이탈, 노란색 급등관문선 하향 이탈(-1.2%), 또는 🛑 -1.5% 하드 손절
                     if not is_first_exit:
                         if day3_m_line > 0 and tick_close < m3_thresh:
                             is_first_exit = True
                             exit_action = "TAKE_PROFIT" if p_rate >= 0 else "STOP_LOSS"
                             sl_reason = f"1차 매수 후 M/3 수식선({day3_m_line:,.0f}원) 하향 이탈 1차 물량 전량 청산 (체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
+                        elif not is_recent_entry and not np.isnan(active_gate) and active_gate > 0 and tick_close < active_gate * 0.988:
+                            is_first_exit = True
+                            exit_action = "TAKE_PROFIT" if p_rate >= 0 else "STOP_LOSS"
+                            sl_reason = f"1차 매수 후 노란색 급등관문선({active_gate:,.0f}원) 지지 실패/검정점선 미돌파 전량 청산 (체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
                         elif base_p1 > 0 and tick_close <= base_p1 * 0.985:
                             is_first_exit = True
                             exit_action = "STOP_LOSS"
@@ -414,7 +523,7 @@ class ThemeGate60mStrategy:
                         return order
 
         # ─────────────────────────────────────────────────────────────
-        # 3. FULL_POSITION 상태: 매도 2대 원칙 충족 시 전량 매도 -> 즉시 IDLE 복귀 (재매수 없음)
+        # 3. FULL_POSITION 상태: 1번째·2번째 분홍 기준선 파동 익절 법칙 + 6대 안전망 전량 매도
         # ─────────────────────────────────────────────────────────────
         elif self.position.state == StrategyState.FULL_POSITION:
             # 🛡️ 관종 1주 매도 절대 차단: 실보유 수량이 1주 이하인 종목은 2차 매수가 완료된 것이 아니므로 매도 신호 차단
@@ -432,8 +541,6 @@ class ThemeGate60mStrategy:
                 self.position.max_profit_pct = profit_rate
 
             # 🔒 [3단계 수익 잠금 래칫 (3-Tier Profit Ratchet) 자동 장전]:
-            # 합산 평단가 대비 +0.60% 이상 도달한 순간부터 무위험 본절락(bep_locked) 영구 활성화
-            # (2차 매수 직후 1~2틱 호가 흔들림에 의한 조기 자가청산 방지 및 수수료+세금 완벽 보존)
             if self.position.max_profit_pct >= 0.6:
                 self.position.bep_locked = True
 
@@ -443,10 +550,57 @@ class ThemeGate60mStrategy:
             m3_thresh = day3_m_line * 0.995 if is_recent_entry else day3_m_line * 0.998
             gijun_thresh = gijun_line * 0.993 if is_recent_entry else gijun_line * 0.995
 
+            # 📈 [1번째 분홍 기준선 돌파 & 2번째 분홍 기준선 생성 추적]:
+            if not np.isnan(active_gijun) and active_gijun > 0:
+                if not self.position.first_gijun_cleared:
+                    if tick_close >= active_gijun * 0.992:
+                        self.position.touched_first_gijun = True
+                    if tick_close >= active_gijun * 1.001:
+                        self.position.first_gijun_cleared = True
+                        self.position.cleared_gijun_price = active_gijun
+                else:
+                    # 이미 1번째 분홍 기준선을 돌파한 뒤 고점에서 새로운(더 높은) 2번째 분홍 기준선이 형성된 경우 기록!
+                    if active_gijun > self.position.cleared_gijun_price * 1.002:
+                        self.position.second_gijun_price = active_gijun
+
             # ─────────────────────────────────────────────────────────────
-            # [통합 매도 6대 원칙 (손실 제로 & 수익 극대화 무결점 락)]
+            # [통합 매도 원칙: 2번째/1번째 분홍 기준선 어깨 익절 + 6대 무결점 방어망]
             # ─────────────────────────────────────────────────────────────
             
+            # 0-A) 🏆 [2번째 분홍색 기준선 돌파 실패(쌍봉 저항) 어깨 전량 익절]:
+            #      1번째 기준선 돌파 후 고점에 새로 형성된 2번째 분홍 기준선(second_gijun_price)을 넘지 못하고
+            #      120틱 테마5 < 테마20 데드크로스(또는 고점 대비 -0.5%p 되밀림)가 발생할 때 최고점 어깨에서 즉시 전량 익절!
+            if (
+                self.position.second_gijun_price > 0
+                and tick_close <= self.position.second_gijun_price * 1.002
+                and (is_tema_dead_5_20_120t or (self.position.max_profit_pct - profit_rate) >= 0.5)
+            ):
+                is_sell_signal = True
+                action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
+                sell_reason = (
+                    f"🏆 [2번째 분홍 기준선({self.position.second_gijun_price:,.0f}원) 돌파 실패 & 테마 꺾임] "
+                    f"어깨 최고점 전량 익절 (1번째 돌파선: {self.position.cleared_gijun_price:,.0f}원, "
+                    f"현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                )
+
+            # 0-B) 🏛️ [1번째 분홍색 기준선 저항 돌파 실패 익절/청산]:
+            #      바닥(노란선+검정점선) 매집 후 1번째 분홍 기준선 부근까지 도달(touched_first_gijun)했으나
+            #      돌파하지 못하고 테마5 < 테마20 데드크로스와 함께 기준선 대비 -0.7% 아래로 꺾일 때 즉시 전량 청산!
+            elif (
+                not self.position.first_gijun_cleared
+                and self.position.touched_first_gijun
+                and not np.isnan(active_gijun)
+                and active_gijun > 0
+                and tick_close < active_gijun * 0.993
+                and is_tema_dead_5_20_120t
+            ):
+                is_sell_signal = True
+                action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
+                sell_reason = (
+                    f"🏛️ [1번째 분홍 기준선({active_gijun:,.0f}원) 저항 돌파 실패 & 테마 5-20 꺾임] "
+                    f"즉시 전량 청산 (현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                )
+
             # 1) 🔒 [무위험 본절/수익 보존 래칫 (3-Tier Profit Ratchet)]:
             #    - Tier 1 (+0.60% 도달 시): 평단가 * 1.0023 (+0.23% 거래세+수수료 보존선, 0원 손실 탈출)
             #    - Tier 2 (+1.20% 도달 시): 평단가 * 1.0060 (+0.60% 확정 순수익 잠금선)
@@ -458,7 +612,7 @@ class ThemeGate60mStrategy:
                 bep_price = self.position.avg_price * 1.0023
                 ratchet_label = "무위험 본절락(+0.23% 수수료보존)"
 
-            if self.position.bep_locked and sec_buy_elapsed >= 60.0 and tick_close <= bep_price:
+            if not is_sell_signal and self.position.bep_locked and sec_buy_elapsed >= 60.0 and tick_close <= bep_price:
                 is_sell_signal = True
                 action_type = "TAKE_PROFIT" if profit_rate >= 0.2 else "STOP_LOSS"
                 sell_reason = (
@@ -467,7 +621,7 @@ class ThemeGate60mStrategy:
                 )
 
             # 2) 🎯 [Tier 3 고점 대비 트레일링 스탑]: +2.0% 이상 상승 후 고점 대비 -0.7% 되밀릴 시 확정 익절
-            elif self.position.max_profit_pct >= 2.0 and (self.position.max_profit_pct - profit_rate) >= 0.7:
+            elif not is_sell_signal and self.position.max_profit_pct >= 2.0 and (self.position.max_profit_pct - profit_rate) >= 0.7:
                 is_sell_signal = True
                 action_type = "TAKE_PROFIT"
                 sell_reason = (
@@ -476,8 +630,7 @@ class ThemeGate60mStrategy:
                 )
 
             # 3) 📉 [120틱 WMA60 피크 하락반전/데드크로스 청산 (실시간 tick_close 반영)]
-            elif kwargs.get('df_120t') is not None and len(kwargs.get('df_120t')) >= 65 and not is_recent_entry:
-                df_120t = kwargs.get('df_120t')
+            elif not is_sell_signal and kwargs.get('df_120t') is not None and len(kwargs.get('df_120t')) >= 65 and not is_recent_entry:
                 if 'close' in df_120t:
                     s_120t = df_120t['close'].astype(float).copy()
                     if tick_close > 0:
@@ -514,18 +667,34 @@ class ThemeGate60mStrategy:
                     f"(현재가: {exit_price:,.0f}원, M/3대비: {diff_pct:+.2f}%, 수익률: {profit_rate:+.2f}%)"
                 )
 
-            # 5) 🏛️ [60분봉 기준선 변곡선(M선) 하향 이탈 매도]
-            elif not is_sell_signal and not np.isnan(gijun_line) and gijun_line > 0 and tick_close < gijun_thresh:
-                is_sell_signal = True
-                diff_pct = ((tick_close - gijun_line) / gijun_line) * 100.0
-                action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
-                sell_reason = (
-                    f"🏛️ 60분봉 기준선 변곡선({gijun_line:,.0f}원) 미돌파/하향 이탈 즉시 전량 매도 "
-                    f"(현재가: {exit_price:,.0f}원, 기준선대비: {diff_pct:+.2f}%, 수익률: {profit_rate:+.2f}%)"
-                )
+            # 5) 🏛️ [1번째 기준선 돌파 후 재이탈 또는 노란색 급등관문선 하향 이탈 매도]
+            elif not is_sell_signal:
+                if self.position.first_gijun_cleared and self.position.cleared_gijun_price > 0 and tick_close < self.position.cleared_gijun_price * 0.993:
+                    is_sell_signal = True
+                    action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
+                    sell_reason = (
+                        f"🏛️ 돌파 완료한 1번째 분홍 기준선({self.position.cleared_gijun_price:,.0f}원) 하향 이탈 즉시 전량 매도 "
+                        f"(현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                    )
+                elif not self.position.first_gijun_cleared and self.position.entry_mode == "" and not np.isnan(gijun_line) and gijun_line > 0 and tick_close < gijun_thresh:
+                    # 기존 계좌 보유분(entry_mode == "")에 대한 60분봉 기준선 변곡선 이탈 감시 유지
+                    is_sell_signal = True
+                    diff_pct = ((tick_close - gijun_line) / gijun_line) * 100.0
+                    action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
+                    sell_reason = (
+                        f"🏛️ 60분봉 기준선 변곡선({gijun_line:,.0f}원) 미돌파/하향 이탈 즉시 전량 매도 "
+                        f"(현재가: {exit_price:,.0f}원, 기준선대비: {diff_pct:+.2f}%, 수익률: {profit_rate:+.2f}%)"
+                    )
+                elif not is_recent_entry and not np.isnan(active_gate) and active_gate > 0 and tick_close < active_gate * 0.988:
+                    is_sell_signal = True
+                    action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
+                    sell_reason = (
+                        f"🛡️ 노란색 급등관문선({active_gate:,.0f}원) 바닥 지지선 하향 이탈 전량 매도 "
+                        f"(현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                    )
 
             # 6) 🛑 [하드 리스크 방어 손절선 (-1.5%)]: 모든 지표를 초월한 계좌 원천 방어
-            elif not is_sell_signal and tick_close <= self.position.avg_price * 0.985:
+            if not is_sell_signal and tick_close <= self.position.avg_price * 0.985:
                 is_sell_signal = True
                 action_type = "STOP_LOSS"
                 sell_reason = (
