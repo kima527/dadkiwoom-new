@@ -465,3 +465,164 @@ class RealAPIAdapter:
         info = self.get_stock_credit_info(stock_code)
         return info.get('is_limit_exceeded', False)
 
+    def get_stock_market_type(self, stock_code: str) -> str:
+        """
+        종목의 소속 시장('KOSPI' 또는 'KOSDAQ')을 조회하여 반환합니다. (영구 메모리 캐시 활용)
+        - 키움 ka10100 API의 marketCode('0': 거래소/코스피, '10': 코스닥) 및 marketName 기준
+        """
+        if not hasattr(self, '_market_type_cache'):
+            self._market_type_cache = {}
+
+        code = stock_code.replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+        if code in self._market_type_cache:
+            return self._market_type_cache[code]
+
+        market_type = "KOSDAQ"  # 개별 테마주 기본값
+        try:
+            res = self.real_client.stock_info_api.stock_information_inquiry_request_ka10100(stock_code=code)
+            if res and isinstance(res, dict):
+                m_code = str(res.get('marketCode', '')).strip()
+                m_name = str(res.get('marketName', '')).strip()
+                if m_code == '10' or '코스닥' in m_name:
+                    market_type = "KOSDAQ"
+                elif m_code == '0' or '거래소' in m_name or '코스피' in m_name:
+                    market_type = "KOSPI"
+                self._market_type_cache[code] = market_type
+                return market_type
+        except Exception as e:
+            logger.debug(f"소속 시장 조회 에러 ({stock_code}): {e}")
+
+        return market_type
+
+    def _parse_futures_benchmark(self, label: str, long_code: str, inv_code: str) -> dict:
+        """
+        코스피200 선물(F-KOSPI200) / 코스닥150 선물(F-KOSDAQ150) 실시간 상태 파싱:
+        - 정방향 지수/선물 ETF(long_code)와 순수 선물지수 1:1 인버스 ETF(inv_code)를 교차 검증하여
+          1) 전일 대비 등락률(flu_rt)
+          2) 당일 시가 대비 방향(intraday_chg_pct: 양봉 반등 vs 시가 하회 음봉 투매)
+          3) 당일 고점 대비 되밀림 폭(drawdown_from_high_pct)
+          을 산출하고 3단계 시장 날씨(NORMAL_BULL / CAUTION_DEFENSE / CRASH_LOCK)를 판정합니다.
+        """
+        default_state = {
+            'label': label,
+            'flu_rt': 0.0,
+            'intraday_chg_pct': 0.0,
+            'drawdown_from_high_pct': 0.0,
+            'is_bull_candle': True,
+            'regime': 'NORMAL_BULL',
+            'badge': '🟢정상',
+            'reason': '정상 흐름'
+        }
+        try:
+            r_long = self.real_client.stock_info_api.basic_stock_information_request_ka10001(stock_code=long_code)
+            r_inv = self.real_client.stock_info_api.basic_stock_information_request_ka10001(stock_code=inv_code)
+
+            def _clean_float(val, abs_val=False):
+                if val is None:
+                    return 0.0
+                s = str(val).replace(',', '').strip()
+                if not s:
+                    return 0.0
+                v = float(s)
+                return abs(v) if abs_val else v
+
+            # 1) 순수 선물지수(F-KOSPI200: 114800 / F-KOSDAQ150: 251340) 역산값 및 정방향(069500 / 229200) 결합
+            long_flu = _clean_float(r_long.get('flu_rt', 0.0)) if r_long else 0.0
+            inv_flu = _clean_float(r_inv.get('flu_rt', 0.0)) if r_inv else 0.0
+
+            # 선물 등락률: 선물지수 1:1 추종 인버스(-inv_flu)와 대표지수(long_flu) 평균(일방 누락 시 유효값 사용)
+            if inv_flu != 0.0 and long_flu != 0.0:
+                flu_rt = round(((-inv_flu) + long_flu) / 2.0, 2)
+            elif inv_flu != 0.0:
+                flu_rt = round(-inv_flu, 2)
+            else:
+                flu_rt = round(long_flu, 2)
+
+            cur_p = _clean_float(r_long.get('cur_prc', 0.0), abs_val=True) if r_long else 0.0
+            open_p = _clean_float(r_long.get('open_pric', 0.0), abs_val=True) if r_long else 0.0
+            high_p = _clean_float(r_long.get('high_pric', 0.0), abs_val=True) if r_long else 0.0
+
+            if cur_p > 0 and open_p > 0:
+                intraday_chg_pct = round(((cur_p - open_p) / open_p) * 100.0, 2)
+            else:
+                # fallback via inverse ETF
+                inv_cur = _clean_float(r_inv.get('cur_prc', 0.0), abs_val=True) if r_inv else 0.0
+                inv_open = _clean_float(r_inv.get('open_pric', 0.0), abs_val=True) if r_inv else 0.0
+                intraday_chg_pct = round(-((inv_cur - inv_open) / inv_open) * 100.0, 2) if (inv_cur > 0 and inv_open > 0) else 0.0
+
+            if cur_p > 0 and high_p > 0 and high_p >= cur_p:
+                drawdown_from_high_pct = round(((high_p - cur_p) / high_p) * 100.0, 2)
+            else:
+                drawdown_from_high_pct = 0.0
+
+            is_bull_candle = (intraday_chg_pct >= -0.05)
+
+            # 🌡️ [3단계 선물지수 날씨 판정 공식]:
+            # 🔴 3단계 (CRASH_LOCK - 신규 매수 전면 잠금 서킷브레이커):
+            #   Case A: 전일 대비 -1.5% 이하 하락 중이면서 동시에 당일 시가 아래 음봉 투매(intraday_chg_pct < -0.20%) 지속
+            #   Case B: 전일 대비 -2.5% 이하 급락장이면서 당일 고점 대비 -0.8%p 이상 되밀리는 하락 파동 진행 중
+            #   Case C: 전일 대비 -3.5% 이하 패닉 폭락장 (야간선물 폭락 후 투매장)
+            #   Case D: 장중 고점 대비 -1.8%p 이상 급투매(Intraday Flash Dump) 발생 구간
+            if (
+                (flu_rt <= -1.50 and intraday_chg_pct < -0.20)
+                or (flu_rt <= -2.50 and drawdown_from_high_pct >= 0.80)
+                or (flu_rt <= -3.50)
+                or (drawdown_from_high_pct >= 1.80 and flu_rt < 0.0)
+            ):
+                regime = "CRASH_LOCK"
+                badge = f"🔴투매서킷브레이커({flu_rt:+.2f}%)"
+                reason = f"{label} 급락/투매({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%, 고점대비 -{drawdown_from_high_pct:.2f}%p) ➔ 신규매수 잠금"
+            # 🟡 2단계 (CAUTION_DEFENSE - 하락 주의 / 대장주 초엄격 선별 방어모드):
+            #   - 전일 대비 -0.8% 이하 하락 중이거나, 당일 시가 대비 -0.5% 이하 음봉 눌림, 또는 고점 대비 -1.0%p 이상 조정 구간
+            elif (
+                flu_rt <= -0.80
+                or intraday_chg_pct <= -0.50
+                or drawdown_from_high_pct >= 1.00
+            ):
+                regime = "CAUTION_DEFENSE"
+                badge = f"🟡하락방어({flu_rt:+.2f}%)"
+                reason = f"{label} 약세/주의({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 노란선 줍기 차단 & 검정점선 돌파 대장주(78점+)만 허용"
+            # 🟢 1단계 (NORMAL_BULL - 선물 정상/강세장):
+            else:
+                regime = "NORMAL_BULL"
+                badge = f"🟢정상/강세({flu_rt:+.2f}%)"
+                reason = f"{label} 양호({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 정석 파동 매매(노란선 1차 ➔ 검정점선 2차)"
+
+            return {
+                'label': label,
+                'flu_rt': flu_rt,
+                'intraday_chg_pct': intraday_chg_pct,
+                'drawdown_from_high_pct': drawdown_from_high_pct,
+                'is_bull_candle': is_bull_candle,
+                'regime': regime,
+                'badge': badge,
+                'reason': reason
+            }
+        except Exception as e:
+            logger.debug(f"{label} 상태 조회 에러: {e}")
+            return default_state
+
+    def get_futures_market_regime(self, cache_ttl: float = 25.0) -> dict:
+        """
+        코스피200 선물(F-KOSPI200) 및 코스닥150 선물(F-KOSDAQ150) 실시간 시장 날씨 조회 (기본 25초 캐시)
+        - 반환: {'KOSPI': {...}, 'KOSDAQ': {...}}
+        """
+        now_ts = time.time()
+        if hasattr(self, '_futures_regime_cache') and hasattr(self, '_futures_regime_ts'):
+            if (now_ts - self._futures_regime_ts) < cache_ttl and self._futures_regime_cache:
+                return self._futures_regime_cache
+
+        kospi_fut = self._parse_futures_benchmark("코스피200선물", long_code="069500", inv_code="114800")
+        time.sleep(0.10)
+        kosdaq_fut = self._parse_futures_benchmark("코스닥150선물", long_code="229200", inv_code="251340")
+
+        res = {
+            'KOSPI': kospi_fut,
+            'KOSDAQ': kosdaq_fut,
+            'updated_at': now_ts
+        }
+        self._futures_regime_cache = res
+        self._futures_regime_ts = now_ts
+        return res
+
+

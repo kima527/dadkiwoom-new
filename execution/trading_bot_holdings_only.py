@@ -240,6 +240,61 @@ class SafeHoldingsThemeGateBot:
                 pass
         return f"종목_{code}"
 
+    def get_stock_market_type(self, code: str) -> str:
+        """종목의 소속 시장('KOSPI' vs 'KOSDAQ') 조회 및 영구 캐싱"""
+        if not hasattr(self, 'stock_market_cache'):
+            self.stock_market_cache: dict[str, str] = {
+                '005930': 'KOSPI',
+                '000660': 'KOSPI',
+                '263750': 'KOSDAQ',
+            }
+        clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+        if clean_code in self.stock_market_cache:
+            return self.stock_market_cache[clean_code]
+        if self.is_real and self.api and hasattr(self.api, 'get_stock_market_type'):
+            try:
+                m_type = self.api.get_stock_market_type(clean_code)
+                if m_type in ("KOSPI", "KOSDAQ"):
+                    self.stock_market_cache[clean_code] = m_type
+                    return m_type
+            except Exception:
+                pass
+        return "KOSDAQ"
+
+    def get_futures_market_regime(self) -> dict:
+        """
+        코스피200 선물(F-KOSPI200) 및 코스닥150 선물(F-KOSDAQ150) 실시간 시장 날씨 조회
+        - 코스피 종목은 'KOSPI' (코스피200선물), 코스닥 종목은 'KOSDAQ' (코스닥150선물)에 1:1 매칭
+        """
+        default_regimes = {
+            'KOSPI': {
+                'label': '코스피200선물',
+                'flu_rt': 0.0,
+                'intraday_chg_pct': 0.0,
+                'drawdown_from_high_pct': 0.0,
+                'is_bull_candle': True,
+                'regime': 'NORMAL_BULL',
+                'badge': '🟢정상(0.00%)',
+                'reason': '정상 흐름'
+            },
+            'KOSDAQ': {
+                'label': '코스닥150선물',
+                'flu_rt': 0.0,
+                'intraday_chg_pct': 0.0,
+                'drawdown_from_high_pct': 0.0,
+                'is_bull_candle': True,
+                'regime': 'NORMAL_BULL',
+                'badge': '🟢정상(0.00%)',
+                'reason': '정상 흐름'
+            }
+        }
+        if self.is_real and self.api and hasattr(self.api, 'get_futures_market_regime'):
+            try:
+                return self.api.get_futures_market_regime()
+            except Exception as e:
+                logger.debug(f"선물지수 시장온도계 조회 예외: {e}")
+        return default_regimes
+
     def _check_and_cleanup_unfilled_orders(self, real_holdings: dict):
         """
         🛡️ [90초 미체결 매수 주문 자동 취소 및 유령 잠금(Ghost Lock) 해제]
@@ -876,6 +931,20 @@ class SafeHoldingsThemeGateBot:
         market_status_str = f"🟢 {session_name}" if is_active else f"🔴 {session_name}"
         logger.info(f"⏱️ 감시 루프 실행 중... [현재 시장 상태: {market_status_str}]")
 
+        # 🌡️ [코스피200선물 & 코스닥150선물 실시간 1:1 시장 온도계 점검]
+        futures_regimes = self.get_futures_market_regime()
+        kp_fut = futures_regimes.get('KOSPI', {})
+        kq_fut = futures_regimes.get('KOSDAQ', {})
+        logger.info(
+            f"🌡️ [선물지수 1:1 매칭 온도계] "
+            f"코스피200선물: {kp_fut.get('badge', '🟢정상')} (시가대비 {kp_fut.get('intraday_chg_pct', 0.0):+.2f}%, 고점대비 -{kp_fut.get('drawdown_from_high_pct', 0.0):.2f}%p) | "
+            f"코스닥150선물: {kq_fut.get('badge', '🟢정상')} (시가대비 {kq_fut.get('intraday_chg_pct', 0.0):+.2f}%, 고점대비 -{kq_fut.get('drawdown_from_high_pct', 0.0):.2f}%p)"
+        )
+        if kp_fut.get('regime') == "CRASH_LOCK":
+            logger.warning(f"   🚨 [코스피 서킷브레이커 발동] {kp_fut.get('reason')} (코스피 종목 신규매수 자동 잠금)")
+        if kq_fut.get('regime') == "CRASH_LOCK":
+            logger.warning(f"   🚨 [코스닥 서킷브레이커 발동] {kq_fut.get('reason')} (코스닥 종목 신규매수 자동 잠금)")
+
         active_code = self.get_active_stock_code()
         if active_code:
             act_name = self.get_stock_name(active_code)
@@ -962,13 +1031,24 @@ class SafeHoldingsThemeGateBot:
                 sma20_val = last_60m.get('sma20', 0.0)
                 sma60_val = last_60m.get('sma60', 0.0)
 
+                # 🌡️ [종목 소속 시장(KOSPI vs KOSDAQ) 1:1 선물지수 매칭]
+                stock_market = self.get_stock_market_type(code)
+                matched_fut = futures_regimes.get(stock_market, {})
+                fut_regime = str(matched_fut.get('regime', 'NORMAL_BULL'))
+                fut_label = str(matched_fut.get('label', '코스피200선물' if stock_market == 'KOSPI' else '코스닥150선물'))
+                fut_badge = str(matched_fut.get('badge', '🟢정상'))
+
                 # ⚡ [스마트 120틱 TR 호출 최적화]:
                 # 활성 보유 중(FIRST_BUY_DONE / FULL_POSITION)이거나,
-                # IDLE 상태에서 일봉 상승추세 + M/3선 지지 + 60분봉 20선 지지를 만족해 실제 매수 타점권인 종목만 120틱 조회!
-                # (지수 폭락으로 역배열에 빠진 종목들의 불필요한 120틱 TR 호출을 생략하여 루프 속도 2배 향상)
+                # IDLE 상태에서 선물 서킷브레이커가 아니고 + 일봉 상승추세 + M/3선 지지 + 60분봉 20선 지지를 만족해 실제 매수 타점권인 종목만 120틱 조회!
                 need_120t = (
                     strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
-                    or (daily_bull and (day3_m_line <= 0 or tick_close >= day3_m_line * 0.995) and close_val >= sma20_val * 0.990)
+                    or (
+                        fut_regime != "CRASH_LOCK"
+                        and daily_bull
+                        and (day3_m_line <= 0 or tick_close >= day3_m_line * 0.995)
+                        and close_val >= sma20_val * 0.990
+                    )
                 )
                 df_120t = self.get_120t_candles(code) if need_120t else pd.DataFrame()
 
@@ -993,7 +1073,9 @@ class SafeHoldingsThemeGateBot:
                         df_daily=df_daily,
                         day3_m_line=day3_m_line,
                         current_price=tick_close,
-                        df_120t=df_120t
+                        df_120t=df_120t,
+                        futures_regime=fut_regime,
+                        futures_label=fut_label
                     )
                 else:
                     order = None
@@ -1039,8 +1121,9 @@ class SafeHoldingsThemeGateBot:
                     profit_tag = f" [수익률: {cur_pnl:+.2f}%(최고 +{ref_pos.max_profit_pct:.2f}%)]"
 
                 source_badge = "🌟[타점관종] " if is_auto_wl else ""
+                mkt_tag = f"[{stock_market}·{fut_badge}]"
                 logger.info(
-                    f"📊 {source_badge}[{name}] 상태: {strat.position.state.value}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f} | "
+                    f"📊 {source_badge}[{name}]{mkt_tag} 상태: {strat.position.state.value}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f} | "
                     f"60분: {align_str} | {m3_str} | 관문선: {gate_val:,.0f} | {gijun_str}"
                 )
 
@@ -1090,6 +1173,10 @@ class SafeHoldingsThemeGateBot:
                         buy_candidates.append({
                             'code': code,
                             'name': name,
+                            'market': stock_market,
+                            'fut_regime': fut_regime,
+                            'fut_label': fut_label,
+                            'fut_badge': fut_badge,
                             'order': order,
                             'strat': strat,
                             'prev_pos': prev_pos,
@@ -1120,28 +1207,39 @@ class SafeHoldingsThemeGateBot:
                     # 상태 안전 원복 (스냅샷 기반 포지션/예수금/거래내역 완벽 복구)
                     self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
             else:
-                # 슬롯 0/1 비어있음! 최고 우선순위 점수 종목 선정 및 최소 커트라인(평시 65점 / 폭락장 75점) 검증
+                # 슬롯 0/1 비어있음! 최고 우선순위 점수 종목 선정 및 소속 시장 선물지수 연동 커트라인 검증
                 buy_candidates.sort(key=lambda x: x['priority_score'], reverse=True)
                 winner = buy_candidates[0]
                 w_d = winner['details']
+                w_fut_regime = winner.get('fut_regime', 'NORMAL_BULL')
+                w_fut_label = winner.get('fut_label', '선물지수')
+                w_fut_badge = winner.get('fut_badge', '🟢정상')
 
                 bear_ratio = (bear_align_count / total_eval_count) if total_eval_count > 0 else 0.0
                 is_market_slump = (total_eval_count >= 4 and bear_ratio >= 0.60)
-                min_required_score = 75.0 if is_market_slump else 65.0
-                market_mode_tag = f"폭락/조정장 방어모드(역배열 {bear_ratio*100:.0f}%)" if is_market_slump else "정상장 모드"
+
+                if w_fut_regime == "CRASH_LOCK":
+                    min_required_score = 999.0  # 선물투매 서킷브레이커 발동 시 전면 차단
+                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 서킷브레이커 잠금"
+                elif w_fut_regime == "CAUTION_DEFENSE" or is_market_slump:
+                    min_required_score = 78.0
+                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 하락방어모드(대장주 78점+ 엄선)"
+                else:
+                    min_required_score = 65.0
+                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 정상/강세모드"
 
                 if winner['priority_score'] < min_required_score:
                     logger.info(
-                        f"🛡️ [우선순위 커트라인 미달 매수 보류] 1위 후보 [{winner['name']}({winner['code']})] "
+                        f"🛡️ [선물지수 연동 커트라인 미달 매수 보류] 1위 후보 [{winner['name']}({winner['code']})] "
                         f"점수 {winner['priority_score']:.1f}점 < 최소 커트라인 {min_required_score:.1f}점 ({market_mode_tag}) "
-                        f"➔ 거래량/캔들 순도가 부족한 억지 매매를 차단하고 현금을 100% 보존합니다."
+                        f"➔ 선물 약세/변동성 구간에서 억지 매매를 차단하고 현금을 100% 보존합니다."
                     )
                     for cand in buy_candidates:
                         self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
                 else:
                     logger.info(
                         f"👑 [동시 기준선 돌파 1픽 선정] 총 {len(buy_candidates)}개 돌파 후보 중 [{winner['name']}({winner['code']})] "
-                        f"우선순위 1위 ({winner['priority_score']:.1f}점/100점 | 커트라인 {min_required_score:.0f}점 통과) 선정 및 매수 집행! "
+                        f"우선순위 1위 ({winner['priority_score']:.1f}점/100점 | {market_mode_tag} 커트라인 {min_required_score:.0f}점 통과) 선정 및 매수 집행! "
                         f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}% 돌파({w_d.get('score_speed', 0.0):.0f}점), "
                         f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
                         f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%({w_d.get('score_anchor', 0.0):.0f}점), "

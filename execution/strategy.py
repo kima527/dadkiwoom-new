@@ -136,6 +136,8 @@ class ThemeGate60mStrategy:
         # 상단: 노란색 급등관문선(gate_120t) + 검정점선 급등관문고가선(gate_high_120t) + 분홍색 기준선(gijun_120t)
         # 하단: 테마 5, 20, 60, 120 + 테마120 상승변곡(is_tema120_up) + 노란 양운(is_yellow_cloud) + 테마60-120 골든크로스
         df_120t = kwargs.get('df_120t', None)
+        futures_regime = str(kwargs.get('futures_regime', 'NORMAL_BULL')).strip()
+        futures_label = str(kwargs.get('futures_label', '선물지수')).strip()
         has_120t_wave = False
         gate_120t = np.nan
         gate_high_120t = np.nan
@@ -229,6 +231,11 @@ class ThemeGate60mStrategy:
             is_bull_support = (close >= sma20 * 0.995) and (sma5 >= sma20 * 0.990)
 
         if self.position.state == StrategyState.IDLE:
+            # 🚨 [소속 시장 선물지수 폭락 서킷브레이커 (CRASH_LOCK)]:
+            # 코스피 종목은 코스피200선물, 코스닥 종목은 코스닥150선물이 투매/폭락장(CRASH_LOCK)일 때 신규 1차 매수 전면 차단!
+            if futures_regime == "CRASH_LOCK":
+                return None
+
             if not daily_bull:
                 return None  # 일봉이 하락 추세(5<20)일 때는 신규 1차 매수 진입 차단
 
@@ -282,7 +289,13 @@ class ThemeGate60mStrategy:
                 and close >= gate_line * 0.990
                 and low <= gate_line * 1.018
             )
-            is_yellow_gate_buy = gate_support_120t or gate_support_60m
+            # 🌡️ [소속 시장 선물지수 하락방어모드 (CAUTION_DEFENSE) 연동]:
+            # 선물지수가 약세/하락 주의장일 때는 어설픈 노란색 급등관문선 바닥 줍기(떨어지는 칼날 받기)를 차단하고,
+            # 반드시 120틱 테마120 상승변곡 + 검정점선(급등관문고가돌파선) 돌파(또는 분홍 기준선 돌파)가 확인된 대장주만 1차 매수 허용!
+            if futures_regime == "CAUTION_DEFENSE":
+                is_yellow_gate_buy = False
+            else:
+                is_yellow_gate_buy = gate_support_120t or gate_support_60m
 
             # 🚀 [강세 예외 1차 타점 B: 120틱 테마120 상승변곡 + 검정 점선(급등관문고가선) 직행 돌파 또는 기준선 초기 돌파]
             gate_high_breakout_120t = (
@@ -360,7 +373,9 @@ class ThemeGate60mStrategy:
             first_pnl = ((tick_close - base_p1) / base_p1) * 100.0 if base_p1 > 0 else 0.0
             if first_pnl > self.position.max_profit_pct:
                 self.position.max_profit_pct = first_pnl
-            if self.position.max_profit_pct >= 0.8:
+            # 소속 시장 선물지수 투매(CRASH_LOCK) 발생 시 +0.4%만 수익이어도 즉시 무위험 본절락 조기 가동!
+            bep_trigger_p1 = 0.4 if futures_regime == "CRASH_LOCK" else 0.8
+            if self.position.max_profit_pct >= bep_trigger_p1:
                 self.position.bep_locked = True
 
             # 1번째/2번째 분홍 기준선 상태 실시간 갱신
@@ -412,7 +427,8 @@ class ThemeGate60mStrategy:
                     breakout_target = base_p1 * 1.005
                     breakout_name = "120틱 테마60-120 골든크로스(노란 양운) 가속 돌파"
 
-            if is_breakout:
+            # 🚨 소속 시장 선물지수가 폭락 투매 서킷브레이커(CRASH_LOCK) 상태일 때는 2차 불타기(BUY_2) 보류!
+            if is_breakout and futures_regime != "CRASH_LOCK":
                 buy_price = tick_close
                 # 2차 매수 수량: 1차 매수 수량과 1:1 동일 수량 추가 매수 (수수료/슬리피지 대비 가용 예수금 99% 안전 버퍼 적용)
                 usable_cash = self.cash * 0.99
@@ -541,7 +557,9 @@ class ThemeGate60mStrategy:
                 self.position.max_profit_pct = profit_rate
 
             # 🔒 [3단계 수익 잠금 래칫 (3-Tier Profit Ratchet) 자동 장전]:
-            if self.position.max_profit_pct >= 0.6:
+            # 소속 시장 선물지수 투매(CRASH_LOCK) 발생 시 +0.4%만 수익이어도 즉시 본절락 조기 장전!
+            full_bep_trigger = 0.4 if futures_regime == "CRASH_LOCK" else 0.6
+            if self.position.max_profit_pct >= full_bep_trigger:
                 self.position.bep_locked = True
 
             # 🛡️ 진입 직후 1~2틱 호가 노이즈 털림 방지 (최소 3분간 노이즈 버퍼 적용):
