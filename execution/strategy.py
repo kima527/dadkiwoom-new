@@ -138,6 +138,7 @@ class ThemeGate60mStrategy:
         df_120t = kwargs.get('df_120t', None)
         futures_regime = str(kwargs.get('futures_regime', 'NORMAL_BULL')).strip()
         futures_label = str(kwargs.get('futures_label', '선물지수')).strip()
+        is_premarket_bridge_window = bool(kwargs.get('is_premarket_bridge_window', False))
         has_120t_wave = False
         gate_120t = np.nan
         gate_high_120t = np.nan
@@ -231,9 +232,10 @@ class ThemeGate60mStrategy:
             is_bull_support = (close >= sma20 * 0.995) and (sma5 >= sma20 * 0.990)
 
         if self.position.state == StrategyState.IDLE:
-            # 🚨 [소속 시장 선물지수 폭락 서킷브레이커 (CRASH_LOCK)]:
-            # 코스피 종목은 코스피200선물, 코스닥 종목은 코스닥150선물이 투매/폭락장(CRASH_LOCK)일 때 신규 1차 매수 전면 차단!
-            if futures_regime == "CRASH_LOCK":
+            # 🚨 [소속 시장 선물지수 폭락 서킷브레이커 (CRASH_LOCK) 및 08:45~08:49 프리마켓 마감 직전 신규진입 차단]:
+            # 1) 코스피 종목은 코스피200선물, 코스닥 종목은 코스닥150선물이 투매/폭락장(CRASH_LOCK)일 때 신규 1차 매수 전면 차단!
+            # 2) 08:45~08:49:59 프리마켓 마감 브릿지 구간에서는 08:50~09:00 10분 거래중단(블랙아웃) 보호를 위해 신규 1차 진입 차단!
+            if futures_regime == "CRASH_LOCK" or is_premarket_bridge_window:
                 return None
 
             if not daily_bull:
@@ -373,8 +375,13 @@ class ThemeGate60mStrategy:
             first_pnl = ((tick_close - base_p1) / base_p1) * 100.0 if base_p1 > 0 else 0.0
             if first_pnl > self.position.max_profit_pct:
                 self.position.max_profit_pct = first_pnl
-            # 소속 시장 선물지수 투매(CRASH_LOCK) 발생 시 +0.4%만 수익이어도 즉시 무위험 본절락 조기 가동!
-            bep_trigger_p1 = 0.4 if futures_regime == "CRASH_LOCK" else 0.8
+            # 소속 시장 선물지수 투매(CRASH_LOCK) 또는 08:45~08:49 프리마켓 마감 브릿지 구간에서는 +0.4%만 수익이어도 즉시 무위험 본절락 조기 가동!
+            if futures_regime == "CRASH_LOCK" or is_premarket_bridge_window:
+                bep_trigger_p1 = 0.4
+            elif futures_regime == "CAUTION_DEFENSE":
+                bep_trigger_p1 = 0.5
+            else:
+                bep_trigger_p1 = 0.8
             if self.position.max_profit_pct >= bep_trigger_p1:
                 self.position.bep_locked = True
 
@@ -505,9 +512,18 @@ class ThemeGate60mStrategy:
                                 f"체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
                             )
 
-                    # 3) 🌊 M/3 실시간 3일선 하향 이탈, 노란색 급등관문선 하향 이탈(-1.2%), 또는 🛑 -1.5% 하드 손절
+                    # 3) 🌊 M/3 실시간 3일선 하향 이탈, 노란색 급등관문선 하향 이탈(-1.2%), 08:45~08:49 브릿지 탄력 둔화, 또는 🛑 -1.5% 하드 손절
                     if not is_first_exit:
-                        if day3_m_line > 0 and tick_close < m3_thresh:
+                        if is_premarket_bridge_window and p_rate < 0.2 and (
+                            is_tema_dead_5_20_120t or (not np.isnan(active_gate) and active_gate > 0 and tick_close < active_gate * 0.996)
+                        ):
+                            is_first_exit = True
+                            exit_action = "TAKE_PROFIT" if p_rate >= 0 else "STOP_LOSS"
+                            sl_reason = (
+                                f"🌉 [08:45~08:49 프리마켓→KRX 브릿지 보호] 08:50 거래중단 전 탄력 둔화 1차 물량 선제 청산 "
+                                f"(09:00 KRX 시초 갭하락 방어, 체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
+                            )
+                        elif day3_m_line > 0 and tick_close < m3_thresh:
                             is_first_exit = True
                             exit_action = "TAKE_PROFIT" if p_rate >= 0 else "STOP_LOSS"
                             sl_reason = f"1차 매수 후 M/3 수식선({day3_m_line:,.0f}원) 하향 이탈 1차 물량 전량 청산 (체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
@@ -557,8 +573,13 @@ class ThemeGate60mStrategy:
                 self.position.max_profit_pct = profit_rate
 
             # 🔒 [3단계 수익 잠금 래칫 (3-Tier Profit Ratchet) 자동 장전]:
-            # 소속 시장 선물지수 투매(CRASH_LOCK) 발생 시 +0.4%만 수익이어도 즉시 본절락 조기 장전!
-            full_bep_trigger = 0.4 if futures_regime == "CRASH_LOCK" else 0.6
+            # 소속 시장 선물지수 투매(CRASH_LOCK) 또는 08:45~08:49 프리마켓 마감 브릿지 구간에서는 +0.4%만 수익이어도 즉시 본절락 조기 장전!
+            if futures_regime == "CRASH_LOCK" or is_premarket_bridge_window:
+                full_bep_trigger = 0.4
+            elif futures_regime == "CAUTION_DEFENSE":
+                full_bep_trigger = 0.5
+            else:
+                full_bep_trigger = 0.6
             if self.position.max_profit_pct >= full_bep_trigger:
                 self.position.bep_locked = True
 
@@ -711,7 +732,17 @@ class ThemeGate60mStrategy:
                         f"(현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
                     )
 
-            # 6) 🛑 [하드 리스크 방어 손절선 (-1.5%)]: 모든 지표를 초월한 계좌 원천 방어
+            # 6) 🌉 [08:45~08:49 프리마켓→KRX 브릿지 보호 청산] & 🛑 [하드 리스크 방어 손절선 (-1.5%)]
+            if not is_sell_signal and is_premarket_bridge_window and profit_rate < 0.2 and (
+                is_tema_dead_5_20_120t or (not np.isnan(active_gate) and active_gate > 0 and tick_close < active_gate * 0.996)
+            ):
+                is_sell_signal = True
+                action_type = "TAKE_PROFIT" if profit_rate >= 0 else "STOP_LOSS"
+                sell_reason = (
+                    f"🌉 [08:45~08:49 프리마켓→KRX 브릿지 보호] 08:50 거래중단 전 탄력 둔화 전량 선제 청산 "
+                    f"(09:00 KRX 시초 갭하락 방어, 현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                )
+
             if not is_sell_signal and tick_close <= self.position.avg_price * 0.985:
                 is_sell_signal = True
                 action_type = "STOP_LOSS"

@@ -2,13 +2,15 @@ import os
 import sys
 import time
 import logging
+from typing import Optional, Dict, Any, List
 import pandas as pd
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# 진짜 실전 API를 가져오기 위한 경로 설정
-real_trading_path = os.path.abspath(r"C:\Users\zoela\OneDrive\바탕 화면\PythonWorksplace\real trading")
+# 진짜 실전 API를 가져오기 위한 경로 설정 (드라이브/PC 이동 시에도 100% 자동 인식되는 상대 경로)
+_adapter_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+real_trading_path = os.path.join(_adapter_root, "real trading")
 if real_trading_path not in sys.path:
     sys.path.append(real_trading_path)
 
@@ -494,15 +496,136 @@ class RealAPIAdapter:
 
         return market_type
 
-    def _parse_futures_benchmark(self, label: str, long_code: str, inv_code: str) -> dict:
+    def _parse_nxt_overnight_basket(self, label: str, nx_codes: list[str], is_premarket: bool = True) -> dict:
+        """
+        🌅 [08:00~08:50 NXT 프리마켓 & 15:40~20:00 애프터마켓 전용: 야간선물 연동 실시간 대표지수 바스켓 파서]
+        - KRX 상장 ETF(069500, 229200 등)는 09:00 정규장 전까지 거래되지 않아 전일 종가(0.00%)에 멈춰 있는 맹점을 해결합니다.
+        - 08:00 프리마켓 개장과 동시에 전거래일 야간 코스피200선물·야간 코스닥150선물 마감 방향이 100% 직결 반영되는
+          NXT 시총 최상위 대표주 바스켓(_NX 실시간 시세)을 통해 프리마켓/애프터마켓 시장 온도를 정밀 판독합니다.
+        """
+        session_tag = "야간선물·프리" if is_premarket else "NXT애프터"
+        default_state = {
+            'label': label,
+            'flu_rt': 0.0,
+            'intraday_chg_pct': 0.0,
+            'drawdown_from_high_pct': 0.0,
+            'is_bull_candle': True,
+            'regime': 'NORMAL_BULL',
+            'badge': f'🟢{session_tag}정상',
+            'reason': '정상 흐름'
+        }
+
+        def _clean_float(val, abs_val=False):
+            if val is None:
+                return 0.0
+            s = str(val).replace(',', '').strip()
+            if not s:
+                return 0.0
+            try:
+                v = float(s)
+                return abs(v) if abs_val else v
+            except Exception:
+                return 0.0
+
+        flu_list = []
+        intra_list = []
+        dd_list = []
+
+        for c in nx_codes:
+            try:
+                r = self.real_client.stock_info_api.basic_stock_information_request_ka10001(stock_code=c)
+                if not r or not isinstance(r, dict):
+                    continue
+                f_rt = _clean_float(r.get('flu_rt', 0.0))
+                cur_p = _clean_float(r.get('cur_prc', 0.0), abs_val=True)
+                open_p = _clean_float(r.get('open_pric', 0.0), abs_val=True)
+                high_p = _clean_float(r.get('high_pric', 0.0), abs_val=True)
+
+                if cur_p > 0:
+                    flu_list.append(f_rt)
+                    if open_p > 0:
+                        intra_list.append(((cur_p - open_p) / open_p) * 100.0)
+                    if high_p > 0 and high_p >= cur_p:
+                        dd_list.append(((high_p - cur_p) / high_p) * 100.0)
+                time.sleep(0.05)
+            except Exception:
+                continue
+
+        if not flu_list:
+            return default_state
+
+        flu_rt = round(sum(flu_list) / len(flu_list), 2)
+        intraday_chg_pct = round(sum(intra_list) / len(intra_list), 2) if intra_list else 0.0
+        drawdown_from_high_pct = round(sum(dd_list) / len(dd_list), 2) if dd_list else 0.0
+        is_bull_candle = (intraday_chg_pct >= -0.05)
+
+        # 🌅 [야간선물 연동 프리마켓/애프터마켓 4단계 날씨 판정]:
+        # 🔴 4단계 (CRASH_LOCK - 야간선물 폭락 프리마켓 서킷브레이커):
+        #   - 야간선물 여파로 대표 바스켓이 -1.50% 이하 급락 중이거나,
+        #   - 전일 대비 -1.00% 이하 하락하면서 동시에 프리마켓 시가 대비 음봉 투매(-0.30% 이하)가 진행 중이거나,
+        #   - 프리마켓 고점 대비 -1.50%p 이상 급투매가 쏟아지는 경우
+        if (
+            flu_rt <= -1.50
+            or (flu_rt <= -1.00 and intraday_chg_pct <= -0.30)
+            or (drawdown_from_high_pct >= 1.50 and flu_rt < 0.0)
+        ):
+            regime = "CRASH_LOCK"
+            badge = f"🔴{session_tag}폭락잠금({flu_rt:+.2f}%)"
+            reason = (
+                f"{label}({session_tag}) 급락({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%, 고점대비 -{drawdown_from_high_pct:.2f}%p) "
+                f"➔ 프리마켓 신규매수 잠금(09:00 정규장 투매 소화 대기)"
+            )
+        # 🟡 3단계 (CAUTION_DEFENSE - 야간선물 하락 주의 / 역행 대장주 초엄격 선별):
+        #   - 전일 대비 -0.70% ~ -1.50% 하락 마감 여파 구간이거나, 프리마켓 시가 대비 -0.40% 이하 음봉 눌림 구간
+        elif (
+            flu_rt <= -0.70
+            or intraday_chg_pct <= -0.40
+            or drawdown_from_high_pct >= 1.00
+        ):
+            regime = "CAUTION_DEFENSE"
+            badge = f"🟡{session_tag}하락방어({flu_rt:+.2f}%)"
+            reason = (
+                f"{label}({session_tag}) 약세({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) "
+                f"➔ 노란선 단순줍기 금지 & 야간선물 역행 검정점선 돌파 대장주(78점+)만 허용"
+            )
+        # 🔥 1단계 (STRONG_BULL - 야간선물 강세장 / 프리마켓 공격적 선취매):
+        elif flu_rt >= 0.50 and intraday_chg_pct >= -0.15:
+            regime = "STRONG_BULL"
+            badge = f"🔥{session_tag}강세({flu_rt:+.2f}%)"
+            reason = f"{label}({session_tag}) 강세({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 프리마켓 노란선 1차·검정점선 2차 적극 선취매"
+        # 🟢 2단계 (NORMAL_BULL - 야간선물 보합/정상장):
+        else:
+            regime = "NORMAL_BULL"
+            badge = f"🟢{session_tag}보합/정상({flu_rt:+.2f}%)"
+            reason = f"{label}({session_tag}) 양호({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 정석 파동 매매 가동"
+
+        return {
+            'label': label,
+            'flu_rt': flu_rt,
+            'intraday_chg_pct': intraday_chg_pct,
+            'drawdown_from_high_pct': drawdown_from_high_pct,
+            'is_bull_candle': is_bull_candle,
+            'regime': regime,
+            'badge': badge,
+            'reason': reason
+        }
+
+    def _parse_futures_benchmark(self, label: str, long_code: str, inv_code: str, nx_basket: Optional[list[str]] = None) -> dict:
         """
         코스피200 선물(F-KOSPI200) / 코스닥150 선물(F-KOSDAQ150) 실시간 상태 파싱:
-        - 정방향 지수/선물 ETF(long_code)와 순수 선물지수 1:1 인버스 ETF(inv_code)를 교차 검증하여
-          1) 전일 대비 등락률(flu_rt)
-          2) 당일 시가 대비 방향(intraday_chg_pct: 양봉 반등 vs 시가 하회 음봉 투매)
-          3) 당일 고점 대비 되밀림 폭(drawdown_from_high_pct)
-          을 산출하고 3단계 시장 날씨(NORMAL_BULL / CAUTION_DEFENSE / CRASH_LOCK)를 판정합니다.
+        - [08:00~09:00 프리마켓 & 15:40~20:00 애프터마켓]: KRX ETF 미개장 시간대이므로
+          전거래일 야간선물 마감 방향이 직결 반영되는 NXT 실시간 대표주 바스켓(_NX)으로 판독!
+        - [09:00~15:30 KRX 정규장]: 정방향 지수/선물 ETF(long_code)와 순수 선물지수 1:1 인버스 ETF(inv_code)를 교차 검증하여
+          4단계 시장 날씨(STRONG_BULL / NORMAL_BULL / CAUTION_DEFENSE / CRASH_LOCK)를 판정합니다.
         """
+        now_t = datetime.now().time()
+        from datetime import time as dtime
+        is_premarket_time = (dtime(8, 0, 0) <= now_t < dtime(9, 0, 0))
+        is_aftermarket_time = (dtime(15, 40, 0) <= now_t < dtime(20, 0, 0))
+
+        if (is_premarket_time or is_aftermarket_time) and nx_basket:
+            return self._parse_nxt_overnight_basket(label, nx_basket, is_premarket=is_premarket_time)
+
         default_state = {
             'label': label,
             'flu_rt': 0.0,
@@ -538,6 +661,10 @@ class RealAPIAdapter:
             else:
                 flu_rt = round(long_flu, 2)
 
+            # 만약 09:00 직후 등 ETF 시세가 아직 0.00%일 경우 NXT 대표 바스켓으로 즉시 보완
+            if flu_rt == 0.0 and nx_basket:
+                return self._parse_nxt_overnight_basket(label, nx_basket, is_premarket=False)
+
             cur_p = _clean_float(r_long.get('cur_prc', 0.0), abs_val=True) if r_long else 0.0
             open_p = _clean_float(r_long.get('open_pric', 0.0), abs_val=True) if r_long else 0.0
             high_p = _clean_float(r_long.get('high_pric', 0.0), abs_val=True) if r_long else 0.0
@@ -557,8 +684,8 @@ class RealAPIAdapter:
 
             is_bull_candle = (intraday_chg_pct >= -0.05)
 
-            # 🌡️ [3단계 선물지수 날씨 판정 공식]:
-            # 🔴 3단계 (CRASH_LOCK - 신규 매수 전면 잠금 서킷브레이커):
+            # 🌡️ [4단계 선물지수 날씨 판정 공식]:
+            # 🔴 4단계 (CRASH_LOCK - 신규 매수 전면 잠금 서킷브레이커):
             #   Case A: 전일 대비 -1.5% 이하 하락 중이면서 동시에 당일 시가 아래 음봉 투매(intraday_chg_pct < -0.20%) 지속
             #   Case B: 전일 대비 -2.5% 이하 급락장이면서 당일 고점 대비 -0.8%p 이상 되밀리는 하락 파동 진행 중
             #   Case C: 전일 대비 -3.5% 이하 패닉 폭락장 (야간선물 폭락 후 투매장)
@@ -572,8 +699,7 @@ class RealAPIAdapter:
                 regime = "CRASH_LOCK"
                 badge = f"🔴투매서킷브레이커({flu_rt:+.2f}%)"
                 reason = f"{label} 급락/투매({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%, 고점대비 -{drawdown_from_high_pct:.2f}%p) ➔ 신규매수 잠금"
-            # 🟡 2단계 (CAUTION_DEFENSE - 하락 주의 / 대장주 초엄격 선별 방어모드):
-            #   - 전일 대비 -0.8% 이하 하락 중이거나, 당일 시가 대비 -0.5% 이하 음봉 눌림, 또는 고점 대비 -1.0%p 이상 조정 구간
+            # 🟡 3단계 (CAUTION_DEFENSE - 하락 주의 / 대장주 초엄격 선별 방어모드):
             elif (
                 flu_rt <= -0.80
                 or intraday_chg_pct <= -0.50
@@ -582,10 +708,15 @@ class RealAPIAdapter:
                 regime = "CAUTION_DEFENSE"
                 badge = f"🟡하락방어({flu_rt:+.2f}%)"
                 reason = f"{label} 약세/주의({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 노란선 줍기 차단 & 검정점선 돌파 대장주(78점+)만 허용"
-            # 🟢 1단계 (NORMAL_BULL - 선물 정상/강세장):
+            # 🔥 1단계 (STRONG_BULL - 선물 강세장):
+            elif flu_rt >= 0.60 and intraday_chg_pct >= -0.10:
+                regime = "STRONG_BULL"
+                badge = f"🔥선물강세({flu_rt:+.2f}%)"
+                reason = f"{label} 강세({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 정석 파동 적극 공략"
+            # 🟢 2단계 (NORMAL_BULL - 선물 정상/보합장):
             else:
                 regime = "NORMAL_BULL"
-                badge = f"🟢정상/강세({flu_rt:+.2f}%)"
+                badge = f"🟢정상/보합({flu_rt:+.2f}%)"
                 reason = f"{label} 양호({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 정석 파동 매매(노란선 1차 ➔ 검정점선 2차)"
 
             return {
@@ -605,6 +736,8 @@ class RealAPIAdapter:
     def get_futures_market_regime(self, cache_ttl: float = 25.0) -> dict:
         """
         코스피200 선물(F-KOSPI200) 및 코스닥150 선물(F-KOSDAQ150) 실시간 시장 날씨 조회 (기본 25초 캐시)
+        - 08:00~09:00 NXT 프리마켓 및 15:40~20:00 애프터마켓에서는 야간선물 마감 방향이 직결 반영되는
+          NXT 시총 대표주 바스켓(_NX)으로 실시간 판독합니다.
         - 반환: {'KOSPI': {...}, 'KOSDAQ': {...}}
         """
         now_ts = time.time()
@@ -612,9 +745,16 @@ class RealAPIAdapter:
             if (now_ts - self._futures_regime_ts) < cache_ttl and self._futures_regime_cache:
                 return self._futures_regime_cache
 
-        kospi_fut = self._parse_futures_benchmark("코스피200선물", long_code="069500", inv_code="114800")
+        kospi_nx_basket = ["005930_NX", "000660_NX", "005380_NX"]
+        kosdaq_nx_basket = ["247540_NX", "196170_NX", "028300_NX"]
+
+        kospi_fut = self._parse_futures_benchmark(
+            "코스피200선물", long_code="069500", inv_code="114800", nx_basket=kospi_nx_basket
+        )
         time.sleep(0.10)
-        kosdaq_fut = self._parse_futures_benchmark("코스닥150선물", long_code="229200", inv_code="251340")
+        kosdaq_fut = self._parse_futures_benchmark(
+            "코스닥150선물", long_code="229200", inv_code="251340", nx_basket=kosdaq_nx_basket
+        )
 
         res = {
             'KOSPI': kospi_fut,

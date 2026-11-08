@@ -25,12 +25,12 @@ from typing import Tuple, Dict, Any, Optional
 import pandas as pd
 import numpy as np
 
-# 경로 설정
+# 경로 설정 (어느 드라이브/폴더나 다른 PC로 옮겨도 100% 자동 인식되도록 상대 경로화)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-PYTHON_WORKSPLACE = r"C:\Users\zoela\OneDrive\바탕 화면\PythonWorksplace"
-MOVING_AVERAGE_TRAID = os.path.join(PYTHON_WORKSPLACE, "MovingAveragelineTraid", "execution")
-REAL_TRADING_PATH = os.path.join(PYTHON_WORKSPLACE, "real trading")
+PYTHON_WORKSPLACE = PROJECT_ROOT
+MOVING_AVERAGE_TRAID = os.path.join(PROJECT_ROOT, "MovingAveragelineTraid", "execution")
+REAL_TRADING_PATH = os.path.join(PROJECT_ROOT, "real trading")
 
 for p in [PROJECT_ROOT, CURRENT_DIR, MOVING_AVERAGE_TRAID, REAL_TRADING_PATH]:
     if os.path.exists(p) and p not in sys.path:
@@ -214,6 +214,15 @@ class SafeHoldingsThemeGateBot:
         self.last_watchlist_scan_time: float = 0.0
         self.sold_today_stocks: set[str] = set()
         self.current_trading_date = datetime.now().date()
+        self.dryrun_stats: dict[str, Any] = {
+            'initial_seed': 0.0,
+            'virtual_cash': 0.0,
+            'realized_net_pnl': 0.0,
+            'wins': 0,
+            'losses': 0,
+            'trades': 0,
+            'log_path': os.path.join(CURRENT_DIR, "dryrun_trade_history.log")
+        }
         self.stock_name_cache: dict[str, str] = {
             '052260': '현대바이오랜드',
             '138360': '앤로보틱스',
@@ -361,6 +370,16 @@ class SafeHoldingsThemeGateBot:
                 '263750': {'qty': 1, 'buy_price': 34650, 'current_price': 34650}
             }
             cash = 10_000_000
+
+        # 💻 [노트북/DRY-RUN 가상매매 감시 모드 시드머니 관리]:
+        # 실계좌 예수금이 10만 원 미만이더라도 가상매매 검증이 가능하도록 기본 1,000만 원 시드 보장,
+        # 가상 매매 체결 시에는 복리로 누적된 virtual_cash를 유지합니다.
+        if self.dry_run:
+            if self.dryrun_stats['initial_seed'] <= 0:
+                init_seed = float(cash) if float(cash) >= 100_000 else 10_000_000.0
+                self.dryrun_stats['initial_seed'] = init_seed
+                self.dryrun_stats['virtual_cash'] = init_seed
+            cash = self.dryrun_stats['virtual_cash']
 
         # 🔍 [성배 타점 종목 사전 등록분 즉시 로드 & 장중 30분 주기 자동 갱신]:
         # 1) 최초 기동 시 이미 사전 스캔·등록된 holy_grail_watchlist.json(최근 12시간 이내)이 있으면 0.01초 만에 즉시 장착!
@@ -624,7 +643,16 @@ class SafeHoldingsThemeGateBot:
                     strat.position.total_qty += strat.position.base_account_qty
                     logger.info(f"   ➕ [수량 흡수] 기존 관심용 1주({strat.position.base_account_qty}주)를 포지션에 합산 ➔ 총 {strat.position.total_qty}주 보유")
                     strat.position.base_account_qty = 0
-                logger.info(f"🛡️ [DRY-RUN 모의 체결] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {order.qty}주 | 스마트지정가: {buy_price:,.0f}원 (실제 주문 미전송)")
+                buy_msg = (
+                    f"💻 [가상매매(DRY-RUN) 매수 체결] [{name}({code})] {order.action} | 세션: {session_name} | "
+                    f"수량: {order.qty}주 | 체결가: {buy_price:,.0f}원 | 사유: {order.reason}"
+                )
+                logger.info(buy_msg)
+                try:
+                    with open(self.dryrun_stats['log_path'], "a", encoding="utf-8") as lf:
+                        lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {buy_msg}\n")
+                except Exception:
+                    pass
                 return
 
             logger.info(f"🚀 [실전 매수 발송(+1~2호가 스마트지정가)] [{name}({code})] {order.action} | 세션: {session_name} ({exchange_hint}) | 수량: {order.qty}주 | 지정가: {buy_price:,.0f}원")
@@ -704,9 +732,43 @@ class SafeHoldingsThemeGateBot:
             sell_price = align_to_tick(raw_price) if raw_price > 0 else 0
 
             if self.dry_run:
-                logger.info(f"🛡️ [DRY-RUN 모의 체결] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (계좌 전량 100%) | 지정가: {sell_price:,.0f}원 (실제 주문 미전송)")
+                avg_buy_p = fallback_price if fallback_price > 0 else sell_price
+                gross_pnl = (sell_price - avg_buy_p) * final_sell_qty
+                fee_tax = (sell_price * final_sell_qty) * 0.0023
+                net_pnl = gross_pnl - fee_tax
+                net_pnl_pct = ((sell_price - avg_buy_p) / avg_buy_p * 100.0 - 0.23) if avg_buy_p > 0 else 0.0
+
+                self.dryrun_stats['trades'] += 1
+                if net_pnl >= 0:
+                    self.dryrun_stats['wins'] += 1
+                else:
+                    self.dryrun_stats['losses'] += 1
+                self.dryrun_stats['realized_net_pnl'] += net_pnl
+                self.dryrun_stats['virtual_cash'] = self.dryrun_stats['initial_seed'] + self.dryrun_stats['realized_net_pnl']
+
+                tot_t = self.dryrun_stats['trades']
+                win_rate = (self.dryrun_stats['wins'] / tot_t * 100.0) if tot_t > 0 else 0.0
+                cum_ret = (self.dryrun_stats['realized_net_pnl'] / self.dryrun_stats['initial_seed'] * 100.0) if self.dryrun_stats['initial_seed'] > 0 else 0.0
+
+                sell_msg = (
+                    f"💻 [가상매매(DRY-RUN) 전량 매도 체결] [{name}({code})] {order.action} | 수량: {final_sell_qty}주 | "
+                    f"매수가: {avg_buy_p:,.0f}원 ➔ 매도가: {sell_price:,.0f}원 | 순수익: {net_pnl:+,.0f}원 ({net_pnl_pct:+.2f}%) | "
+                    f"사유: {order.reason} | 📊 누적성적: {self.dryrun_stats['wins']}승 {self.dryrun_stats['losses']}패(승률 {win_rate:.1f}%), "
+                    f"누적순손익: {self.dryrun_stats['realized_net_pnl']:+,.0f}원({cum_ret:+.2f}%)"
+                )
+                logger.info(sell_msg)
+                try:
+                    with open(self.dryrun_stats['log_path'], "a", encoding="utf-8") as lf:
+                        lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {sell_msg}\n")
+                except Exception:
+                    pass
+
                 if strat:
                     strat.position = PositionTracker()
+                # 복리 반영된 가상 시드머니를 대기 중인 모든 전략 객체에 동기화
+                for st_obj in self.strategies.values():
+                    if st_obj.position.state == StrategyState.IDLE:
+                        st_obj.cash = self.dryrun_stats['virtual_cash']
                 self.sold_today_stocks.add(code)
                 return
 
@@ -881,12 +943,13 @@ class SafeHoldingsThemeGateBot:
                 elif w1 >= w20:
                     score_120t = 5.0
 
-        # 5. 시초가 모멘텀 락온 점수 (+1.5% 돌파, 10점 만점 - momentum_bot 융합)
+        # 5. 시초가 모멘텀 락온 점수 (+1.5% 돌파, 10점 만점 - NXT 프리마켓 08:03~08:30 & KRX 정규장 09:00~09:30)
         score_morning = 0.0
         if c_open > 0:
             change_from_open = ((tick_close - c_open) / c_open) * 100.0
             cur_t = datetime.now().time()
-            if dtime(9, 0, 0) <= cur_t <= dtime(9, 30, 0) and change_from_open >= 1.5:
+            is_early_session = (dtime(8, 3, 0) <= cur_t <= dtime(8, 30, 0)) or (dtime(9, 0, 0) <= cur_t <= dtime(9, 30, 0))
+            if is_early_session and change_from_open >= 1.5:
                 score_morning = 10.0
             elif change_from_open >= 1.0:
                 score_morning = 5.0
@@ -978,13 +1041,17 @@ class SafeHoldingsThemeGateBot:
                     logger.warning(f"⚠️ [{name}({code})] 실전 차트 데이터(60분봉/일봉) 수신 대기 중 ➔ 이번 사이클 평가 스킵")
                     continue
 
-                # 실시간 현재가 최우선 확보: 1순위 실시간 60분봉 마지막 현재가(cur_prc) -> 2순위 계좌 잔고 수신가
+                # 실시간 현재가 최우선 확보:
+                # - NXT 프리마켓/애프터마켓 세션에서는 _AL 통합 차트 현재가(candle_close)가 실시간 NXT 체결가를 반영하므로 최우선 적용!
+                # - KRX 정규장에서는 실계좌 수신가(acc_price) 또는 실시간 60분봉 현재가(candle_close) 적용
                 h_info = self.active_holdings.get(code, {})
                 is_auto_wl = bool(h_info.get('is_auto_watchlist', False))
                 acc_price = float(h_info.get('current_price', 0.0) or 0.0)
 
                 candle_close = float(df_60m.iloc[-1]['close']) if not df_60m.empty else 0.0
-                if not is_auto_wl and acc_price > 0:
+                if exchange_hint == "NXT" and candle_close > 0:
+                    tick_close = candle_close
+                elif not is_auto_wl and acc_price > 0:
                     tick_close = acc_price
                 elif candle_close > 0:
                     tick_close = candle_close
@@ -1059,7 +1126,11 @@ class SafeHoldingsThemeGateBot:
 
                 now_t = datetime.now().time()
                 is_eod_window = (dtime(15, 15, 0) <= now_t <= dtime(15, 30, 0) and exchange_hint == "KRX")
-                is_opening_whipsaw_window = (dtime(9, 0, 0) <= now_t < dtime(9, 3, 0) and exchange_hint == "KRX")
+                is_opening_whipsaw_window = (
+                    (dtime(8, 0, 0) <= now_t < dtime(8, 3, 0) and exchange_hint == "NXT")
+                    or (dtime(9, 0, 0) <= now_t < dtime(9, 3, 0) and exchange_hint == "KRX")
+                )
+                is_premarket_bridge_window = (dtime(8, 45, 0) <= now_t < dtime(8, 50, 0) and exchange_hint == "NXT")
                 cur_qty = h_info.get('qty', 0)
                 pre_holding_qty = cur_qty if (self.is_real and not self.dry_run) else max(cur_qty, prev_pos.total_qty)
 
@@ -1075,7 +1146,8 @@ class SafeHoldingsThemeGateBot:
                         current_price=tick_close,
                         df_120t=df_120t,
                         futures_regime=fut_regime,
-                        futures_label=fut_label
+                        futures_label=fut_label,
+                        is_premarket_bridge_window=is_premarket_bridge_window
                     )
                 else:
                     order = None
@@ -1157,12 +1229,14 @@ class SafeHoldingsThemeGateBot:
                     # 2) 2차 불타기 매수: 이미 활성 운용 중인 종목이므로 즉시 집행
                     elif order.action == "BUY_2":
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
-                    # 3) 신규 1차 매수: 시초 3분(09:00~09:03) 동시호가 휩소 방어 검사 후 우선순위 스코어링 수집
+                    # 3) 신규 1차 매수: 시초 3분(08:00~08:03 프리마켓 / 09:00~09:03 정규장) 휩소 방어 검사 후 우선순위 스코어링 수집
                     elif order.action == "BUY_1":
                         if is_opening_whipsaw_window and not self.dry_run:
+                            whipsaw_label = "08:00~08:03 프리마켓 시초 3분 호가 휩소 방어" if exchange_hint == "NXT" else "09:00~09:03 정규장 시초가 휩소 방어"
+                            resume_time_str = "08:03:00" if exchange_hint == "NXT" else "09:03:00"
                             logger.info(
-                                f"   🛡️ [09:00~09:03 시초가 휩소 방어] [{name}({code})] 시초 동시호가 차익 매물 소화 대기 중 "
-                                f"➔ 09:03:00 이후 돌파 유지 확인 시 진입 (상태 안전 복원)"
+                                f"   🛡️ [{whipsaw_label}] [{name}({code})] 시초 얇은 호가창/차익 매물 소화 대기 중 "
+                                f"➔ {resume_time_str} 이후 양봉·지지 유지 확인 시 진입 (상태 안전 복원)"
                             )
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
@@ -1170,6 +1244,22 @@ class SafeHoldingsThemeGateBot:
                         p_score, p_details = self.calculate_priority_score(
                             code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1, df_daily=df_daily, df_120t=df_120t
                         )
+                        # 🏆 [야간/장중 코스피200선물 vs 코스닥150선물 상대강도 우위 시장 가산점 (+5.0점)]:
+                        # 두 선물지수 중 상대강도가 +0.50%p 이상 우위이고 양봉(+0.30% 이상)인 시장의 대장주에 +5.0점 우선권 부여!
+                        other_market = "KOSDAQ" if stock_market == "KOSPI" else "KOSPI"
+                        other_fut = futures_regimes.get(other_market, {})
+                        my_flu = float(matched_fut.get('flu_rt', 0.0) or 0.0)
+                        other_flu = float(other_fut.get('flu_rt', 0.0) or 0.0)
+                        rel_bonus = 0.0
+                        if (
+                            my_flu >= 0.30
+                            and bool(matched_fut.get('is_bull_candle', True))
+                            and (my_flu - other_flu) >= 0.50
+                        ):
+                            rel_bonus = 5.0
+                            p_score = min(100.0, p_score + rel_bonus)
+                        p_details['rel_market_bonus'] = rel_bonus
+
                         buy_candidates.append({
                             'code': code,
                             'name': name,
@@ -1224,9 +1314,12 @@ class SafeHoldingsThemeGateBot:
                 elif w_fut_regime == "CAUTION_DEFENSE" or is_market_slump:
                     min_required_score = 78.0
                     market_mode_tag = f"{w_fut_label} {w_fut_badge} 하락방어모드(대장주 78점+ 엄선)"
+                elif w_fut_regime == "STRONG_BULL":
+                    min_required_score = 62.0
+                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 강세공격모드(62점+)"
                 else:
                     min_required_score = 65.0
-                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 정상/강세모드"
+                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 정상/강세모드(65점+)"
 
                 if winner['priority_score'] < min_required_score:
                     logger.info(
