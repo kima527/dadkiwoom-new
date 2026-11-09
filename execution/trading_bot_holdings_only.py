@@ -242,7 +242,7 @@ class SafeHoldingsThemeGateBot:
         self.auto_watchlist_picks: dict[str, dict] = {}
         self.pending_buy_orders: dict[str, dict] = {}
         self.last_watchlist_scan_time: float = 0.0
-        self.sold_today_stocks: set[str] = set()
+        self.sold_cooldowns: dict[str, float] = {}  # 매도 종목 단기 쿨다운 (code -> cooldown_until_ts, 영구 차단 없이 관심종목 지속 유지)
         self.current_trading_date = datetime.now().date()
         self.dryrun_stats: dict[str, Any] = {
             'initial_seed': 0.0,
@@ -272,8 +272,6 @@ class SafeHoldingsThemeGateBot:
         """키움 실시간 조건검색(Traiding, traiding, Traiding1) 종목 편입 콜백"""
         clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
         if not clean_code.isdigit() or len(clean_code) != 6:
-            return
-        if clean_code in self.sold_today_stocks:
             return
 
         effective_cond = cond_name.strip() if cond_name and cond_name.strip() else "Traiding"
@@ -524,14 +522,14 @@ class SafeHoldingsThemeGateBot:
                     self.last_watchlist_scan_time = now_ts
                     logger.info(f"📂 [사전 등록 관심종목 로드 완료] holy_grail_watchlist.json에서 성배 타점 {len(saved_wl)}종목 즉시 장착!")
                 else:
-                    exclude_set = set(real_holdings.keys()) | self.sold_today_stocks
+                    exclude_set = set(real_holdings.keys())
                     self.auto_watchlist_picks = scan_and_save_holy_grail_watchlist(
                         self.api, max_picks=12, exclude_codes=exclude_set
                     )
                     self.last_watchlist_scan_time = now_ts
             elif (now_ts - self.last_watchlist_scan_time >= 1800.0) and not self.get_active_stock_code():
                 try:
-                    exclude_set = set(real_holdings.keys()) | self.sold_today_stocks
+                    exclude_set = set(real_holdings.keys())
                     self.auto_watchlist_picks = scan_and_save_holy_grail_watchlist(
                         self.api, max_picks=12, exclude_codes=exclude_set
                     )
@@ -549,6 +547,7 @@ class SafeHoldingsThemeGateBot:
                 holdings[code] = h
 
         # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입 (조건식 중복 포착 수 많은 순 → 최신 포착순, 최대 15종목)
+        # 💡 매도된 종목도 버리지 않고 계속 관심종목으로 유지하며 120틱 파동을 지속 들여다봄!
         cond_added_count = 0
         with self.condition_lock:
             sorted_cond_picks = sorted(
@@ -558,7 +557,7 @@ class SafeHoldingsThemeGateBot:
             )[:15]
         for c_pick in sorted_cond_picks:
             code = c_pick['code']
-            if code not in real_holdings and code not in self.sold_today_stocks:
+            if code not in real_holdings:
                 holdings[code] = {
                     'name': c_pick.get('name', ''),
                     'qty': 0,
@@ -571,10 +570,10 @@ class SafeHoldingsThemeGateBot:
                 }
                 cond_added_count += 1
 
-        # (B-2) 🌟 성배 로직 최적합 자동 발굴 관심종목 편입 (실계좌 미보유 & 당일 미매도 종목)
+        # (B-2) 🌟 성배 로직 최적합 자동 발굴 관심종목 편입
         auto_added_count = 0
         for code, pick in self.auto_watchlist_picks.items():
-            if code not in holdings and code not in real_holdings and code not in self.sold_today_stocks:
+            if code not in holdings and code not in real_holdings:
                 holdings[code] = {
                     'name': pick.get('name', ''),
                     'qty': 0,
@@ -930,7 +929,9 @@ class SafeHoldingsThemeGateBot:
                 for st_obj in self.strategies.values():
                     if st_obj.position.state == StrategyState.IDLE:
                         st_obj.cash = self.dryrun_stats['virtual_cash']
-                self.sold_today_stocks.add(code)
+                # 매도 종목 영구 차단 없이 관심종목 지속 유지 + 3분(180초) 휩소 방지 쿨다운 적용
+                self.sold_cooldowns[code] = time.time() + 180.0
+                logger.info(f"   👀 [{name}({code})] 모의 전량 매도 완료 ➔ 관심종목 지속 유지! (3분 쿨다운 후 120틱 신규 골든크로스 재진입 감시)")
                 return
 
             if exchange_hint == "NXT":
@@ -949,12 +950,12 @@ class SafeHoldingsThemeGateBot:
                 logger.info(f"   ✅ [전량 매도 접수 완료] 주문번호: {order_no}")
 
             if strat:
-                # 전량 매도 완료 즉시 포지션 초기화 (IDLE 복귀, 재매수 없음)
+                # 전량 매도 완료 즉시 포지션 초기화 (IDLE 복귀)
                 strat.position = PositionTracker()
 
-            # 당일 매도 완료 종목으로 등록하여 당일 재매수 원천 차단
-            self.sold_today_stocks.add(code)
-            logger.info(f"   🚫 [{name}({code})] 당일 매도 완료 처리 ➔ 당일 재매수 영구 차단 목록에 등록되었습니다.")
+            # 매도 종목 영구 차단 없이 관심종목 지속 유지 + 3분(180초) 휩소 방지 쿨다운 적용
+            self.sold_cooldowns[code] = time.time() + 180.0
+            logger.info(f"   👀 [{name}({code})] 전량 매도 완료 ➔ 관심종목 지속 유지! (3분 쿨다운 후 120틱 신규 골든크로스 재진입 감시)")
 
     def get_active_stock_code(self, exclude_codes: Optional[set[str]] = None) -> str | None:
         """
@@ -1143,8 +1144,8 @@ class SafeHoldingsThemeGateBot:
         # 🌅 날짜 변경 시 당일 매도 완료(No-Rebuy) 목록 자동 초기화
         today_date = datetime.now().date()
         if today_date != self.current_trading_date:
-            logger.info(f"🌅 [영업일 변경 감지] {self.current_trading_date} ➔ {today_date} | 당일 매도 차단 목록({len(self.sold_today_stocks)}종목) 초기화 완료")
-            self.sold_today_stocks.clear()
+            logger.info(f"🌅 [영업일 변경 감지] {self.current_trading_date} ➔ {today_date} | 매도 쿨다운 목록 초기화 완료")
+            self.sold_cooldowns.clear()
             self.current_trading_date = today_date
 
         self.refresh_holdings()
@@ -1189,9 +1190,9 @@ class SafeHoldingsThemeGateBot:
             if not strat or strat.position.state == StrategyState.TERMINATED:
                 continue
 
-            # 🚫 당일 매도 완료 종목: 신규 매수 감시 원천 제외 (No-Rebuy 원칙)
-            if code in self.sold_today_stocks and strat.position.state == StrategyState.IDLE:
-                continue
+            # 💡 쿨다운 확인: 매도 직후 단기 쿨다운(3분) 중인지 체크 (종목을 버리지 않고 계속 들여다봄)
+            now_ts = time.time()
+            cooldown_rem = max(0.0, self.sold_cooldowns.get(code, 0.0) - now_ts)
 
             # ⏱️ 키움 API 초당 5회(TR 제한) 방어 및 네트워크 부하 분산 딜레이
             time.sleep(0.15)
@@ -1389,8 +1390,12 @@ class SafeHoldingsThemeGateBot:
                     source_badge = ""
                 rs_status = f"🔥지수초과({day_alpha:+.2f}%p)" if is_outperforming_index else f"⚪지수대비({day_alpha:+.2f}%p)"
                 mkt_tag = f"[{stock_market}·{fut_badge}·{rs_status}]"
+                if strat.position.state == StrategyState.IDLE and cooldown_rem > 0:
+                    state_display = f"IDLE(쿨다운 {cooldown_rem:.0f}초)"
+                else:
+                    state_display = strat.position.state.value
                 logger.info(
-                    f"📊 {source_badge}[{name}]{mkt_tag} 상태: {strat.position.state.value}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f}({day_ret_pct:+.2f}%) | "
+                    f"📊 {source_badge}[{name}]{mkt_tag} 상태: {state_display}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f}({day_ret_pct:+.2f}%) | "
                     f"60분: {align_str} | {m3_str} | 관문선: {gate_val:,.0f} | {gijun_str}"
                 )
 
@@ -1424,8 +1429,16 @@ class SafeHoldingsThemeGateBot:
                     # 2) 2차 불타기 매수: 이미 활성 운용 중인 종목이므로 즉시 집행
                     elif order.action == "BUY_2":
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
-                    # 3) 신규 1차 매수: 시초 3분(08:00~08:03 프리마켓 / 09:00~09:03 정규장) 휩소 방어 검사 후 우선순위 스코어링 수집
+                    # 3) 신규 1차 매수: 쿨다운/시초 휩소 방어 검사 후 우선순위 스코어링 수집
                     elif order.action == "BUY_1":
+                        if cooldown_rem > 0:
+                            logger.info(
+                                f"   ⏳ [매도 후 쿨다운 대기] [{name}({code})] 3분 쿨다운 잔여 {cooldown_rem:.0f}초 "
+                                f"➔ 동일봉 휩소 방어 대기 중 (관심종목은 계속 유지하며 120틱 재진입 추적)"
+                            )
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
+
                         if is_opening_whipsaw_window and not self.dry_run:
                             whipsaw_label = "08:00~08:03 프리마켓 시초 3분 호가 휩소 방어" if exchange_hint == "NXT" else "09:00~09:03 정규장 시초가 휩소 방어"
                             resume_time_str = "08:03:00" if exchange_hint == "NXT" else "09:03:00"
