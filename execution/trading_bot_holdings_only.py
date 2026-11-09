@@ -189,7 +189,8 @@ class SafeHoldingsThemeGateBot:
         holdings_state: str = "idle",
         auto_scan: bool = False,
         condition_name: str = "Traiding,traiding,Traiding1,trading1",
-        enable_ws: bool = True
+        enable_ws: bool = True,
+        min_overlap: int = 1
     ):
         """
         is_real: 키움 실전 API 연동 여부
@@ -204,6 +205,9 @@ class SafeHoldingsThemeGateBot:
         self.dry_run = dry_run
         self.auto_scan = auto_scan
         self.condition_name = condition_name
+        # 조건식 중복 포착 집계: 전체 조건식 개수 및 신규 매수 허용 최소 중복 수 (기본 1 = 중복 많은 종목 '우선', 3 = 3곳 이상만 매수)
+        self.condition_total = max(1, len({n.strip() for n in str(condition_name).split(',') if n.strip()}))
+        self.min_overlap = max(1, min(int(min_overlap), self.condition_total))
         self.enable_ws = enable_ws and HAS_WS_CLIENT
         if is_real and not HAS_REAL_API:
             logger.error("❌ [치명적 오류] 실전 계좌 전용 봇(holdings_bot.bat)에서 키움 실전 API(RealAPIAdapter) 로드에 실패했습니다.")
@@ -277,28 +281,59 @@ class SafeHoldingsThemeGateBot:
             is_new = clean_code not in self.condition_picks
             existing = self.condition_picks.get(clean_code, {})
             prev_conds = set(existing.get('cond_names', []))
+            is_new_cond = effective_cond not in prev_conds
             prev_conds.add(effective_cond)
+            overlap = len(prev_conds)
             cond_label = ", ".join(sorted(prev_conds))
             self.condition_picks[clean_code] = {
                 'code': clean_code,
-                'name': self.stock_name_cache.get(clean_code, ''),
+                'name': self.stock_name_cache.get(clean_code, existing.get('name', '')),
                 'cond_names': sorted(prev_conds),
-                'target_tag': f'🔔실시간조건({cond_label})',
-                'captured_at': time.time()
+                'overlap': overlap,
+                'target_tag': f'🔔조건중복{overlap}/{self.condition_total}({cond_label})',
+                'captured_at': existing.get('captured_at', time.time()),
+                'last_update': time.time()
             }
 
+        cached_nm = self.stock_name_cache.get(clean_code, f"종목_{clean_code}")
         if is_new:
-            cached_nm = self.stock_name_cache.get(clean_code, f"종목_{clean_code}")
             logger.info(
                 f"🔔 [실시간 조건검색 포착] [{cached_nm}({clean_code})] (포착 조건식: {effective_cond}) "
                 f"➔ 지수 상대강도 & 120틱 매수 타점 즉시 검증 깨우기!"
             )
             self.condition_wakeup_event.set()
+        elif is_new_cond:
+            logger.info(
+                f"🔥 [조건식 중복 포착 {overlap}/{self.condition_total}] [{cached_nm}({clean_code})] "
+                f"'{effective_cond}' 추가 편입 ➔ 현재 [{cond_label}] 동시 포착 (중복 많을수록 최우선 매매)"
+            )
+            if overlap >= 3:
+                self.condition_wakeup_event.set()
 
-    def _on_condition_delete(self, code: str):
-        """키움 실시간 조건검색 종목 이탈 콜백 (보유 중이거나 파동 살아있는 종목 보호를 위해 즉시 삭제하지 않고 메인 루프에서 상대강도로 정밀 관리)"""
+    def _on_condition_delete(self, code: str, cond_name: str = ""):
+        """키움 실시간 조건검색 종목 이탈 콜백: 해당 조건식만 중복 집계에서 제외 (보유/파동 종목 보호를 위해 감시 목록 자체는 메인 루프에서 상대강도로 관리)"""
         clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
-        logger.debug(f"🔕 [실시간 조건검색 이탈 신호] 종목코드: {clean_code} (지수 상대강도 및 120틱 추세 유지 여부로 감시 지속 판단)")
+        effective_cond = cond_name.strip() if cond_name else ""
+        with self.condition_lock:
+            pick = self.condition_picks.get(clean_code)
+            if pick and effective_cond and effective_cond in pick.get('cond_names', []):
+                remaining = [c for c in pick['cond_names'] if c != effective_cond]
+                if remaining:
+                    pick['cond_names'] = remaining
+                    pick['overlap'] = len(remaining)
+                    pick['target_tag'] = f"🔔조건중복{len(remaining)}/{self.condition_total}({', '.join(remaining)})"
+                    pick['last_update'] = time.time()
+                else:
+                    # 마지막 조건식까지 이탈 → 최소 1로 유지(감시 지속), 정리는 메인 루프 상대강도 판정에 위임
+                    pick['overlap'] = 1
+                    pick['last_update'] = time.time()
+        logger.debug(f"🔕 [실시간 조건검색 이탈] 종목코드: {clean_code} 조건식: {effective_cond or '-'} (중복 집계 갱신)")
+
+    def get_condition_overlap(self, code: str) -> int:
+        """해당 종목이 현재 몇 개의 조건식(Traiding/traiding/trading1/Traiding1)에 동시 포착 중인지 반환 (0 = 조건검색 미포착)"""
+        with self.condition_lock:
+            pick = self.condition_picks.get(code)
+            return int(pick.get('overlap', 1)) if pick else 0
 
     def _start_condition_ws_daemon(self):
         """백그라운드 데몬 스레드에서 KiwoomWebSocketClient 실시간 조건검색 수신 루프 구동"""
@@ -513,12 +548,12 @@ class SafeHoldingsThemeGateBot:
             if int(h.get('qty', 0)) > 1:
                 holdings[code] = h
 
-        # (B-1) 🔔 키움 실시간 조건검색(Traiding, traiding, Traiding1) 포착 종목 최우선 편입 (최신 포착순 최대 15종목)
+        # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입 (조건식 중복 포착 수 많은 순 → 최신 포착순, 최대 15종목)
         cond_added_count = 0
         with self.condition_lock:
             sorted_cond_picks = sorted(
                 self.condition_picks.values(),
-                key=lambda x: float(x.get('captured_at', 0.0)),
+                key=lambda x: (int(x.get('overlap', 1)), float(x.get('last_update', x.get('captured_at', 0.0)))),
                 reverse=True
             )[:15]
         for c_pick in sorted_cond_picks:
@@ -1343,7 +1378,9 @@ class SafeHoldingsThemeGateBot:
                     profit_tag = f" [수익률: {cur_pnl:+.2f}%(최고 +{ref_pos.max_profit_pct:.2f}%)]"
 
                 if is_cond_pick:
-                    source_badge = "🔔[실시간조건(Traiding)] "
+                    cond_overlap_now = self.get_condition_overlap(code)
+                    star = "🔥" if cond_overlap_now >= 3 else "🔔"
+                    source_badge = f"{star}[조건중복 {cond_overlap_now}/{self.condition_total}] "
                 elif is_auto_wl:
                     source_badge = "🌟[타점관종] "
                 else:
@@ -1397,10 +1434,20 @@ class SafeHoldingsThemeGateBot:
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
 
+                        # 🔥 [조건식 중복 포착 게이트]: --min-overlap N 지정 시, N곳 미만 포착 조건검색 종목은 신규 매수 보류
+                        cond_overlap = self.get_condition_overlap(code) if is_cond_pick else 0
+                        if is_cond_pick and cond_overlap < self.min_overlap:
+                            logger.info(
+                                f"   ⏸️ [조건 중복 부족 매수 보류] [{name}({code})] 조건식 {cond_overlap}/{self.condition_total}곳 포착 "
+                                f"< 최소 {self.min_overlap}곳 ➔ 120틱 타점이 떠도 진입하지 않고 중복 포착 대기"
+                            )
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
+
                         p_score, p_details = self.calculate_priority_score(
                             code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1, df_daily=df_daily, df_120t=df_120t
                         )
-                        # 🏆 [1) 금일 지수 대비 초과강도(RS Alpha) 가산점 (+4~+10점) & 실시간 조건검색(Traiding) 포착 우선권 (+5점)]
+                        # 🏆 [1) 금일 지수 대비 초과강도(RS Alpha) 가산점 (+4~+10점) & 실시간 조건검색 중복 포착 가산점]
                         rs_alpha_bonus = 0.0
                         if day_alpha >= 3.5 and intraday_alpha >= 1.5:
                             rs_alpha_bonus = 10.0
@@ -1408,7 +1455,8 @@ class SafeHoldingsThemeGateBot:
                             rs_alpha_bonus = 7.0
                         elif day_alpha >= 1.5 and intraday_alpha >= 0.5:
                             rs_alpha_bonus = 4.0
-                        cond_bonus = 5.0 if is_cond_pick else 0.0
+                        # 조건식 중복 수 가산점: 1곳 +5 / 2곳 +8 / 3곳 +12 / 4곳 +15
+                        cond_bonus = {0: 0.0, 1: 5.0, 2: 8.0, 3: 12.0}.get(cond_overlap, 15.0) if is_cond_pick else 0.0
 
                         # 🏆 [2) 야간/장중 코스피200선물 vs 코스닥150선물 상대강도 우위 시장 가산점 (+5.0점)]:
                         other_market = "KOSDAQ" if stock_market == "KOSPI" else "KOSPI"
@@ -1426,6 +1474,7 @@ class SafeHoldingsThemeGateBot:
                         p_score = min(100.0, p_score + rs_alpha_bonus + cond_bonus + rel_bonus)
                         p_details['rs_alpha_bonus'] = rs_alpha_bonus
                         p_details['cond_bonus'] = cond_bonus
+                        p_details['cond_overlap'] = cond_overlap
                         p_details['day_alpha'] = day_alpha
                         p_details['rel_market_bonus'] = rel_bonus
 
@@ -1433,6 +1482,7 @@ class SafeHoldingsThemeGateBot:
                             'code': code,
                             'name': name,
                             'market': stock_market,
+                            'cond_overlap': cond_overlap,
                             'fut_regime': fut_regime,
                             'fut_label': fut_label,
                             'fut_badge': fut_badge,
@@ -1466,8 +1516,9 @@ class SafeHoldingsThemeGateBot:
                     # 상태 안전 원복 (스냅샷 기반 포지션/예수금/거래내역 완벽 복구)
                     self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
             else:
-                # 슬롯 0/1 비어있음! 최고 우선순위 점수 종목 선정 및 소속 시장 선물지수 연동 커트라인 검증
-                buy_candidates.sort(key=lambda x: x['priority_score'], reverse=True)
+                # 슬롯 0/1 비어있음! [1순위] 조건식 중복 포착 수 → [2순위] 우선순위 점수 순으로 종목 선정
+                # (점수는 100점 상한이라 가산점만으로는 동점이 생기므로, 중복 수를 1차 정렬키로 사용)
+                buy_candidates.sort(key=lambda x: (x.get('cond_overlap', 0), x['priority_score']), reverse=True)
                 winner = buy_candidates[0]
                 w_d = winner['details']
                 w_fut_regime = winner.get('fut_regime', 'NORMAL_BULL')
@@ -1501,6 +1552,7 @@ class SafeHoldingsThemeGateBot:
                 else:
                     logger.info(
                         f"👑 [동시 기준선 돌파 1픽 선정] 총 {len(buy_candidates)}개 돌파 후보 중 [{winner['name']}({winner['code']})] "
+                        f"[🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
                         f"우선순위 1위 ({winner['priority_score']:.1f}점/100점 | {market_mode_tag} 커트라인 {min_required_score:.0f}점 통과) 선정 및 매수 집행! "
                         f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}% 돌파({w_d.get('score_speed', 0.0):.0f}점), "
                         f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
@@ -1554,6 +1606,8 @@ if __name__ == '__main__':
     parser.add_argument("--condition", type=str, default="Traiding,traiding,Traiding1,trading1",
                         help="키움 실시간 조건검색식 이름 (기본값: Traiding,traiding,Traiding1,trading1)")
     parser.add_argument("--auto-scan", action="store_true", help="정적 관심종목(holy_grail_watchlist.json) 병행 스캔 활성화")
+    parser.add_argument("--min-overlap", type=int, default=1,
+                        help="신규 매수 허용 최소 조건식 중복 포착 수 (기본 1=중복 많은 종목 우선 매매, 3=3곳 이상 동시 포착 종목만 매수)")
     parser.add_argument("--no-ws", action="store_true", help="실시간 조건검색 웹소켓 비활성화")
 
     args = parser.parse_args()
@@ -1564,7 +1618,8 @@ if __name__ == '__main__':
         holdings_state=args.holdings_state,
         auto_scan=args.auto_scan,
         condition_name=args.condition,
-        enable_ws=(not args.no_ws)
+        enable_ws=(not args.no_ws),
+        min_overlap=args.min_overlap
     )
 
     if args.once:

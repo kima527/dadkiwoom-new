@@ -293,10 +293,16 @@ class KiwoomWebSocketClient:
                                         asyncio.create_task(self.subscribe_real_tick(code))
                                         
                                 elif evt_tp == 'D':
-                                    if asyncio.iscoroutinefunction(self.on_delete):
-                                        asyncio.create_task(self.on_delete(code))
-                                    else:
-                                        self.on_delete(code)
+                                    try:
+                                        if asyncio.iscoroutinefunction(self.on_delete):
+                                            asyncio.create_task(self.on_delete(code, cond_name))
+                                        else:
+                                            self.on_delete(code, cond_name)
+                                    except TypeError:
+                                        if asyncio.iscoroutinefunction(self.on_delete):
+                                            asyncio.create_task(self.on_delete(code))
+                                        else:
+                                            self.on_delete(code)
                                         
                         elif name == '주식체결':
                             code = values.get('9001', '').replace('A', '') # 종목코드
