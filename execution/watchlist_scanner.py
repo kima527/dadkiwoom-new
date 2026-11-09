@@ -173,9 +173,16 @@ def collect_market_candidates(api, max_candidates: int = 45) -> List[Dict[str, A
     return sorted_cands[:max_candidates]
 
 
-def evaluate_holy_grail_fit(code: str, name: str, hint_price: float, api) -> Optional[Dict[str, Any]]:
+def evaluate_holy_grail_fit(
+    code: str,
+    name: str,
+    hint_price: float,
+    api,
+    futures_regimes: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
     """
     단일 후보 종목이 현재 `strategy.py`의 매수 로직에 부합하는지 2단계(일봉 -> 60분봉) 고속 검증:
+    0) 소속 시장 지수(코스피200선물/코스닥150선물) 대비 상대강도 우위 (Day Alpha >= +1.5%p)
     1) 일봉 TEMA 5>=20 상승추세(daily_bull) & 데드크로스 부재
     2) 실시간 3일선 M/3 수식선 상단 지지 (tick_close >= day3_m_line)
     3) 60분봉 정배열(5>20>60) 또는 20선 상단 지지 (is_bull_support)
@@ -214,6 +221,22 @@ def evaluate_holy_grail_fit(code: str, name: str, hint_price: float, api) -> Opt
         day_ret_pct = ((curr_price - pred1) / pred1 * 100.0) if pred1 > 0 else 0.0
         if day_ret_pct < -1.0 or day_ret_pct > 9.5:
             return None
+
+        # 🏆 [금일 시장 지수 대비 상대강도(RS Alpha) 필터]:
+        # 소속 시장 지수(코스피200선물/코스닥150선물) 대비 최소 +1.5%p 이상 강하게 움직이는 종목만 통과!
+        day_alpha = day_ret_pct
+        if futures_regimes:
+            m_type = "KOSDAQ"
+            if hasattr(api, "get_stock_market_type"):
+                try:
+                    m_type = api.get_stock_market_type(code)
+                except Exception:
+                    pass
+            m_fut = futures_regimes.get(m_type, {})
+            fut_flu = float(m_fut.get("flu_rt", 0.0) or 0.0)
+            day_alpha = day_ret_pct - fut_flu
+            if day_alpha < 1.5:
+                return None
 
         # 🛡️ [시가총액 탄력 구간 필터 (1,000억 ~ 8조 원)]:
         # 시총 8조 초과 초대형 둔중주(KB금융 60조, 셀트리온 45조, 현대모비스 33조, 한국전력 20조 등) 및
@@ -379,12 +402,21 @@ def scan_and_save_holy_grail_watchlist(api, max_picks: int = 12, exclude_codes: 
 
     logger.info(f"⚡ 1차 수급/양봉 필터 통과 주도주 {len(raw_candidates)}개 대상 [일봉 추세 ➔ 시총(1천억~8조) ➔ M/3선 ➔ 60분봉 관문/기준선] 정밀 검증...")
 
+    futures_regimes = {}
+    if hasattr(api, "get_futures_market_regime"):
+        try:
+            futures_regimes = api.get_futures_market_regime() or {}
+        except Exception:
+            futures_regimes = {}
+
     matched: List[Dict[str, Any]] = []
     for cand in raw_candidates:
         code = cand["code"]
         if exclude_codes and code in exclude_codes:
             continue
-        res = evaluate_holy_grail_fit(code, cand.get("name", ""), cand.get("price", 0.0), api)
+        res = evaluate_holy_grail_fit(
+            code, cand.get("name", ""), cand.get("price", 0.0), api, futures_regimes=futures_regimes
+        )
         if res:
             matched.append(res)
 

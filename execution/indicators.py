@@ -113,31 +113,33 @@ def detect_gate_inflection(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
     
-    # 골든크로스 시점의 gate 값들만 추출하여 변곡 확인
+    # 골든크로스 시점의 gate 값들만 추출하여 변곡 확인 (중복 타임스탬프 방지를 위해 정수 위치 기반 iloc 사용)
     gate_levels = []
-    cross_indices = df.index[df['gate_cross_up']].tolist()
-    
-    df['gate_up_turnaround'] = False
-    
-    for i, idx in enumerate(cross_indices):
-        curr_gate = df.loc[idx, 'theme_gate']
-        gate_levels.append((idx, curr_gate))
-        
+    cross_positions = np.flatnonzero(df['gate_cross_up'].fillna(False).to_numpy())
+    turnaround_flags = np.zeros(len(df), dtype=bool)
+    gate_arr = df['theme_gate'].to_numpy(dtype=float)
+
+    for pos in cross_positions:
+        curr_gate = float(gate_arr[pos])
+        gate_levels.append((pos, curr_gate))
+
         # 최소 3번의 골든크로스 기록이 있으면 변곡 판정 가능
         if len(gate_levels) >= 3:
             prev2_gate = gate_levels[-3][1]
             prev1_gate = gate_levels[-2][1]
             curr_val = gate_levels[-1][1]
-            
+
             # G[k-2] > G[k-1] (하락하던 테마급등관문선) and G[k] > G[k-1] (상승변곡 시작)
             if prev2_gate > prev1_gate and curr_val > prev1_gate:
-                df.loc[idx, 'gate_up_turnaround'] = True
+                turnaround_flags[pos] = True
         elif len(gate_levels) == 2:
             # 기록이 2개일 때는 직전보다 상승 시 변곡 시작으로 인정
             prev1_gate = gate_levels[-2][1]
             curr_val = gate_levels[-1][1]
             if curr_val > prev1_gate:
-                df.loc[idx, 'gate_up_turnaround'] = True
+                turnaround_flags[pos] = True
+
+    df['gate_up_turnaround'] = turnaround_flags
                 
     # 보조: 60분봉 TEMA 5선의 U턴 변곡
     # TEMA1(t-2) > TEMA1(t-1) and TEMA1(t-1) < TEMA1(t)
@@ -195,7 +197,7 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     if df_120t is None or df_120t.empty:
         return pd.DataFrame()
         
-    df = df_120t.copy()
+    df = df_120t.copy().reset_index(drop=True)
     if 'close' not in df.columns:
         return pd.DataFrame()
         
@@ -209,12 +211,12 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     # 실시간 현재가(current_price)가 전달된 경우 마지막 120틱 봉에 즉시 반영
     if current_price is not None and float(current_price) > 0 and len(df) > 0:
         cp = float(current_price)
-        last_idx = df.index[-1]
-        df.loc[last_idx, 'close'] = cp
-        if cp > float(df.loc[last_idx, 'high']):
-            df.loc[last_idx, 'high'] = cp
-        if cp < float(df.loc[last_idx, 'low']):
-            df.loc[last_idx, 'low'] = cp
+        last_pos = len(df) - 1
+        df.iat[last_pos, df.columns.get_loc('close')] = cp
+        if cp > float(df.iat[last_pos, df.columns.get_loc('high')]):
+            df.iat[last_pos, df.columns.get_loc('high')] = cp
+        if cp < float(df.iat[last_pos, df.columns.get_loc('low')]):
+            df.iat[last_pos, df.columns.get_loc('low')] = cp
 
     # 1) 상단 차트 지표: 노란색 급등관문선(theme_gate), 검정점선 급등관문고가선(theme_gate_high), 분홍색 기준선(theme_gijun)
     df = calculate_theme_gate_line(df, p1=5, p2=20)

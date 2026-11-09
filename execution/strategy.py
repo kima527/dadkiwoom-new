@@ -139,6 +139,9 @@ class ThemeGate60mStrategy:
         futures_regime = str(kwargs.get('futures_regime', 'NORMAL_BULL')).strip()
         futures_label = str(kwargs.get('futures_label', '선물지수')).strip()
         is_premarket_bridge_window = bool(kwargs.get('is_premarket_bridge_window', False))
+        is_outperforming_index = bool(kwargs.get('is_outperforming_index', True))
+        is_condition_pick = bool(kwargs.get('is_condition_pick', False))
+        day_alpha = float(kwargs.get('day_alpha', 0.0) or 0.0)
         has_120t_wave = False
         gate_120t = np.nan
         gate_high_120t = np.nan
@@ -228,14 +231,21 @@ class ThemeGate60mStrategy:
         sma60 = row.get('sma60', np.nan)
         
         is_bull_support = False
+        is_60m_sma20_support = True
         if not np.isnan(sma5) and not np.isnan(sma20):
             is_bull_support = (close >= sma20 * 0.995) and (sma5 >= sma20 * 0.990)
+            is_60m_sma20_support = (close >= sma20 * 0.990)
 
         if self.position.state == StrategyState.IDLE:
             # 🚨 [소속 시장 선물지수 폭락 서킷브레이커 (CRASH_LOCK) 및 08:45~08:49 프리마켓 마감 직전 신규진입 차단]:
             # 1) 코스피 종목은 코스피200선물, 코스닥 종목은 코스닥150선물이 투매/폭락장(CRASH_LOCK)일 때 신규 1차 매수 전면 차단!
             # 2) 08:45~08:49:59 프리마켓 마감 브릿지 구간에서는 08:50~09:00 10분 거래중단(블랙아웃) 보호를 위해 신규 1차 진입 차단!
             if futures_regime == "CRASH_LOCK" or is_premarket_bridge_window:
+                return None
+
+            # 🏆 [금일 시장 지수 대비 상대강도(RS Alpha) 필수 필터]:
+            # 소속 시장 지수(코스피200선물/코스닥150선물)보다 강하게 움직이는 주도주만 신규 매수 허용
+            if not is_outperforming_index:
                 return None
 
             if not daily_bull:
@@ -260,30 +270,35 @@ class ThemeGate60mStrategy:
             if (upper_shadow / c_range) > 0.45:
                 return None
 
-            # 🛡️ [기준선 과열 추격매수 차단]: 60분봉 기준선 대비 +4.5% 초과 이격 과열 구간에서는 신규 1차 추격매수 원천 차단
-            if not np.isnan(gijun_line) and gijun_line > 0 and tick_close > gijun_line * 1.045:
+            # 🛡️ [기준선 과열 추격매수 차단]: 유효 기준선(120틱 기준선 우선, 부재 시 60분봉 기준선) 대비 +4.5% 초과 이격 과열 시 차단
+            ref_overheat_gijun = gijun_120t if (has_120t_wave and not np.isnan(gijun_120t) and gijun_120t > 0) else gijun_line
+            if not np.isnan(ref_overheat_gijun) and ref_overheat_gijun > 0 and tick_close > ref_overheat_gijun * 1.045:
                 return None
 
             # ⚡ [120틱 WMA/TEMA 순차돌파 & 실시간 현재가 반영 검증]
             is_120t_breakout = True
+            is_120t_wma_seq_breakout = False
             if df_120t is not None and len(df_120t) >= 65 and 'close' in df_120t:
                 s_120t = df_120t['close'].astype(float).copy()
                 if tick_close > 0:
                     s_120t.iloc[-1] = tick_close
                 w1 = float(s_120t.iloc[-1])
                 w20 = float(calculate_wma(s_120t, 20).iloc[-1])
+                w40 = float(calculate_wma(s_120t, 40).iloc[-1])
                 w60 = float(calculate_wma(s_120t, 60).iloc[-1])
                 if not np.isnan(w20) and not np.isnan(w60) and w20 > 0 and w60 > 0:
                     is_120t_breakout = ((w1 >= w20 * 0.998) and (w1 >= w60 * 0.995)) or (is_tema5_20_bull_120t and is_tema120_up)
+                if not np.isnan(w20) and not np.isnan(w40) and not np.isnan(w60) and w20 > 0 and w40 > 0 and w60 > 0:
+                    is_120t_wma_seq_breakout = (w1 >= w20 * 0.998) and (w1 >= w40 * 0.998) and (w1 >= w60 * 0.998)
 
-            # 🎯 [정석 1차 타점 A: 노란색 급등관문선(theme_gate) 지지/상승변곡 선취매]
-            # - 120틱 노란색 관문선 지지 또는 60분봉 노란색 관문선 지지 (발목 타점)
+            # 🎯 [120틱 타점 A: 120틱 노란색 급등관문선(theme_gate) 지지/상승변곡 선취매]
             gate_support_120t = (
                 has_120t_wave
                 and not np.isnan(gate_120t)
                 and gate_120t > 0
-                and (gate_120t * 0.992 <= tick_close <= gate_120t * 1.020)
+                and ((gate_120t * 0.992 <= tick_close <= gate_120t * 1.022) or (is_gate_up_120t and tick_close >= gate_120t * 0.990))
                 and is_tema5_20_bull_120t
+                and upper_shadow_ratio_120t <= 0.38
             )
             gate_support_60m = is_gate_up or (
                 not np.isnan(gate_line)
@@ -292,31 +307,47 @@ class ThemeGate60mStrategy:
                 and low <= gate_line * 1.018
             )
             # 🌡️ [소속 시장 선물지수 하락방어모드 (CAUTION_DEFENSE) 연동]:
-            # 선물지수가 약세/하락 주의장일 때는 어설픈 노란색 급등관문선 바닥 줍기(떨어지는 칼날 받기)를 차단하고,
-            # 반드시 120틱 테마120 상승변곡 + 검정점선(급등관문고가돌파선) 돌파(또는 분홍 기준선 돌파)가 확인된 대장주만 1차 매수 허용!
             if futures_regime == "CAUTION_DEFENSE":
                 is_yellow_gate_buy = False
+            elif has_120t_wave:
+                is_yellow_gate_buy = gate_support_120t or (is_bull_support and gate_support_60m and is_tema5_20_bull_120t)
             else:
-                is_yellow_gate_buy = gate_support_120t or gate_support_60m
+                is_yellow_gate_buy = gate_support_60m
 
-            # 🚀 [강세 예외 1차 타점 B: 120틱 테마120 상승변곡 + 검정 점선(급등관문고가선) 직행 돌파 또는 기준선 초기 돌파]
+            # 🚀 [120틱 타점 B: 120틱 테마120 상승변곡 + 검정 점선(급등관문고가선) 또는 120틱 분홍 기준선 돌파]
             gate_high_breakout_120t = (
                 has_120t_wave
                 and is_tema120_up
                 and is_tema5_20_bull_120t
                 and upper_shadow_ratio_120t <= 0.35
-                and not np.isnan(gate_high_120t)
-                and gate_high_120t > 0
-                and (gate_high_120t <= tick_close <= gate_high_120t * 1.025)
+                and (
+                    (not np.isnan(gate_high_120t) and gate_high_120t > 0 and (gate_high_120t <= tick_close <= gate_high_120t * 1.028))
+                    or (not np.isnan(gijun_120t) and gijun_120t > 0 and (gijun_120t <= tick_close <= gijun_120t * 1.030))
+                )
+            )
+            # 🔥 [120틱 타점 C: 120틱 WMA 20-40-60 순차돌파 + 테마120 상승변곡 & 노란 양운(테마60>120) 가속 돌파]
+            wma_cloud_surge_120t = (
+                has_120t_wave
+                and is_120t_wma_seq_breakout
+                and is_tema120_up
+                and is_tema60_120_gc_120t
+                and is_tema5_20_bull_120t
+                and upper_shadow_ratio_120t <= 0.35
+                and (np.isnan(gate_120t) or gate_120t <= 0 or tick_close >= gate_120t * 0.995)
             )
             gijun_breakout = (
                 not np.isnan(gijun_line)
                 and gijun_line > 0
                 and (gijun_line <= tick_close <= gijun_line * 1.035)
             )
-            is_strong_breakout_buy = gate_high_breakout_120t or gijun_breakout
+            if has_120t_wave:
+                is_strong_breakout_buy = gate_high_breakout_120t or wma_cloud_surge_120t or (is_bull_support and gijun_breakout and is_tema5_20_bull_120t)
+                can_trigger_120t_buy = is_60m_sma20_support and is_120t_breakout and (is_yellow_gate_buy or is_strong_breakout_buy)
+            else:
+                is_strong_breakout_buy = gijun_breakout
+                can_trigger_120t_buy = is_bull_support and is_120t_breakout and (is_yellow_gate_buy or is_strong_breakout_buy)
             
-            if is_bull_support and is_120t_breakout and (is_yellow_gate_buy or is_strong_breakout_buy):
+            if can_trigger_120t_buy:
                 budget = self.cash * 0.50
                 buy_price = tick_close
                 qty = int(budget // buy_price)
@@ -342,13 +373,19 @@ class ThemeGate60mStrategy:
                         self.position.cleared_gijun_price = active_gijun if (not np.isnan(active_gijun) and active_gijun > 0) else 0.0
                     self.position.second_gijun_price = 0.0
 
+                    alpha_tag = f"[지수초과강도 {day_alpha:+.2f}%p] " if day_alpha != 0.0 else ""
+                    cond_tag = "🔔[실시간조건검색] " if is_condition_pick else ""
                     if is_yellow_gate_buy:
                         self.position.entry_mode = "GATE_SUPPORT"
                         ref_g = gate_120t if gate_support_120t else gate_line
-                        trigger_str = f"노란색 급등관문선({ref_g:,.0f}원) 바닥지지/변곡 (정석 1차 ➔ 검정점선 돌파 시 2차 대기)"
+                        trigger_str = f"120틱/60분 노란색 급등관문선({ref_g:,.0f}원) 바닥지지/변곡 (정석 1차 ➔ 검정점선 돌파 시 2차 대기)"
                     elif gate_high_breakout_120t:
                         self.position.entry_mode = "HIGH_BREAKOUT"
-                        trigger_str = f"120틱 테마120 상승변곡 + 검정점선 급등관문고가선({gate_high_120t:,.0f}원) 돌파"
+                        ref_gh = gate_high_120t if (not np.isnan(gate_high_120t) and gate_high_120t > 0) else gijun_120t
+                        trigger_str = f"120틱 테마120 상승변곡 + 검정점선/기준선({ref_gh:,.0f}원) 돌파"
+                    elif wma_cloud_surge_120t:
+                        self.position.entry_mode = "GATE_SUPPORT"
+                        trigger_str = "120틱 WMA20-40-60 순차돌파 + 테마120 상승변곡 & 노란 양운 돌파"
                     else:
                         self.position.entry_mode = "HIGH_BREAKOUT"
                         trigger_str = f"분홍 기준선({gijun_line:,.0f}원) 초기 맥점 돌파"
@@ -359,7 +396,7 @@ class ThemeGate60mStrategy:
                         price=buy_price,
                         qty=qty,
                         amount=cost,
-                        reason=f"60분봉 정배열/20선 지지 + {trigger_str} 1차 50% 매수 (체결가: {buy_price:,.0f}원)",
+                        reason=f"{cond_tag}{alpha_tag}{trigger_str} 1차 50% 매수 (체결가: {buy_price:,.0f}원)",
                         stage="FIRST_BUY_DONE"
                     )
                     self.trade_history.append(order)
