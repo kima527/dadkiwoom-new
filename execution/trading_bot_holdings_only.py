@@ -187,7 +187,7 @@ class SafeHoldingsThemeGateBot:
         is_real: bool = True,
         dry_run: bool = False,
         holdings_state: str = "idle",
-        auto_scan: bool = True,
+        auto_scan: bool = False,
         condition_name: str = "Traiding,traiding,Traiding1,trading1",
         enable_ws: bool = True
     ):
@@ -197,9 +197,8 @@ class SafeHoldingsThemeGateBot:
         holdings_state: 'idle' (기본값: 관심종목/1주 수동 매수 종목을 IDLE 상태로 등록, 1차 50% 매수 대기)
                         'first_buy_done' (1차 매수 보유 상태, 60분봉 기준선 돌파 2차 매수 대기)
                         'full_position' (풀포지션 완료 상태, M/3선 및 기준선 변곡선 매도 대기)
-        auto_scan: 지수 조정/폭락 시에도 현재 성배 로직(60분 정배열/20선지지 + 관문/기준선 타점 + M/3선 지지)에
-                   가장 부합하는 주도주를 자동 발굴하여 관심종목에 추가 및 매매 수행
-        condition_name: 키움 실시간 조건검색식 이름 (기본값: 'Traiding,traiding,Traiding1')
+        auto_scan: 정적 관심종목(holy_grail_watchlist.json) 스캔 여부 (기본값 False: Traiding/traiding/Traiding1 조건검색 전용)
+        condition_name: 키움 실시간 조건검색식 이름 (기본값: 'Traiding,traiding,Traiding1,trading1')
         enable_ws: 키움 실시간 조건검색 웹소켓 수신 데몬 활성화 여부
         """
         self.dry_run = dry_run
@@ -216,7 +215,7 @@ class SafeHoldingsThemeGateBot:
 
         logger.info("==================================================")
         if self.dry_run:
-            logger.info(" 🛡️ [실전 계좌 연동 + 모의 안전 모드(DRY-RUN)] 실계좌 잔고/차트 감시만 수행 (실제 주문 미전송)")
+            logger.info(" 🛡️ [실전 계좌 연동 + 모의 안전 모드(DRY-RUN)] 실계좌 잔고 + 실시간 조건검색 감시 (실제 주문 미전송)")
         elif self.is_real:
             logger.info(f" 🚀 [키움 실전 계좌 거래 모드] 실계좌 잔고 + 실시간 조건검색({self.condition_name}) + 지수초과강도·120틱 매매 즉시 전송")
         else:
@@ -233,6 +232,7 @@ class SafeHoldingsThemeGateBot:
         self.condition_picks: dict[str, dict] = {}
         self.condition_lock = threading.Lock()
         self.condition_wakeup_event = threading.Event()
+        self.condition_init_event = threading.Event()
         self.ws_client = None
         self.ws_thread: Optional[threading.Thread] = None
         self.auto_watchlist_picks: dict[str, dict] = {}
@@ -264,7 +264,7 @@ class SafeHoldingsThemeGateBot:
         if self.is_real and self.enable_ws:
             self._start_condition_ws_daemon()
 
-    def _on_condition_insert(self, code: str):
+    def _on_condition_insert(self, code: str, cond_name: str = ""):
         """키움 실시간 조건검색(Traiding, traiding, Traiding1) 종목 편입 콜백"""
         clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
         if not clean_code.isdigit() or len(clean_code) != 6:
@@ -272,19 +272,25 @@ class SafeHoldingsThemeGateBot:
         if clean_code in self.sold_today_stocks:
             return
 
+        effective_cond = cond_name.strip() if cond_name and cond_name.strip() else "Traiding"
         with self.condition_lock:
             is_new = clean_code not in self.condition_picks
+            existing = self.condition_picks.get(clean_code, {})
+            prev_conds = set(existing.get('cond_names', []))
+            prev_conds.add(effective_cond)
+            cond_label = ", ".join(sorted(prev_conds))
             self.condition_picks[clean_code] = {
                 'code': clean_code,
                 'name': self.stock_name_cache.get(clean_code, ''),
-                'target_tag': f'🔔실시간조건({self.condition_name})',
+                'cond_names': sorted(prev_conds),
+                'target_tag': f'🔔실시간조건({cond_label})',
                 'captured_at': time.time()
             }
 
         if is_new:
             cached_nm = self.stock_name_cache.get(clean_code, f"종목_{clean_code}")
             logger.info(
-                f"🔔 [실시간 조건검색 포착] [{cached_nm}({clean_code})] (조건식: {self.condition_name}) "
+                f"🔔 [실시간 조건검색 포착] [{cached_nm}({clean_code})] (포착 조건식: {effective_cond}) "
                 f"➔ 지수 상대강도 & 120틱 매수 타점 즉시 검증 깨우기!"
             )
             self.condition_wakeup_event.set()
@@ -305,10 +311,12 @@ class SafeHoldingsThemeGateBot:
                     on_insert=self._on_condition_insert,
                     on_delete=self._on_condition_delete
                 )
+                self.ws_client.init_sync_event = self.condition_init_event
                 logger.info(f"📡 [실시간 조건검색 웹소켓 가동] 목표 조건식: [{self.condition_name}] 실시간 수신 대기 중...")
                 loop.run_until_complete(self.ws_client.run())
             except Exception as ws_err:
                 logger.error(f"❌ 실시간 조건검색 웹소켓 데몬 예외: {ws_err}")
+                self.condition_init_event.set()
             finally:
                 try:
                     loop.close()
@@ -317,8 +325,8 @@ class SafeHoldingsThemeGateBot:
 
         self.ws_thread = threading.Thread(target=_ws_worker, name="KiwoomConditionWSDaemon", daemon=True)
         self.ws_thread.start()
-        # 초기 조건검색(CNSRREQ) 포착 종목이 첫 사이클부터 즉시 반영되도록 최대 2.5초 대기
-        self.condition_wakeup_event.wait(timeout=2.5)
+        # 모든 목표 조건식(CNSRREQ) 초기 포착 응답이 수신될 때까지 최대 6.0초 대기
+        self.condition_init_event.wait(timeout=6.0)
         self.condition_wakeup_event.clear()
 
     def get_stock_name(self, code: str) -> str:
@@ -562,11 +570,11 @@ class SafeHoldingsThemeGateBot:
 
         self.active_holdings = holdings
         logger.info(
-            f"💼 [계좌 잔고 & 실시간 조건검색·타점관종 갱신] 가용 예수금: {cash:,.0f}원 | "
-            f"실계좌 보유: {len(real_holdings)}개 + 🔔실시간조건검색({self.condition_name}): {cond_added_count}개 + 🌟성배타점관종: {auto_added_count}개 (총 감시: {len(holdings)}개)"
+            f"💼 [계좌 잔고 & 실시간 조건검색 갱신] 가용 예수금: {cash:,.0f}원 | "
+            f"실계좌 보유: {len(real_holdings)}개 + 🔔실시간조건검색({self.condition_name}): {cond_added_count}개 (총 감시: {len(holdings)}개)"
         )
 
-        # 새로운 우선순위 순서(실보유 -> 🌟성배타점관종 -> 기존 1주 관종)에 맞춰 strategies 순서도 정렬 유지
+        # 새로운 우선순위 순서(실보유 -> 🔔실시간조건검색 -> 기존 1주 관종)에 맞춰 strategies 순서도 정렬 유지
         ordered_strategies: dict[str, ThemeGate60mStrategy] = {}
 
         for code, h in holdings.items():
@@ -576,6 +584,7 @@ class SafeHoldingsThemeGateBot:
             account_qty = int(h.get('qty', 0))
             buy_prc = float(h.get('buy_price', 0.0))
             is_auto_wl = bool(h.get('is_auto_watchlist', False))
+            is_cond_pick = bool(h.get('is_condition_pick', False))
             target_tag = h.get('target_tag', '')
             fit_score = h.get('fit_score', 0.0)
             
@@ -586,7 +595,14 @@ class SafeHoldingsThemeGateBot:
                     gate_sl_pct=DEFAULT_CONFIG.GATE_STOP_LOSS_PCT,
                     max_reentry=0
                 )
-                if is_auto_wl and account_qty == 0:
+                if is_cond_pick and account_qty == 0:
+                    strat.position.state = StrategyState.IDLE
+                    strat.position.total_qty = 0
+                    strat.position.base_account_qty = 0
+                    logger.info(
+                        f"   🔔 [{name}({code})] 키움 실시간 조건검색 포착 종목 등록 완료 ({target_tag} | IDLE 대기 ➔ 지수초과 & 120틱 매수 타점 감시)"
+                    )
+                elif is_auto_wl and account_qty == 0:
                     strat.position.state = StrategyState.IDLE
                     strat.position.total_qty = 0
                     strat.position.base_account_qty = 0
@@ -1537,6 +1553,7 @@ if __name__ == '__main__':
                         help="실계좌 보유종목 초기 상태 (기본값: idle = 1주 수동 매수 관심종목 대기)")
     parser.add_argument("--condition", type=str, default="Traiding,traiding,Traiding1,trading1",
                         help="키움 실시간 조건검색식 이름 (기본값: Traiding,traiding,Traiding1,trading1)")
+    parser.add_argument("--auto-scan", action="store_true", help="정적 관심종목(holy_grail_watchlist.json) 병행 스캔 활성화")
     parser.add_argument("--no-ws", action="store_true", help="실시간 조건검색 웹소켓 비활성화")
 
     args = parser.parse_args()
@@ -1545,6 +1562,7 @@ if __name__ == '__main__':
         is_real=True,
         dry_run=args.dry_run,
         holdings_state=args.holdings_state,
+        auto_scan=args.auto_scan,
         condition_name=args.condition,
         enable_ws=(not args.no_ws)
     )

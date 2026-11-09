@@ -41,6 +41,8 @@ class KiwoomWebSocketClient:
 
         self.target_condition_map = {}      # {cond_sn: cond_name}
         self.target_condition_indices = set() # {cond_sn_str, ...}
+        self.received_cnsrreq_seqs = set()    # 초기 CNSRREQ 응답 수신 완료된 일련번호 집합
+        self.init_sync_event = None           # threading.Event (초기 조건검색 전수 수신 완료 시그널)
         
         self.on_insert = on_insert
         self.on_delete = on_delete
@@ -191,19 +193,19 @@ class KiwoomWebSocketClient:
                 
                 elif trnm == 'CNSRLST':
                     # 조건식 목록 응답
-                    logger.info(f"CNSRLST 원본 응답: {response}")
                     cond_list = response.get('data', [])
-                    logger.info(f"조건검색식 목록 수신: {len(cond_list)}개")
+                    logger.info(f"📋 [키움 서버 조건검색식 목록 수신] 총 {len(cond_list)}개 등록 확인")
                     
                     self.target_condition_map.clear()
                     self.target_condition_indices.clear()
+                    self.received_cnsrreq_seqs.clear()
                     
                     # 대소문자 무시 매칭을 위한 타겟 목록
                     targets_lower = {t.lower(): t for t in self.target_condition_names}
 
                     for cond in cond_list:
                         if len(cond) >= 2:
-                            cond_sn = str(cond[0])
+                            cond_sn = str(cond[0]).strip()
                             cond_name = cond[1].strip()
                             
                             # 정확 매칭 또는 대소문자 무시 매칭
@@ -212,33 +214,53 @@ class KiwoomWebSocketClient:
                                 self.target_condition_indices.add(cond_sn)
                                 logger.info(f"🎯 목표 조건식 '{cond_name}' 발견! (일련번호: {cond_sn})")
                                 
-                                # 각 조건식마다 실시간 조건검색 등록 요청 (CNSRREQ) 전송
-                                req = {
-                                    "trnm": "CNSRREQ",
-                                    "seq": str(cond_sn),
-                                    "search_type": "1",
-                                    "stex_tp": "K"
-                                }
-                                logger.info(f"실시간 조건검색 등록 시도: CNSRREQ with seq={cond_sn} ({cond_name})")
-                                asyncio.create_task(self.send_message(req))
-                            
                     if self.target_condition_map:
-                        logger.info(f"✅ 총 {len(self.target_condition_map)}개 목표 조건식 등록 완료: {list(self.target_condition_map.values())}")
+                        logger.info(f"✅ 총 {len(self.target_condition_map)}개 목표 조건식 매칭 완료: {list(self.target_condition_map.values())}")
+                        for cond_sn, cond_name in self.target_condition_map.items():
+                            req = {
+                                "trnm": "CNSRREQ",
+                                "seq": str(cond_sn),
+                                "search_type": "1",
+                                "stex_tp": "K"
+                            }
+                            logger.info(f"📡 실시간 조건검색 등록 요청 전송: [{cond_name}] (seq={cond_sn})")
+                            await self.send_message(req)
+                            await asyncio.sleep(0.05)
                     else:
-                        logger.error(f"조건식 목록에서 목표 조건식({self.target_condition_names})을 찾을 수 없습니다!")
+                        logger.error(f"❌ 조건식 목록에서 목표 조건식({self.target_condition_names})을 찾을 수 없습니다! 전체 목록: {cond_list}")
+                        if self.init_sync_event:
+                            self.init_sync_event.set()
                 
                 elif trnm == 'CNSRREQ':
                     # 초기 조건검색 포착 종목 리스트
-                    logger.info(f"조건검색 초기 포착 응답: {response}")
+                    seq_str = str(response.get('seq', '')).strip()
+                    cond_name = self.target_condition_map.get(seq_str, f"seq:{seq_str}")
                     data_list = response.get('data') or []
+                    captured_codes = []
                     for item in data_list:
-                        code = item.get('jmcode', '').replace('A', '')
+                        code = item.get('jmcode', '').replace('A', '').strip()
                         if code:
-                            logger.info(f"초기 포착 종목: {code}")
-                            if asyncio.iscoroutinefunction(self.on_insert):
-                                asyncio.create_task(self.on_insert(code))
-                            else:
-                                self.on_insert(code)
+                            captured_codes.append(code)
+                            try:
+                                if asyncio.iscoroutinefunction(self.on_insert):
+                                    asyncio.create_task(self.on_insert(code, cond_name))
+                                else:
+                                    self.on_insert(code, cond_name)
+                            except TypeError:
+                                if asyncio.iscoroutinefunction(self.on_insert):
+                                    asyncio.create_task(self.on_insert(code))
+                                else:
+                                    self.on_insert(code)
+
+                    if captured_codes:
+                        logger.info(f"🔔 [조건식 '{cond_name}'(seq={seq_str}) 초기 포착] {len(captured_codes)}종목 수신: {captured_codes}")
+                    else:
+                        logger.info(f"📡 [조건식 '{cond_name}'(seq={seq_str}) 실시간 대기] 현재 초기 포착 0종목 (신규 편입 시 0.1초 즉시 포착)")
+
+                    if seq_str:
+                        self.received_cnsrreq_seqs.add(seq_str)
+                    if self.init_sync_event and len(self.received_cnsrreq_seqs) >= len(self.target_condition_indices):
+                        self.init_sync_event.set()
                             
                 elif trnm == 'REAL':
                     # 실시간 데이터
@@ -248,18 +270,24 @@ class KiwoomWebSocketClient:
                         values = data_item.get('values', {})
                         
                         if name == '조건검색':
-                            code = values.get('9001', '').replace('A', '')
+                            code = values.get('9001', '').replace('A', '').strip()
                             evt_tp = values.get('843', '') # I: 편입, D: 이탈
-                            cond_idx = str(values.get('841', ''))
+                            cond_idx = str(values.get('841', '')).strip()
                             
                             if cond_idx in self.target_condition_indices:
                                 cond_name = self.target_condition_map.get(cond_idx, f"seq:{cond_idx}")
                                 logger.info(f"🔔 [{cond_name}] 실시간 조건검색 신호: 종목코드={code}, 이벤트={evt_tp}")
                                 if evt_tp == 'I':
-                                    if asyncio.iscoroutinefunction(self.on_insert):
-                                        asyncio.create_task(self.on_insert(code))
-                                    else:
-                                        self.on_insert(code)
+                                    try:
+                                        if asyncio.iscoroutinefunction(self.on_insert):
+                                            asyncio.create_task(self.on_insert(code, cond_name))
+                                        else:
+                                            self.on_insert(code, cond_name)
+                                    except TypeError:
+                                        if asyncio.iscoroutinefunction(self.on_insert):
+                                            asyncio.create_task(self.on_insert(code))
+                                        else:
+                                            self.on_insert(code)
                                     # 실시간 체결 콜백이 등록되어 있을 때만 체결 데이터 구독
                                     if self.on_real_tick:
                                         asyncio.create_task(self.subscribe_real_tick(code))
