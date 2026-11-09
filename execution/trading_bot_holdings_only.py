@@ -1144,8 +1144,14 @@ class SafeHoldingsThemeGateBot:
         # 🌅 날짜 변경 시 당일 매도 완료(No-Rebuy) 목록 자동 초기화
         today_date = datetime.now().date()
         if today_date != self.current_trading_date:
-            logger.info(f"🌅 [영업일 변경 감지] {self.current_trading_date} ➔ {today_date} | 매도 쿨다운 목록 초기화 완료")
+            with self.condition_lock:
+                old_cond_count = len(self.condition_picks)
+                self.condition_picks.clear()
             self.sold_cooldowns.clear()
+            logger.info(
+                f"🌅 [영업일 변경 감지] {self.current_trading_date} ➔ {today_date} | "
+                f"전일 조건검색({old_cond_count}개) 및 쿨다운 초기화 완료 ➔ 금일 신규 조건검색 수신 대기!"
+            )
             self.current_trading_date = today_date
 
         self.refresh_holdings()
