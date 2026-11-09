@@ -8,8 +8,8 @@ def calculate_tema(series: pd.Series, period: int) -> pd.Series:
     영웅문(키움 HTS) TEMA(Triple Exponential Moving Average) 계산
     TEMA = 3*eavg(c, 기간) - 3*eavg(eavg(c, 기간), 기간) + eavg(eavg(eavg(c, 기간), 기간), 기간)
     """
-    if len(series) < period:
-        return pd.Series(np.nan, index=series.index)
+    if series is None or len(series) == 0:
+        return pd.Series(dtype=float)
         
     ema1 = series.ewm(span=period, adjust=False).mean()
     ema2 = ema1.ewm(span=period, adjust=False).mean()
@@ -224,11 +224,13 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     df = calculate_theme_gijun_line(df, p_fast=5, p_mid=20, p_slow=60)
     df = detect_gate_inflection(df)
 
-    # 2) 하단 차트 지표: 테마 5, 20, 60, 120 및 양운(노란 구름대) / 기울기 변곡
+    # 2) 하단 차트 지표: 테마 5, 20, 60, 120 및 SMA 40, 60
     df['tema5'] = df['tema_fast']
     df['tema20'] = df['tema_slow']
     df['tema60'] = calculate_tema(df['close'], 60)
     df['tema120'] = calculate_tema(df['close'], 120)
+    df['sma40'] = df['close'].rolling(40, min_periods=5).mean()
+    df['sma60'] = df['close'].rolling(60, min_periods=10).mean()
 
     df['tema60_slope'] = df['tema60'].diff()
     df['tema120_slope'] = df['tema120'].diff()
@@ -238,9 +240,15 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
         (df['tema60_slope'] > 0) & (df['tema5'] >= df['tema20'])
     )
 
-    # 테마60-120 골든크로스 및 노란색 양운 구름대(tema60 >= tema120)
+    # 🌟 [120틱 핵심 타점 1]: 테마60-120 골든크로스 및 노란색 양운 구름대(tema60 >= tema120), 크로스 시점 가격 기록
     df['is_yellow_cloud'] = df['tema60'] >= df['tema120']
     df['is_tema60_120_gc'] = (df['tema60'].shift(1) <= df['tema120'].shift(1)) & (df['tema60'] > df['tema120'])
+    df['tema60_120_gc_price'] = df['close'].where(df['is_tema60_120_gc']).ffill()
+
+    # 🌟 [120틱 핵심 타점 2]: SMA 40-60 골든크로스 및 크로스 시점 가격 기록
+    df['is_sma40_60_bull'] = df['sma40'] >= df['sma60']
+    df['is_sma40_60_gc'] = (df['sma40'].shift(1) <= df['sma60'].shift(1)) & (df['sma40'] > df['sma60'])
+    df['sma40_60_gc_price'] = df['close'].where(df['is_sma40_60_gc']).ffill()
 
     # 5 > 20 > 60 > 120 완전 정배열
     df['is_tema_aligned_120t'] = (

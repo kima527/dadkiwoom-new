@@ -58,6 +58,8 @@ class PositionTracker:
     last_gate_high: float = 0.0
     last_gijun_line: float = 0.0
     entry_mode: str = ""                # "GATE_SUPPORT" (노란선 1차) or "HIGH_BREAKOUT" (검정점선/기준선 1차)
+    first_cross_type: str = ""          # "TEMA60_120_GC" or "SMA40_60_GC"
+    first_cross_price: float = 0.0      # 골든크로스 시점의 가격
     first_gijun_cleared: bool = False   # 1번째 분홍색 기준선 돌파 완료 여부
     cleared_gijun_price: float = 0.0    # 돌파 완료한 1번째 분홍색 기준선 가격
     second_gijun_price: float = 0.0     # 고점에서 새로 형성된 2번째 분홍색 기준선 가격
@@ -165,9 +167,17 @@ class ThemeGate60mStrategy:
                 is_gate_up_120t = bool(last_120t.get('gate_up_turnaround', False))
                 is_tema120_up = bool(last_120t.get('is_tema120_up', True))
                 is_yellow_cloud_120t = bool(last_120t.get('is_yellow_cloud', False))
-                # 최근 3틱봉 이내 테마60-120 골든크로스 발생 또는 노란 양운 유지 여부
-                recent_gc = bool(df_120t_calc['is_tema60_120_gc'].tail(3).any()) if 'is_tema60_120_gc' in df_120t_calc else False
-                is_tema60_120_gc_120t = recent_gc or is_yellow_cloud_120t
+
+                # 🌟 [120틱 핵심 타점 1]: 테마60-120 골든크로스 발생 여부(최근 5봉) 및 크로스 가격
+                recent_tema60_120_gc = bool(df_120t_calc['is_tema60_120_gc'].tail(5).any()) if 'is_tema60_120_gc' in df_120t_calc else False
+                tema60_120_gc_price = float(last_120t.get('tema60_120_gc_price', np.nan))
+                is_tema60_120_gc_120t = recent_tema60_120_gc or is_yellow_cloud_120t
+
+                # 🌟 [120틱 핵심 타점 2]: SMA 40-60 골든크로스 발생 여부(최근 5봉) 및 크로스 가격
+                is_sma40_60_bull_120t = bool(last_120t.get('is_sma40_60_bull', False))
+                recent_sma40_60_gc = bool(df_120t_calc['is_sma40_60_gc'].tail(5).any()) if 'is_sma40_60_gc' in df_120t_calc else False
+                sma40_60_gc_price = float(last_120t.get('sma40_60_gc_price', np.nan))
+
                 t5 = float(last_120t.get('tema5', np.nan))
                 t20 = float(last_120t.get('tema20', np.nan))
                 if not np.isnan(t5) and not np.isnan(t20) and t20 > 0:
@@ -291,61 +301,38 @@ class ThemeGate60mStrategy:
                 if not np.isnan(w20) and not np.isnan(w40) and not np.isnan(w60) and w20 > 0 and w40 > 0 and w60 > 0:
                     is_120t_wma_seq_breakout = (w1 >= w20 * 0.998) and (w1 >= w40 * 0.998) and (w1 >= w60 * 0.998)
 
-            # 🎯 [120틱 타점 A: 120틱 노란색 급등관문선(theme_gate) 지지/상승변곡 선취매]
-            gate_support_120t = (
-                has_120t_wave
-                and not np.isnan(gate_120t)
-                and gate_120t > 0
-                and ((gate_120t * 0.992 <= tick_close <= gate_120t * 1.022) or (is_gate_up_120t and tick_close >= gate_120t * 0.990))
-                and is_tema5_20_bull_120t
-                and upper_shadow_ratio_120t <= 0.38
-            )
-            gate_support_60m = is_gate_up or (
-                not np.isnan(gate_line)
-                and gate_line > 0
-                and close >= gate_line * 0.990
-                and low <= gate_line * 1.018
-            )
-            # 🌡️ [소속 시장 선물지수 하락방어모드 (CAUTION_DEFENSE) 연동]:
-            if futures_regime == "CAUTION_DEFENSE":
-                is_yellow_gate_buy = False
-            elif has_120t_wave:
-                is_yellow_gate_buy = gate_support_120t or (is_bull_support and gate_support_60m and is_tema5_20_bull_120t)
-            else:
-                is_yellow_gate_buy = gate_support_60m
+            # 🌟 [120틱 핵심 타점 1]: 테마 60이평선이 120이평선을 골든크로스 할 때의 가격
+            # 🌟 [120틱 핵심 타점 2]: SMA 40, 60이평선 골든크로스 시점
+            is_tema60_120_cross_buy = False
+            is_sma40_60_cross_buy = False
 
-            # 🚀 [120틱 타점 B: 120틱 테마120 상승변곡 + 검정 점선(급등관문고가선) 또는 120틱 분홍 기준선 돌파]
-            gate_high_breakout_120t = (
-                has_120t_wave
-                and is_tema120_up
-                and is_tema5_20_bull_120t
-                and upper_shadow_ratio_120t <= 0.35
-                and (
-                    (not np.isnan(gate_high_120t) and gate_high_120t > 0 and (gate_high_120t <= tick_close <= gate_high_120t * 1.028))
-                    or (not np.isnan(gijun_120t) and gijun_120t > 0 and (gijun_120t <= tick_close <= gijun_120t * 1.030))
-                )
-            )
-            # 🔥 [120틱 타점 C: 120틱 WMA 20-40-60 순차돌파 + 테마120 상승변곡 & 노란 양운(테마60>120) 가속 돌파]
-            wma_cloud_surge_120t = (
-                has_120t_wave
-                and is_120t_wma_seq_breakout
-                and is_tema120_up
-                and is_tema60_120_gc_120t
-                and is_tema5_20_bull_120t
-                and upper_shadow_ratio_120t <= 0.35
-                and (np.isnan(gate_120t) or gate_120t <= 0 or tick_close >= gate_120t * 0.995)
-            )
-            gijun_breakout = (
-                not np.isnan(gijun_line)
-                and gijun_line > 0
-                and (gijun_line <= tick_close <= gijun_line * 1.035)
-            )
             if has_120t_wave:
-                is_strong_breakout_buy = gate_high_breakout_120t or wma_cloud_surge_120t or (is_bull_support and gijun_breakout and is_tema5_20_bull_120t)
-                can_trigger_120t_buy = is_60m_sma20_support and is_120t_breakout and (is_yellow_gate_buy or is_strong_breakout_buy)
+                # 1) 테마 60-120 골든크로스:
+                #    최근 5틱봉 이내 골든크로스 발생 또는 노란 양운(테마60 >= 테마120) 상태에서 크로스 시점 가격(tema60_120_gc_price) 지지/안착
+                t_gc_p = tema60_120_gc_price if (not np.isnan(tema60_120_gc_price) and tema60_120_gc_price > 0) else 0.0
+                price_near_tema_gc = (t_gc_p > 0 and t_gc_p * 0.990 <= tick_close <= t_gc_p * 1.040) if t_gc_p > 0 else is_yellow_cloud_120t
+                
+                is_tema60_120_cross_buy = (
+                    (recent_tema60_120_gc or (is_yellow_cloud_120t and price_near_tema_gc))
+                    and is_tema5_20_bull_120t
+                    and upper_shadow_ratio_120t <= 0.48
+                )
+
+                # 2) SMA 40-60 골든크로스 (만약 SMA 40-60이 먼저 발생했거나 동시에 발생한 경우 1차 매수 진입):
+                s_gc_p = sma40_60_gc_price if (not np.isnan(sma40_60_gc_price) and sma40_60_gc_price > 0) else 0.0
+                price_near_sma_gc = (s_gc_p > 0 and s_gc_p * 0.990 <= tick_close <= s_gc_p * 1.040) if s_gc_p > 0 else is_sma40_60_bull_120t
+
+                is_sma40_60_cross_buy = (
+                    (recent_sma40_60_gc or (is_sma40_60_bull_120t and price_near_sma_gc))
+                    and is_tema5_20_bull_120t
+                    and upper_shadow_ratio_120t <= 0.48
+                )
+
+                can_trigger_120t_buy = is_60m_sma20_support and (is_tema60_120_cross_buy or is_sma40_60_cross_buy)
             else:
-                is_strong_breakout_buy = gijun_breakout
-                can_trigger_120t_buy = is_bull_support and is_120t_breakout and (is_yellow_gate_buy or is_strong_breakout_buy)
+                # 120틱 부재 시 60분봉 백업 지지/돌파
+                gijun_breakout = (not np.isnan(gijun_line) and gijun_line > 0 and (gijun_line <= tick_close <= gijun_line * 1.035))
+                can_trigger_120t_buy = is_bull_support and gijun_breakout
             
             if can_trigger_120t_buy:
                 budget = self.cash * 0.50
@@ -375,20 +362,20 @@ class ThemeGate60mStrategy:
 
                     alpha_tag = f"[지수초과강도 {day_alpha:+.2f}%p] " if day_alpha != 0.0 else ""
                     cond_tag = "🔔[실시간조건검색] " if is_condition_pick else ""
-                    if is_yellow_gate_buy:
-                        self.position.entry_mode = "GATE_SUPPORT"
-                        ref_g = gate_120t if gate_support_120t else gate_line
-                        trigger_str = f"120틱/60분 노란색 급등관문선({ref_g:,.0f}원) 바닥지지/변곡 (정석 1차 ➔ 검정점선 돌파 시 2차 대기)"
-                    elif gate_high_breakout_120t:
-                        self.position.entry_mode = "HIGH_BREAKOUT"
-                        ref_gh = gate_high_120t if (not np.isnan(gate_high_120t) and gate_high_120t > 0) else gijun_120t
-                        trigger_str = f"120틱 테마120 상승변곡 + 검정점선/기준선({ref_gh:,.0f}원) 돌파"
-                    elif wma_cloud_surge_120t:
-                        self.position.entry_mode = "GATE_SUPPORT"
-                        trigger_str = "120틱 WMA20-40-60 순차돌파 + 테마120 상승변곡 & 노란 양운 돌파"
+                    if is_tema60_120_cross_buy:
+                        self.position.entry_mode = "TEMA60_120_GC"
+                        self.position.first_cross_type = "TEMA60_120_GC"
+                        self.position.first_cross_price = t_gc_p if t_gc_p > 0 else buy_price
+                        trigger_str = f"120틱 테마 60이평선 > 120이평선 골든크로스(크로스가격: {self.position.first_cross_price:,.0f}원) 안착"
+                    elif is_sma40_60_cross_buy:
+                        self.position.entry_mode = "SMA40_60_GC"
+                        self.position.first_cross_type = "SMA40_60_GC"
+                        self.position.first_cross_price = s_gc_p if s_gc_p > 0 else buy_price
+                        trigger_str = f"120틱 SMA 40이평선 > 60이평선 골든크로스(크로스가격: {self.position.first_cross_price:,.0f}원) 안착"
                     else:
-                        self.position.entry_mode = "HIGH_BREAKOUT"
-                        trigger_str = f"분홍 기준선({gijun_line:,.0f}원) 초기 맥점 돌파"
+                        self.position.entry_mode = "60M_GIJUN"
+                        self.position.first_cross_type = "60M_GIJUN"
+                        trigger_str = f"60분봉 기준선({gijun_line:,.0f}원) 초기 맥점 돌파"
 
                     order = TradeOrder(
                         timestamp=timestamp,
@@ -430,46 +417,44 @@ class ThemeGate60mStrategy:
                 elif self.position.first_gijun_cleared and active_gijun > self.position.cleared_gijun_price * 1.002:
                     self.position.second_gijun_price = active_gijun
 
-            # 2차 매수 조건 (정석: 노란색 급등관문선 1차 매수 후 ➔ 검정 점선 급등관문고가돌파선 확실한 돌파 확인 시 2차 매수!):
-            # - 확실한 돌파 기준: 양봉 유지(윗꼬리 35% 이하) + 단기 테마 정배열(TEMA5 >= TEMA20) + 최소 수익 갭(+0.4%~+0.5%)
+            # 🌟 [사용자 지정 2차 매수 불타기]:
+            # 1차 매수가 테마 60-120 골든크로스 시점이었으면 ➔ SMA 40-60 이평선 골든크로스 발생 시점 2차 매수!
+            # 1차 매수가 SMA 40-60 골든크로스 시점이었으면 ➔ 테마 60-120 이평선 골든크로스 발생 시점 2차 매수!
             is_breakout = False
             breakout_target = 0.0
             breakout_name = ""
 
-            min_gate_high_gap = (tick_close >= base_p1 * 1.004) if base_p1 > 0 else False
-            min_pyramiding_gap = (tick_close >= base_p1 * 1.005) if base_p1 > 0 else False
-            is_solid_candle = (upper_shadow_ratio_120t <= 0.35) and is_tema5_20_bull_120t
+            min_pyramiding_gap = (tick_close >= base_p1 * 1.002) if base_p1 > 0 else False
+            is_solid_candle = (upper_shadow_ratio_120t <= 0.45)
 
-            # 유효 검정 점선(급등관문고가돌파선): 120틱 검정점선 우선, 60분봉 검정점선 병행
-            cand_gate_high = gate_high_120t if (has_120t_wave and not np.isnan(gate_high_120t) and gate_high_120t > base_p1) else gate_high
+            if has_120t_wave:
+                s_gc_p = sma40_60_gc_price if (not np.isnan(sma40_60_gc_price) and sma40_60_gc_price > 0) else 0.0
+                t_gc_p = tema60_120_gc_price if (not np.isnan(tema60_120_gc_price) and tema60_120_gc_price > 0) else 0.0
 
-            if self.position.entry_mode == "GATE_SUPPORT" or (not np.isnan(cand_gate_high) and cand_gate_high > base_p1):
-                # 🥇 [정석 2차 불타기 1순위]: 노란색 급등관문선에서 1차 매수 후, 검정 점선(급등관문고가돌파선)을 확실하게 돌파 안착할 때!
-                if min_gate_high_gap and is_solid_candle and not np.isnan(cand_gate_high) and cand_gate_high > 0 and tick_close >= cand_gate_high:
-                    is_breakout = True
-                    breakout_target = cand_gate_high
-                    breakout_name = "검정점선 급등관문고가돌파선(HH) 확실한 돌파"
-                # 🥈 [정석 2차 불타기 2순위]: 120틱 테마60 > 테마120 골든크로스(하단 노란 양운 전환)와 함께 +0.5% 이상 상승 확정 시
-                elif min_pyramiding_gap and is_solid_candle and is_tema60_120_gc_120t:
-                    is_breakout = True
-                    breakout_target = base_p1 * 1.005
-                    breakout_name = "120틱 테마60-120 골든크로스(노란 양운 전환) 돌파"
-                # 🥉 [정석 2차 불타기 3순위]: 1번째 분홍색 기준선(M선) 상향 돌파 시
-                elif min_pyramiding_gap and not np.isnan(active_gijun) and active_gijun > 0 and tick_close >= active_gijun:
-                    is_breakout = True
-                    breakout_target = active_gijun
-                    breakout_name = "1번째 분홍 기준선(M선) 돌파"
+                if self.position.first_cross_type == "TEMA60_120_GC":
+                    # 🥇 1차가 테마 60-120 크로스였으므로 ➔ SMA 40-60 골든크로스 발생 시점 2차 불타기 매수!
+                    if min_pyramiding_gap and is_solid_candle and (recent_sma40_60_gc or is_sma40_60_bull_120t):
+                        is_breakout = True
+                        breakout_target = s_gc_p if s_gc_p > 0 else (base_p1 * 1.005)
+                        breakout_name = f"120틱 SMA 40-60 골든크로스(크로스가격: {breakout_target:,.0f}원) 확증"
+                elif self.position.first_cross_type == "SMA40_60_GC":
+                    # 🥇 1차가 SMA 40-60 크로스였으므로 ➔ 테마 60-120 골든크로스 발생 시점 2차 불타기 매수!
+                    if min_pyramiding_gap and is_solid_candle and (recent_tema60_120_gc or is_yellow_cloud_120t):
+                        is_breakout = True
+                        breakout_target = t_gc_p if t_gc_p > 0 else (base_p1 * 1.005)
+                        breakout_name = f"120틱 테마 60-120 골든크로스(크로스가격: {breakout_target:,.0f}원) 확증"
+                else:
+                    # 듀얼 크로스 완성 확인 시 2차 불타기 매수
+                    if min_pyramiding_gap and is_solid_candle and (recent_sma40_60_gc or recent_tema60_120_gc or (is_yellow_cloud_120t and is_sma40_60_bull_120t)):
+                        is_breakout = True
+                        breakout_target = base_p1 * 1.005
+                        breakout_name = "120틱 테마60-120 & SMA40-60 듀얼 골든크로스 완성"
             else:
-                # [강세 예외 진입(검정점선/기준선 1차) 후 2차 불타기]:
-                # 테마60-120 골든크로스(노란 양운) 또는 1번째 분홍 기준선 돌파(+0.5% 이상 추가 상승 동반)
-                if min_pyramiding_gap and is_solid_candle and not np.isnan(active_gijun) and active_gijun > base_p1 and tick_close >= active_gijun:
+                # 120틱 부재 시 60분봉 1번째 분홍 기준선 돌파 백업
+                if min_pyramiding_gap and not np.isnan(active_gijun) and active_gijun > base_p1 and tick_close >= active_gijun:
                     is_breakout = True
                     breakout_target = active_gijun
                     breakout_name = "1번째 분홍 기준선(M선) 돌파"
-                elif min_pyramiding_gap and is_solid_candle and is_tema60_120_gc_120t:
-                    is_breakout = True
-                    breakout_target = base_p1 * 1.005
-                    breakout_name = "120틱 테마60-120 골든크로스(노란 양운) 가속 돌파"
 
             # 🚨 소속 시장 선물지수가 폭락 투매 서킷브레이커(CRASH_LOCK) 상태일 때는 2차 불타기(BUY_2) 보류!
             if is_breakout and futures_regime != "CRASH_LOCK":

@@ -1088,21 +1088,23 @@ class SafeHoldingsThemeGateBot:
             pre_close = float(last_daily.get('close', tick_close))
         day_ret_pct = ((tick_close - pre_close) / pre_close * 100.0) if pre_close > 0 else 0.0
 
-        # 4. 120틱 WMA 20-40-60 순차돌파 가속도 점수 (10점 만점 - 실시간 tick_close 주입 반영)
+        # 4. 120틱 듀얼 골든크로스(테마 60-120 GC & SMA 40-60 GC) 점수 (10점 만점)
         score_120t = 0.0
-        if df_120t is not None and len(df_120t) >= 65 and 'close' in df_120t:
-            s_120t = df_120t['close'].astype(float).copy()
-            if tick_close > 0:
-                s_120t.iloc[-1] = tick_close
-            w1 = float(s_120t.iloc[-1])
-            w20 = float(calculate_wma(s_120t, 20).iloc[-1])
-            w40 = float(calculate_wma(s_120t, 40).iloc[-1])
-            w60 = float(calculate_wma(s_120t, 60).iloc[-1])
-            if not np.isnan(w20) and not np.isnan(w40) and not np.isnan(w60):
-                if w1 >= w60 * 0.998 and w1 >= w40 * 0.998 and w1 >= w20 * 0.998:
-                    score_120t = 10.0
-                elif w1 >= w20:
-                    score_120t = 5.0
+        if df_120t is not None and len(df_120t) >= 40 and 'close' in df_120t:
+            df_120t_calc = calculate_120t_tema_indicators(df_120t, current_price=tick_close)
+            if not df_120t_calc.empty:
+                last_120 = df_120t_calc.iloc[-1]
+                is_yellow_cloud = bool(last_120.get('is_yellow_cloud', False))
+                is_sma_bull = bool(last_120.get('is_sma40_60_bull', False))
+                tema_gc_recent = bool(df_120t_calc['is_tema60_120_gc'].tail(5).any()) if 'is_tema60_120_gc' in df_120t_calc else False
+                sma_gc_recent = bool(df_120t_calc['is_sma40_60_gc'].tail(5).any()) if 'is_sma40_60_gc' in df_120t_calc else False
+
+                if (tema_gc_recent or is_yellow_cloud) and (sma_gc_recent or is_sma_bull):
+                    score_120t = 10.0  # 듀얼 크로스 완성/동시 돌파 (최고점)
+                elif tema_gc_recent or is_yellow_cloud:
+                    score_120t = 7.0   # 테마 60-120 골든크로스 (1차 타점 완료)
+                elif sma_gc_recent or is_sma_bull:
+                    score_120t = 5.0   # SMA 40-60 골든크로스 완료
 
         # 5. 시초가 모멘텀 락온 점수 (+1.5% 돌파, 10점 만점 - NXT 프리마켓 08:03~08:30 & KRX 정규장 09:00~09:30)
         score_morning = 0.0
