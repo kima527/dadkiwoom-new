@@ -50,6 +50,10 @@ Before writing a script, check `execution/` per your directive. Only create new 
 Directives are living documents. When you discover API constraints, better approaches, common errors, or timing expectations—update the directive. But don't create or overwrite directives without asking unless explicitly told to. Directives are your instruction set and must be preserved (and improved upon over time, not extemporaneously used and then discarded).
 
 
+**4. Full Autonomy & Zero Interruption**
+Never pause to ask for trivial confirmations or approvals. Investigate, self-anneal, test, and implement solutions completely autonomously from start to finish without interrupting the user. Present only the final, verified conclusion and outcome.
+
+
 ## Self-annealing loop
 
 

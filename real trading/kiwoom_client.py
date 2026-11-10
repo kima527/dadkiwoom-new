@@ -34,17 +34,29 @@ from kiwoom_rest_api.koreanstock.stockinfo import StockInfo
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# 🛡️ 키움증권 REST API 리밋 방어용 전역 레이트 리미터 (초당 최대 4회 = 0.25초 강제 딜레이)
+# 🛡️ 키움증권 REST API 리밋 방어용 전역 레이트 리미터
 _LAST_KIWOOM_CALL_TIME = 0.0
-_MIN_KIWOOM_INTERVAL = 0.25  # 키움 공식 1초당 5회 제한 대비 100% 안전 보장
+_LAST_KIWOOM_ACCOUNT_CALL_TIME = 0.0
+_MIN_KIWOOM_INTERVAL = 0.25          # 일반 시세 TR (초당 최대 4회 = 0.25초, 키움 공식 5회 제한 대비 안전)
+_MIN_KIWOOM_ACCOUNT_INTERVAL = 0.40  # 🏛️ 계좌 조회 TR (초당 최대 2.5회 = 0.40초, 키움 공식 1초 3회 제한 100% 안전 보장)
 
-def _enforce_kiwoom_rate_limit():
-    global _LAST_KIWOOM_CALL_TIME
+def _enforce_kiwoom_rate_limit(is_account: bool = False):
+    global _LAST_KIWOOM_CALL_TIME, _LAST_KIWOOM_ACCOUNT_CALL_TIME
     now = time.time()
+    
+    # 1) 일반 전역 딜레이 (0.25초)
     elapsed = now - _LAST_KIWOOM_CALL_TIME
     if elapsed < _MIN_KIWOOM_INTERVAL:
         time.sleep(_MIN_KIWOOM_INTERVAL - elapsed)
     _LAST_KIWOOM_CALL_TIME = time.time()
+
+    # 2) 계좌 조회 전용 딜레이 (0.40초 = 1초당 최대 2.5회로 키움 3회 제한 완벽 방어)
+    if is_account:
+        acc_now = time.time()
+        acc_elapsed = acc_now - _LAST_KIWOOM_ACCOUNT_CALL_TIME
+        if acc_elapsed < _MIN_KIWOOM_ACCOUNT_INTERVAL:
+            time.sleep(_MIN_KIWOOM_ACCOUNT_INTERVAL - acc_elapsed)
+        _LAST_KIWOOM_ACCOUNT_CALL_TIME = time.time()
 
 
 class KiwoomRealClient:
@@ -66,10 +78,10 @@ class KiwoomRealClient:
 
         # 💡 [Patch] kiwoom_rest_api 라이브러리가 acnt_no를 누락하는 문제를 해결하기 위해
         # 계좌 관련 및 주문 API의 _execute_request에 config.KIWOOM_ACCOUNT_NUM을 강제 주입
-        def _patch_api_instance(api_instance):
+        def _patch_api_instance(api_instance, is_account: bool = False):
             original_execute = api_instance._execute_request
             def patched_execute(method: str, resource_url: str = None, **kwargs):
-                _enforce_kiwoom_rate_limit()
+                _enforce_kiwoom_rate_limit(is_account=is_account)
                 if "json" in kwargs and kwargs["json"] is not None:
                     kwargs["json"]["acnt_no"] = config.KIWOOM_ACCOUNT_NUM
                     if hasattr(config, 'KIWOOM_ACCOUNT_PWD') and config.KIWOOM_ACCOUNT_PWD:
@@ -89,11 +101,11 @@ class KiwoomRealClient:
                 return original_execute(method, resource_url, **kwargs)
             api_instance._execute_request = patched_execute
 
-        _patch_api_instance(self.account_api)
-        _patch_api_instance(self.chart_api)
-        _patch_api_instance(self.order_api)
-        _patch_api_instance(self.rank_api)
-        _patch_api_instance(self.stock_info_api)
+        _patch_api_instance(self.account_api, is_account=True)
+        _patch_api_instance(self.chart_api, is_account=False)
+        _patch_api_instance(self.order_api, is_account=False)
+        _patch_api_instance(self.rank_api, is_account=False)
+        _patch_api_instance(self.stock_info_api, is_account=False)
 
     # ═══════════════════════════════════════════════════════════
     # 🔒 종목코드 정규화 (모든 API 호출 전 반드시 이 메서드를 거침)

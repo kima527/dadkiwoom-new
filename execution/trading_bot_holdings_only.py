@@ -190,7 +190,8 @@ class SafeHoldingsThemeGateBot:
         auto_scan: bool = False,
         condition_name: str = "Traiding,traiding,Traiding1,trading1",
         enable_ws: bool = True,
-        min_overlap: int = 1
+        min_overlap: int = 1,
+        fixed_qty: int = 2
     ):
         """
         is_real: 키움 실전 API 연동 여부
@@ -201,10 +202,12 @@ class SafeHoldingsThemeGateBot:
         auto_scan: 정적 관심종목(holy_grail_watchlist.json) 스캔 여부 (기본값 False: Traiding/traiding/Traiding1 조건검색 전용)
         condition_name: 키움 실시간 조건검색식 이름 (기본값: 'Traiding,traiding,Traiding1,trading1')
         enable_ws: 키움 실시간 조건검색 웹소켓 수신 데몬 활성화 여부
+        fixed_qty: 고정 매수 수량 (기본값: 2주, 계좌 예수금 조회 TR 생략)
         """
         self.dry_run = dry_run
         self.auto_scan = auto_scan
         self.condition_name = condition_name
+        self.fixed_qty = fixed_qty
         # 조건식 중복 포착 집계: 전체 조건식 개수 및 신규 매수 허용 최소 중복 수 (기본 1 = 중복 많은 종목 '우선', 3 = 3곳 이상만 매수)
         self.condition_total = max(1, len({n.strip() for n in str(condition_name).split(',') if n.strip()}))
         self.min_overlap = max(1, min(int(min_overlap), self.condition_total))
@@ -221,7 +224,8 @@ class SafeHoldingsThemeGateBot:
         if self.dry_run:
             logger.info(" 🛡️ [실전 계좌 연동 + 모의 안전 모드(DRY-RUN)] 실계좌 잔고 + 실시간 조건검색 감시 (실제 주문 미전송)")
         elif self.is_real:
-            logger.info(f" 🚀 [키움 실전 계좌 거래 모드] 실계좌 잔고 + 실시간 조건검색({self.condition_name}) + 지수초과강도·120틱 매매 즉시 전송")
+            qty_tag = f"고정 {self.fixed_qty}주 실전 매매 (예수금 TR 생략)" if self.fixed_qty > 0 else "예수금 100% 매매"
+            logger.info(f" 🚀 [키움 실전 계좌 거래 모드] {qty_tag} + 실시간 조건검색({self.condition_name}) + 지수초과강도·120틱 매매 즉시 전송")
         else:
             logger.info(" 🧪 [시뮬레이션 모드] 가상 데이터 모드")
         logger.info("==================================================")
@@ -242,6 +246,9 @@ class SafeHoldingsThemeGateBot:
         self.auto_watchlist_picks: dict[str, dict] = {}
         self.pending_buy_orders: dict[str, dict] = {}
         self.last_watchlist_scan_time: float = 0.0
+        self._last_account_refresh_time: float = 0.0  # 🏛️ 키움 계좌 TR(초당 3회 제한) 방어용 캐시 타임스탬프
+        self._cached_real_holdings: dict = {}
+        self._cached_cash: float = 0.0
         self.sold_cooldowns: dict[str, float] = {}  # 매도 종목 단기 쿨다운 (code -> cooldown_until_ts, 영구 차단 없이 관심종목 지속 유지)
         self.current_trading_date = datetime.now().date()
         self.dryrun_stats: dict[str, Any] = {
@@ -487,10 +494,30 @@ class SafeHoldingsThemeGateBot:
 
     def refresh_holdings(self):
         """실전 계좌 보유종목 + 통합 성배 로직 최적합 자동발굴 관심종목 통합 갱신"""
-        if self.is_real:
+        now_ts = time.time()
+        # 🛡️ 키움증권 계좌 조회 TR(1초당 3회 제한) 완벽 보호:
+        # 최근 2.5초 이내에 계좌 조회를 완료했고, 대기 중인 미체결 주문이 없다면 캐시된 잔고를 재사용하여 TR 차단을 원천 방지합니다.
+        can_use_cache = (
+            self.is_real 
+            and (now_ts - self._last_account_refresh_time < 2.5)
+            and not self.pending_buy_orders
+            and bool(self._cached_real_holdings or self._cached_cash > 0)
+        )
+        if can_use_cache:
+            real_holdings = self._cached_real_holdings
+            cash = self._cached_cash
+        elif self.is_real:
             real_holdings = self.api.get_account_holdings()
-            cash = self.api.get_cash_balance()
+            # 🌟 [대표님 지시]: "계좌예수금 조회하지말고 그냥 2주로 매매를 해보자"
+            # ➔ 고정 수량 매매 모드(fixed_qty > 0) 시 계좌 예수금 조회 TR(opw00001/kt00001)을 아예 호출하지 않아 1초 3회 제한 완전 방어!
+            if self.fixed_qty > 0:
+                cash = 10_000_000.0  # 고정 2주 매매용 가상 예수금 (TR 호출 생략)
+            else:
+                cash = self.api.get_cash_balance()
             self._check_and_cleanup_unfilled_orders(real_holdings)
+            self._cached_real_holdings = real_holdings
+            self._cached_cash = cash
+            self._last_account_refresh_time = now_ts
         else:
             real_holdings = {
                 '005930': {'qty': 1, 'buy_price': 70000, 'current_price': 71000},
@@ -544,7 +571,11 @@ class SafeHoldingsThemeGateBot:
         # (A) 실계좌 실보유 종목 (qty > 1) 최우선 배치
         for code, h in real_holdings.items():
             if int(h.get('qty', 0)) > 1:
-                holdings[code] = h
+                h_copy = dict(h)
+                if code in self.condition_picks:
+                    h_copy['is_condition_pick'] = True
+                    h_copy['target_tag'] = self.condition_picks[code].get('target_tag', '🔔실시간조건(Traiding)')
+                holdings[code] = h_copy
 
         # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입 (조건식 중복 포착 수 많은 순 → 최신 포착순, 최대 15종목)
         # 💡 매도된 종목도 버리지 않고 계속 관심종목으로 유지하며 120틱 파동을 지속 들여다봄!
@@ -603,8 +634,9 @@ class SafeHoldingsThemeGateBot:
                 }
 
         self.active_holdings = holdings
+        cash_str = f"고정 {self.fixed_qty}주 실전 매매 (예수금 조회 TR 생략)" if self.fixed_qty > 0 else f"가용 예수금: {cash:,.0f}원"
         logger.info(
-            f"💼 [계좌 잔고 & 실시간 조건검색 갱신] 가용 예수금: {cash:,.0f}원 | "
+            f"💼 [계좌 잔고 & 실시간 조건검색 갱신] {cash_str} | "
             f"실계좌 보유: {len(real_holdings)}개 + 🔔실시간조건검색({self.condition_name}): {cond_added_count}개 (총 감시: {len(holdings)}개)"
         )
 
@@ -627,7 +659,8 @@ class SafeHoldingsThemeGateBot:
                 strat = ThemeGate60mStrategy(
                     initial_capital=cash,
                     gate_sl_pct=DEFAULT_CONFIG.GATE_STOP_LOSS_PCT,
-                    max_reentry=0
+                    max_reentry=0,
+                    fixed_qty=self.fixed_qty
                 )
                 if is_cond_pick and account_qty == 0:
                     strat.position.state = StrategyState.IDLE
@@ -650,27 +683,30 @@ class SafeHoldingsThemeGateBot:
                     if buy_prc > 0:
                         strat.position.avg_price = buy_prc
                     logger.info(f"   🎯 [{name}({code})] 계좌 관심종목(1주 마커) 등록 완료 (IDLE 대기 | 기존 수량: {account_qty}주 ➔ 1차/기준선 돌파 매수 시 흡수 합산)")
-                elif self.holdings_state == "first_buy_done":
+                elif self.holdings_state == "first_buy_done" or is_cond_pick or (code in self.condition_picks):
                     strat.position.state = StrategyState.FIRST_BUY_DONE
                     strat.position.total_qty = account_qty
                     strat.position.avg_price = buy_prc
                     strat.position.first_buy_price = buy_prc
                     strat.position.first_buy_qty = account_qty
                     strat.position.base_account_qty = 0
+                    strat.position.entry_mode = "120T_TEMA"
                     strat.position.entry_time = time.time()
-                    logger.info(f"   ➔ [{name}({code})] 1차 매수 보유 상태 등록 (FIRST_BUY_DONE) | 보유: {account_qty}주 (매수가: {buy_prc:,.0f}원) ➔ M선 돌파 2차 매수 대기")
+                    logger.info(f"   ➔ [{name}({code})] 1차 매수 보유 상태 등록 (FIRST_BUY_DONE | 당일 조건검색/타점 진입) | 보유: {account_qty}주 (매수가: {buy_prc:,.0f}원) ➔ 120틱 2차 불타기 및 익절 대기")
                 else:
-                    # 실보유 종목 (account_qty > 1) -> M/3 수식선 및 기준선 변곡선 이탈 매도 감시 (FULL_POSITION)
+                    # 기존 계좌 보유분 (account_qty > 1) -> M/3 수식선 및 기준선 변곡선 이탈 매도 감시 (FULL_POSITION)
                     strat.position.state = StrategyState.FULL_POSITION
                     strat.position.total_qty = account_qty
                     strat.position.avg_price = buy_prc
                     strat.position.base_account_qty = 0
                     strat.position.entry_time = time.time()
-                    logger.info(f"   ➔ [{name}({code})] 실보유 종목 등록 완료 (FULL_POSITION | M/3 수식선 & 기준선 변곡선 매도 감시) | 보유: {account_qty}주 | 매수가: {buy_prc:,.0f}원")
+                    strat.position.entry_mode = ""
+                    logger.info(f"   ➔ [{name}({code})] 기존 계좌 보유분 등록 완료 (FULL_POSITION | M/3 수식선 & 기준선 변곡선 매도 감시) | 보유: {account_qty}주 | 매수가: {buy_prc:,.0f}원")
                 ordered_strategies[code] = strat
             else:
-                # 이미 등록된 전략 객체에도 최신 예수금 반영 (단, 모의/DRY-RUN 중 가상 차감된 예수금 보존을 위해 실전 모드에서만 덮어씀)
+                # 이미 등록된 전략 객체에도 최신 예수금 및 고정 수량 반영
                 existing_strat = self.strategies[code]
+                existing_strat.fixed_qty = self.fixed_qty
                 if self.is_real and not self.dry_run:
                     existing_strat.cash = cash
 
@@ -1629,6 +1665,8 @@ if __name__ == '__main__':
     parser.add_argument("--auto-scan", action="store_true", help="정적 관심종목(holy_grail_watchlist.json) 병행 스캔 활성화")
     parser.add_argument("--min-overlap", type=int, default=1,
                         help="신규 매수 허용 최소 조건식 중복 포착 수 (기본 1=중복 많은 종목 우선 매매, 3=3곳 이상 동시 포착 종목만 매수)")
+    parser.add_argument("--fixed-qty", type=int, default=2,
+                        help="고정 매수 수량 (기본값: 2주, 계좌 예수금 조회 TR 생략)")
     parser.add_argument("--no-ws", action="store_true", help="실시간 조건검색 웹소켓 비활성화")
 
     args = parser.parse_args()
@@ -1640,7 +1678,8 @@ if __name__ == '__main__':
         auto_scan=args.auto_scan,
         condition_name=args.condition,
         enable_ws=(not args.no_ws),
-        min_overlap=args.min_overlap
+        min_overlap=args.min_overlap,
+        fixed_qty=args.fixed_qty
     )
 
     if args.once:
