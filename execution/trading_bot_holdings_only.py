@@ -251,6 +251,10 @@ class SafeHoldingsThemeGateBot:
         self._cached_cash: float = 0.0
         self.sold_cooldowns: dict[str, float] = {}  # 매도 종목 단기 쿨다운 (code -> cooldown_until_ts, 영구 차단 없이 관심종목 지속 유지)
         self.current_trading_date = datetime.now().date()
+        self.elite_top5_pool: set[str] = set()       # 👑 09:05 정각 락온된 상위 5개 정예군 풀 (09:05 이후 신규 조건검색 100% 차단)
+        self.pool_locked: bool = False               # 🔒 풀 락온 완료 여부 플래그
+        self.m5_anchors: dict[str, dict] = {}        # 🎯 첫 5분봉 앵커 캐시 (open_5m, low_5m, high_5m, locked)
+        self._orderbook_cache: dict[str, dict] = {}  # 📊 호가창 매도/매수 잔량비 캐시 (ask_bid_ratio, ts)
         self.dryrun_stats: dict[str, Any] = {
             'initial_seed': 0.0,
             'virtual_cash': 0.0,
@@ -279,6 +283,12 @@ class SafeHoldingsThemeGateBot:
         """키움 실시간 조건검색(Traiding, traiding, Traiding1) 종목 편입 콜백"""
         clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
         if not clean_code.isdigit() or len(clean_code) != 6:
+            return
+
+        # 👑 [09:05 풀 락온 후 신규 조건검색 100% 차단]
+        # 대표님 절대 원칙: 09:05 이후에 조건검색식으로 편입되는 종목들은 100% 무시/차단 (오직 Top 5 정예군으로만 매매 진행)
+        if self.pool_locked and clean_code not in self.elite_top5_pool and clean_code not in self.active_holdings:
+            logger.debug(f"🚫 [09:05 풀 락온 차단] [{clean_code}] 신규 조건검색 무시 (Top 5 정예군 외 종목 100% 차단)")
             return
 
         effective_cond = cond_name.strip() if cond_name and cond_name.strip() else "Traiding"
@@ -339,6 +349,221 @@ class SafeHoldingsThemeGateBot:
         with self.condition_lock:
             pick = self.condition_picks.get(code)
             return int(pick.get('overlap', 1)) if pick else 0
+
+    def get_orderbook_stats(self, code: str) -> float:
+        """
+        호가창 매도/매수 잔량비(ask_bid_ratio) 반환:
+        - total_ask_qty / total_bid_qty (매도총잔량 / 매수총잔량)
+        - 1.15 이상이면 위쪽 매도벽이 두터운 세력 매집형 호가 (당일 저점 지지 신호)
+        - 3초 캐싱으로 API 호출 TR 부하 최소화
+        - 기본값: 1.20 (조회 실패/모의 시 안전 통과)
+        """
+        clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
+        now_ts = time.time()
+        if clean_code in self._orderbook_cache:
+            cached = self._orderbook_cache[clean_code]
+            if (now_ts - cached['ts']) < 3.0:
+                return float(cached['ratio'])
+
+        ratio = 1.20
+        if self.is_real and self.api and hasattr(self.api, 'real_client'):
+            try:
+                rc = self.api.real_client
+                from kiwoom_rest_api.koreanstock.market_condition import MarketCondition
+                mc = MarketCondition(base_url=rc.base_url, token_manager=rc.token_manager)
+                data_code = rc._get_data_code(clean_code) if hasattr(rc, '_get_data_code') else clean_code
+                res = mc.stock_quote_request_ka10004(stock_code=data_code)
+                if res and res.get("return_code") == 0:
+                    tot_ask = float(str(res.get("tot_sel_req", "0")).replace("+", "").replace("-", "") or 0)
+                    tot_bid = float(str(res.get("tot_buy_req", "0")).replace("+", "").replace("-", "") or 0)
+                    if tot_bid > 0:
+                        ratio = tot_ask / tot_bid
+                    elif tot_ask > 0:
+                        ratio = 2.0
+            except Exception as e:
+                logger.debug(f"호가창 잔량비 조회 예외 ({clean_code}): {e}")
+
+        self._orderbook_cache[clean_code] = {'ratio': ratio, 'ts': now_ts}
+        return ratio
+
+    def get_5m_anchor(self, code: str, df_60m: Optional[pd.DataFrame], df_daily: Optional[pd.DataFrame], tick_close: float) -> dict:
+        """
+        09:00~09:05 첫 5분봉의 시가(open_5m), 저가(low_5m), 고가(high_5m) 반환 및 캐싱.
+        - 09:05 정각 이후에는 고정 앵커로 확정 보존.
+        - API 5분봉(get_5m_candles) 조회 시 당일 09:00 첫 5분봉 캔들 추출.
+        - 부재 시 당일 일봉 시가(day_open) 및 저가 기반 백업.
+        """
+        clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
+        if clean_code in self.m5_anchors:
+            cached = self.m5_anchors[clean_code]
+            if cached.get('locked', False):
+                return cached
+
+        now_t = datetime.now().time()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        anchor = {'open': 0.0, 'low': 0.0, 'high': 0.0, 'locked': False}
+
+        # 1) API 5분봉 직접 조회 시도
+        if self.is_real and self.api and hasattr(self.api, 'get_5m_candles'):
+            try:
+                df_5m = self.api.get_5m_candles(clean_code)
+                if df_5m is not None and not df_5m.empty:
+                    date_col = 'date' if 'date' in df_5m.columns else ('time' if 'time' in df_5m.columns else None)
+                    if date_col:
+                        df_today = df_5m[df_5m[date_col].astype(str).str.contains(today_str)]
+                        if not df_today.empty:
+                            first_bar = df_today.iloc[0]
+                            anchor['open'] = float(first_bar.get('open', 0.0))
+                            anchor['low'] = float(first_bar.get('low', 0.0))
+                            anchor['high'] = float(first_bar.get('high', 0.0))
+            except Exception as e:
+                logger.debug(f"5분봉 앵커 조회 예외 ({clean_code}): {e}")
+
+        # 2) Fallback: 일봉/60분봉 시가 및 저가 활용
+        if anchor['open'] <= 0:
+            day_open = 0.0
+            day_low = 0.0
+            day_high = 0.0
+            if df_daily is not None and not df_daily.empty:
+                last_d = df_daily.iloc[-1]
+                day_open = float(last_d.get('open', 0.0))
+                day_low = float(last_d.get('low', 0.0))
+                day_high = float(last_d.get('high', 0.0))
+            if day_open <= 0 and df_60m is not None and not df_60m.empty:
+                last_60 = df_60m.iloc[-1]
+                day_open = float(last_60.get('open', 0.0))
+                day_low = float(last_60.get('low', 0.0))
+                day_high = float(last_60.get('high', 0.0))
+            if day_open <= 0:
+                day_open = tick_close
+                day_low = tick_close * 0.995
+                day_high = tick_close * 1.015
+
+            anchor['open'] = day_open
+            anchor['low'] = day_low if day_low > 0 else min(day_open * 0.992, tick_close)
+            anchor['high'] = day_high if day_high > 0 else max(day_open * 1.015, tick_close)
+
+        # 09:05 이후이거나 pool_locked 상태이면 앵커 영구 고정
+        if now_t >= dtime(9, 5, 0) or self.pool_locked:
+            anchor['locked'] = True
+
+        self.m5_anchors[clean_code] = anchor
+        return anchor
+
+    def _lock_top5_pool(self):
+        """
+        👑 [09:05:00 정각] 장초반 5분 관찰 완료 ➔ 당일 최상위 5개(Top 5) 정예군 풀 락온(Pool Lock)
+        - 09:00~09:05 동안 Traiding 조건검색에 편입된 종목 + 기존 실계좌 보유 종목 대상
+        - 선정 기준:
+          1) 조건식 중복 포착 수 (많은 조건식에 동시 포착된 대장주 우선)
+          2) 당일 시가 대비 등락률 및 양봉 순도
+          3) 거래대금 / 전일대비 거래량 잠식률
+          4) 시장 지수 대비 초과강도 (RS Alpha)
+        - 상위 5개만 self.elite_top5_pool 에 영구 락온
+        - 09:05:01 이후 조건검색에 새로 뜨는 종목은 100% 무시/차단
+        """
+        if self.pool_locked:
+            return
+
+        logger.info("================================================================================")
+        logger.info("👑 [09:05:00 정각] 장초반 5분 관찰 완료 ➔ 당일 최상위 5개(Top 5) 정예군 풀 락온 시작!")
+        logger.info("================================================================================")
+
+        candidates = {}
+        with self.condition_lock:
+            for code, pick in self.condition_picks.items():
+                candidates[code] = dict(pick)
+
+        for code, h in self.active_holdings.items():
+            if code not in candidates:
+                candidates[code] = {
+                    'code': code,
+                    'name': self.get_stock_name(code),
+                    'overlap': 1,
+                    'cond_names': ['AccountHolding'],
+                    'target_tag': '계좌보유'
+                }
+
+        if not candidates:
+            logger.warning("⚠️ 09:05 정각 포착된 종목이 없습니다. 풀 잠금 보류 후 다음 사이클 재시도.")
+            return
+
+        scored_candidates = []
+        futures_regimes = self.get_futures_market_regime()
+
+        for code, cand in candidates.items():
+            name = self.get_stock_name(code)
+            try:
+                df_60m = self.get_60m_candles(code)
+                df_daily = self.get_daily_candles(code)
+                h_info = self.active_holdings.get(code, {})
+                tick_close = float(h_info.get('current_price', 0.0) or 0.0)
+                if tick_close <= 0 and df_60m is not None and not df_60m.empty:
+                    tick_close = float(df_60m.iloc[-1].get('close', 0.0))
+                if tick_close <= 0:
+                    continue
+
+                last_60m = df_60m.iloc[-1] if (df_60m is not None and not df_60m.empty) else pd.Series({'close': tick_close, 'open': tick_close, 'high': tick_close, 'low': tick_close})
+                last_daily = df_daily.iloc[-1] if (df_daily is not None and not df_daily.empty) else pd.Series({'close': tick_close, 'open': tick_close, 'volume': 0})
+
+                score, details = self.calculate_priority_score(
+                    code, name, tick_close, last_60m, last_daily, df_60m, df_daily=df_daily
+                )
+                overlap = self.get_condition_overlap(code)
+                stock_market = self.get_stock_market_type(code)
+                matched_fut = futures_regimes.get(stock_market, {})
+                fut_flu = float(matched_fut.get('flu_rt', 0.0) or 0.0)
+                day_alpha = details.get('day_ret_pct', 0.0) - fut_flu
+
+                # 5분봉 앵커 사전 확보
+                self.get_5m_anchor(code, df_60m, df_daily, tick_close)
+
+                scored_candidates.append({
+                    'code': code,
+                    'name': name,
+                    'score': score,
+                    'overlap': overlap,
+                    'day_ret_pct': details.get('day_ret_pct', 0.0),
+                    'day_val_eok': details.get('day_val_eok', 0.0),
+                    'day_alpha': day_alpha,
+                    'details': details
+                })
+            except Exception as e:
+                logger.debug(f"09:05 후보 평가 예외 ({name}): {e}")
+
+        # 정렬: 1순위 조건중복 수 -> 2순위 우선순위 스코어 -> 3순위 거래대금
+        scored_candidates.sort(key=lambda x: (x['overlap'], x['score'], x['day_val_eok']), reverse=True)
+
+        # 상위 5개 선정 (최대 5개)
+        top5 = scored_candidates[:5]
+        self.elite_top5_pool = {item['code'] for item in top5}
+        # 실계좌 실제 보유분(qty > 1)은 매도 관리를 위해 풀에 영구 유지
+        for code, h in self.active_holdings.items():
+            if int(h.get('qty', 0)) > 1:
+                self.elite_top5_pool.add(code)
+
+        self.pool_locked = True
+
+        logger.info("👑 ────────────────────────────────────────────────────────────────────────────")
+        logger.info(f"👑 [09:05 정각 확정] 당일 최상위 5개(Top 5) 정예 주도주 락온 완료 (총 {len(self.elite_top5_pool)}종목)")
+        for rank, item in enumerate(top5, 1):
+            logger.info(
+                f"   🥇 {rank}위: [{item['name']}({item['code']})] | 점수: {item['score']:.1f}점 | "
+                f"조건중복: {item['overlap']}/{self.condition_total} | 등락률: {item['day_ret_pct']:+.2f}% | "
+                f"지수초과(RS): {item['day_alpha']:+.2f}%p | 거래대금: {item['day_val_eok']:.1f}억"
+            )
+        logger.info("🔒 [안내] 09:05:01 이후 조건검색식에 새로 뜨는 종목은 100% 무시(차단)됩니다.")
+        logger.info("   [제1전략] 09:05~09:30: 첫 5분봉 앵커 & 호가창 스나이핑 (2주 실전 매수)")
+        logger.info("   [제2전략] 1차 매도 후: 120틱 관문선 저점 2주 회전 매매 가동")
+        logger.info("👑 ────────────────────────────────────────────────────────────────────────────")
+
+        # 탈락한 종목 중 실보유가 없는 종목은 condition_picks에서 정리
+        with self.condition_lock:
+            for c in list(self.condition_picks.keys()):
+                if c not in self.elite_top5_pool and c not in self.active_holdings:
+                    self.condition_picks.pop(c, None)
+
 
     def _start_condition_ws_daemon(self):
         """백그라운드 데몬 스레드에서 KiwoomWebSocketClient 실시간 조건검색 수신 루프 구동"""
@@ -577,15 +802,18 @@ class SafeHoldingsThemeGateBot:
                     h_copy['target_tag'] = self.condition_picks[code].get('target_tag', '🔔실시간조건(Traiding)')
                 holdings[code] = h_copy
 
-        # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입 (조건식 중복 포착 수 많은 순 → 최신 포착순, 최대 15종목)
-        # 💡 매도된 종목도 버리지 않고 계속 관심종목으로 유지하며 120틱 파동을 지속 들여다봄!
+        # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입
+        # 🔒 풀 락온 상태에서는 elite_top5_pool에 속한 종목만 엄선 편입!
         cond_added_count = 0
         with self.condition_lock:
-            sorted_cond_picks = sorted(
-                self.condition_picks.values(),
-                key=lambda x: (int(x.get('overlap', 1)), float(x.get('last_update', x.get('captured_at', 0.0)))),
-                reverse=True
-            )[:15]
+            if self.pool_locked:
+                sorted_cond_picks = [p for p in self.condition_picks.values() if p['code'] in self.elite_top5_pool]
+            else:
+                sorted_cond_picks = sorted(
+                    self.condition_picks.values(),
+                    key=lambda x: (int(x.get('overlap', 1)), float(x.get('last_update', x.get('captured_at', 0.0)))),
+                    reverse=True
+                )[:15]
         for c_pick in sorted_cond_picks:
             code = c_pick['code']
             if code not in real_holdings:
@@ -601,25 +829,28 @@ class SafeHoldingsThemeGateBot:
                 }
                 cond_added_count += 1
 
-        # (B-2) 🌟 성배 로직 최적합 자동 발굴 관심종목 편입
+        # (B-2) 🌟 성배 로직 최적합 자동 발굴 관심종목 편입 (풀 락온 전까지만 허용)
         auto_added_count = 0
-        for code, pick in self.auto_watchlist_picks.items():
-            if code not in holdings and code not in real_holdings:
-                holdings[code] = {
-                    'name': pick.get('name', ''),
-                    'qty': 0,
-                    'buy_price': 0.0,
-                    'current_price': float(pick.get('price', 0.0)),
-                    'is_auto_watchlist': True,
-                    'is_condition_pick': False,
-                    'target_tag': pick.get('target_tag', '🌟성배타점관종'),
-                    'fit_score': pick.get('fit_score', 0.0)
-                }
-                auto_added_count += 1
+        if not self.pool_locked:
+            for code, pick in self.auto_watchlist_picks.items():
+                if code not in holdings and code not in real_holdings:
+                    holdings[code] = {
+                        'name': pick.get('name', ''),
+                        'qty': 0,
+                        'buy_price': 0.0,
+                        'current_price': float(pick.get('price', 0.0)),
+                        'is_auto_watchlist': True,
+                        'is_condition_pick': False,
+                        'target_tag': pick.get('target_tag', '🌟성배타점관종'),
+                        'fit_score': pick.get('fit_score', 0.0)
+                    }
+                    auto_added_count += 1
 
         # (C) 실계좌 1주 보유 관심종목 마커 배치
         for code, h in real_holdings.items():
             if code not in holdings:
+                if self.pool_locked and code not in self.elite_top5_pool and int(h.get('qty', 0)) <= 1:
+                    continue  # 락온 이후 비정예 1주 마커는 감시 대상에서 제외하여 TR 부하 축소
                 holdings[code] = h
 
         # (D) 지정가 주문 발송 직후 아직 잔고에 미반영된 활성 전략 종목 보호
@@ -1177,16 +1408,20 @@ class SafeHoldingsThemeGateBot:
 
     def run_cycle(self):
         """1회 감시 사이클"""
-        # 🌅 날짜 변경 시 당일 매도 완료(No-Rebuy) 목록 자동 초기화
+        # 🌅 날짜 변경 시 당일 매도 완료(No-Rebuy) 목록 및 Top 5 풀 자동 초기화
         today_date = datetime.now().date()
         if today_date != self.current_trading_date:
             with self.condition_lock:
                 old_cond_count = len(self.condition_picks)
                 self.condition_picks.clear()
             self.sold_cooldowns.clear()
+            self.elite_top5_pool.clear()
+            self.pool_locked = False
+            self.m5_anchors.clear()
+            self._orderbook_cache.clear()
             logger.info(
                 f"🌅 [영업일 변경 감지] {self.current_trading_date} ➔ {today_date} | "
-                f"전일 조건검색({old_cond_count}개) 및 쿨다운 초기화 완료 ➔ 금일 신규 조건검색 수신 대기!"
+                f"전일 조건검색({old_cond_count}개), Top 5 풀 락온 및 앵커 초기화 완료 ➔ 금일 신규 조건검색 수신 대기!"
             )
             self.current_trading_date = today_date
 
@@ -1197,6 +1432,18 @@ class SafeHoldingsThemeGateBot:
             return
 
         is_active, session_name, exchange_hint = get_market_session()
+        cur_t = datetime.now().time()
+        is_krx_session = (exchange_hint == "KRX")
+
+        # 👑 [09:05:00 정각] 최상위 5개(Top 5) 정예군 풀 락온 트리거!
+        if is_krx_session and cur_t >= dtime(9, 5, 0) and not self.pool_locked:
+            self._lock_top5_pool()
+
+        # 🔍 09:00~09:05 장초반 관찰 모드 (첫 5분봉 완성 대기, 신규 매수 차단)
+        is_morning_obs = (dtime(9, 0, 0) <= cur_t < dtime(9, 5, 0) and is_krx_session)
+        if is_morning_obs:
+            logger.info("🔍 [09:00~09:05 장초반 5분 관찰 모드] 첫 5분봉 완성 대기 중... 신규 매수 전면 차단 (09:05 정각 상위 5개 락온 예정)")
+
         market_status_str = f"🟢 {session_name}" if is_active else f"🔴 {session_name}"
         logger.info(f"⏱️ 감시 루프 실행 중... [현재 시장 상태: {market_status_str}]")
 
@@ -1230,6 +1477,10 @@ class SafeHoldingsThemeGateBot:
             name = self.get_stock_name(code)
             strat = self.strategies.get(code)
             if not strat or strat.position.state == StrategyState.TERMINATED:
+                continue
+
+            # 🔒 풀 락온 상태에서 Top 5 정예군 외 비보유 종목은 스킵 (불필요한 TR 호출 차단)
+            if self.pool_locked and code not in self.elite_top5_pool and strat.position.total_qty <= 0:
                 continue
 
             # 💡 쿨다운 확인: 매도 직후 단기 쿨다운(3분) 중인지 체크 (종목을 버리지 않고 계속 들여다봄)
@@ -1361,6 +1612,14 @@ class SafeHoldingsThemeGateBot:
                 cur_qty = h_info.get('qty', 0)
                 pre_holding_qty = cur_qty if (self.is_real and not self.dry_run) else max(cur_qty, prev_pos.total_qty)
 
+                # 🎯 [첫 5분봉 앵커 및 호가창 매도벽 우위 지표 산출]
+                anchor_5m = self.get_5m_anchor(code, df_60m, df_daily, tick_close)
+                open_5m = float(anchor_5m.get('open', 0.0) or 0.0)
+                low_5m = float(anchor_5m.get('low', 0.0) or 0.0)
+                high_5m = float(anchor_5m.get('high', 0.0) or 0.0)
+                ask_bid_ratio = self.get_orderbook_stats(code)
+                is_first_strat = (dtime(9, 5, 0) <= now_t <= dtime(9, 30, 0) and strat.position.trade_count_today == 0)
+
                 # 장 운영 시간(또는 DRY-RUN 테스트 모드)에만 전략 상태 전이 평가 실행
                 # (단, 15:15~15:30 정규장 마감 동시호가 구간에서는 신규 매수 원천 차단 및 보유분 일괄 청산 우선)
                 if (is_active or self.dry_run) and not is_eod_window:
@@ -1377,7 +1636,13 @@ class SafeHoldingsThemeGateBot:
                         is_premarket_bridge_window=is_premarket_bridge_window,
                         is_outperforming_index=is_outperforming_index,
                         is_condition_pick=is_cond_pick,
-                        day_alpha=day_alpha
+                        day_alpha=day_alpha,
+                        open_5m=open_5m,
+                        low_5m=low_5m,
+                        high_5m=high_5m,
+                        day_open=day_open,
+                        ask_bid_ratio=ask_bid_ratio,
+                        is_first_strategy=is_first_strat
                     )
                 else:
                     order = None
@@ -1473,6 +1738,21 @@ class SafeHoldingsThemeGateBot:
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
                     # 3) 신규 1차 매수: 쿨다운/시초 휩소 방어 검사 후 우선순위 스코어링 수집
                     elif order.action == "BUY_1":
+                        if is_morning_obs and not self.dry_run:
+                            logger.info(
+                                f"   🔍 [09:00~09:05 관찰 모드 매수 차단] [{name}({code})] 첫 5분봉 완성 대기 중 "
+                                f"➔ 09:05 정각 상위 5개 락온 후 매수 가동 (상태 안전 복원)"
+                            )
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
+
+                        if self.pool_locked and code not in self.elite_top5_pool:
+                            logger.info(
+                                f"   🚫 [Top 5 풀 외부 매수 차단] [{name}({code})] 정예 5개 외 종목 차단 (상태 안전 복원)"
+                            )
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
+
                         if cooldown_rem > 0:
                             logger.info(
                                 f"   ⏳ [매도 후 쿨다운 대기] [{name}({code})] 3분 쿨다운 잔여 {cooldown_rem:.0f}초 "
@@ -1557,6 +1837,22 @@ class SafeHoldingsThemeGateBot:
         # ─────────────────────────────────────────────────────────────
         # 동시 기준선 돌파 종목 우선순위(Priority Score) 옥석 가리기 및 최우선주 매수 집행
         # ─────────────────────────────────────────────────────────────
+        if buy_candidates:
+            if is_morning_obs and not self.dry_run:
+                logger.info("🔍 [09:00~09:05 장초반 관찰 모드] 5분봉 완성 대기 중 신규 매수 보류 (09:05 정각 상위 5개 락온 후 매매 시작)")
+                for cand in buy_candidates:
+                    self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
+                buy_candidates = []
+            elif self.pool_locked:
+                filtered_cands = []
+                for cand in buy_candidates:
+                    if cand['code'] in self.elite_top5_pool:
+                        filtered_cands.append(cand)
+                    else:
+                        logger.info(f"   🚫 [Top 5 풀 외부 매수 차단] [{cand['name']}({cand['code']})] 정예 5개 외 종목 차단")
+                        self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
+                buy_candidates = filtered_cands
+
         if buy_candidates:
             # 🚨 핵심 결함 수정: 이번 루프에서 막 BUY_1 후보가 되어 FIRST_BUY_DONE으로 임시 전이된 종목들은
             # 기존 활성 종목 조회 대상에서 제외해야 1위 후보(winner) 주문이 정상 발송됨!
