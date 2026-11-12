@@ -20,6 +20,15 @@ except ImportError as e:
     logger.error(f"실전 API(KiwoomRealClient)를 불러올 수 없습니다: {e}")
     sys.exit(1)
 
+try:
+    from execution.overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
+except ImportError:
+    try:
+        from overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
+    except ImportError:
+        get_overnight_market_radar = None
+        get_stock_theme_alignment_score = None
+
 class RealAPIAdapter:
     """
     모의 API(KiwoomRESTClient)와 완전히 동일한 함수(메서드)를 제공하지만,
@@ -559,44 +568,59 @@ class RealAPIAdapter:
         drawdown_from_high_pct = round(sum(dd_list) / len(dd_list), 2) if dd_list else 0.0
         is_bull_candle = (intraday_chg_pct >= -0.05)
 
-        # 🌅 [야간선물 연동 프리마켓/애프터마켓 4단계 날씨 판정]:
+        # 🌐 [글로벌 선행 지수 & 야간선물 레이더 연동]:
+        # 미국 필라델피아 반도체 지수(SOX), 나스닥, 코스피 야간선물 마감치 연동
+        global_radar = None
+        if get_overnight_market_radar:
+            try:
+                global_radar = get_overnight_market_radar()
+            except Exception:
+                pass
+
+        radar_regime = global_radar.get('regime', 'NORMAL_BULL') if global_radar else 'NORMAL_BULL'
+        sox_pct = global_radar.get('sox_pct', 0.0) if global_radar else 0.0
+        fut_pct = global_radar.get('fut_pct', 0.0) if global_radar else 0.0
+
+        # 🌅 [야간선물 & 프리마켓 바스켓 융합 4단계 날씨 판정]:
         # 🔴 4단계 (CRASH_LOCK - 야간선물 폭락 프리마켓 서킷브레이커):
-        #   - 야간선물 여파로 대표 바스켓이 -1.50% 이하 급락 중이거나,
-        #   - 전일 대비 -1.00% 이하 하락하면서 동시에 프리마켓 시가 대비 음봉 투매(-0.30% 이하)가 진행 중이거나,
-        #   - 프리마켓 고점 대비 -1.50%p 이상 급투매가 쏟아지는 경우
         if (
-            flu_rt <= -1.50
+            radar_regime == "CRASH_LOCK"
+            or flu_rt <= -1.50
             or (flu_rt <= -1.00 and intraday_chg_pct <= -0.30)
             or (drawdown_from_high_pct >= 1.50 and flu_rt < 0.0)
         ):
             regime = "CRASH_LOCK"
-            badge = f"🔴{session_tag}폭락잠금({flu_rt:+.2f}%)"
+            badge = f"🔴{session_tag}폭락잠금(바스켓 {flu_rt:+.2f}% | 선물 {fut_pct:+.2f}%)"
             reason = (
-                f"{label}({session_tag}) 급락({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%, 고점대비 -{drawdown_from_high_pct:.2f}%p) "
+                f"{label}({session_tag}) 급락(바스켓 {flu_rt:+.2f}%, 야간선물 {fut_pct:+.2f}%, 필반 {sox_pct:+.2f}%) "
                 f"➔ 프리마켓 신규매수 잠금(09:00 정규장 투매 소화 대기)"
             )
         # 🟡 3단계 (CAUTION_DEFENSE - 야간선물 하락 주의 / 역행 대장주 초엄격 선별):
-        #   - 전일 대비 -0.70% ~ -1.50% 하락 마감 여파 구간이거나, 프리마켓 시가 대비 -0.40% 이하 음봉 눌림 구간
         elif (
-            flu_rt <= -0.70
+            radar_regime == "CAUTION_DEFENSE"
+            or flu_rt <= -0.70
             or intraday_chg_pct <= -0.40
             or drawdown_from_high_pct >= 1.00
         ):
             regime = "CAUTION_DEFENSE"
-            badge = f"🟡{session_tag}하락방어({flu_rt:+.2f}%)"
+            badge = f"🟡{session_tag}하락방어(바스켓 {flu_rt:+.2f}% | 선물 {fut_pct:+.2f}%)"
             reason = (
-                f"{label}({session_tag}) 약세({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) "
+                f"{label}({session_tag}) 약세(바스켓 {flu_rt:+.2f}%, 야간선물 {fut_pct:+.2f}%) "
                 f"➔ 노란선 단순줍기 금지 & 야간선물 역행 검정점선 돌파 대장주(78점+)만 허용"
             )
         # 🔥 1단계 (STRONG_BULL - 야간선물 강세장 / 프리마켓 공격적 선취매):
-        elif flu_rt >= 0.50 and intraday_chg_pct >= -0.15:
+        elif (
+            radar_regime == "STRONG_BULL"
+            or (flu_rt >= 0.50 and intraday_chg_pct >= -0.15)
+            or (sox_pct >= 1.50 and flu_rt >= 0.20)
+        ):
             regime = "STRONG_BULL"
-            badge = f"🔥{session_tag}강세({flu_rt:+.2f}%)"
-            reason = f"{label}({session_tag}) 강세({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 프리마켓 노란선 1차·검정점선 2차 적극 선취매"
+            badge = f"🔥{session_tag}강세(바스켓 {flu_rt:+.2f}% | 선물 {fut_pct:+.2f}%)"
+            reason = f"{label}({session_tag}) 강세(바스켓 {flu_rt:+.2f}%, 야간선물 {fut_pct:+.2f}%, 필반 {sox_pct:+.2f}%) ➔ 프리마켓 노란선 1차·검정점선 2차 적극 선취매"
         # 🟢 2단계 (NORMAL_BULL - 야간선물 보합/정상장):
         else:
             regime = "NORMAL_BULL"
-            badge = f"🟢{session_tag}보합/정상({flu_rt:+.2f}%)"
+            badge = f"🟢{session_tag}보합/정상(바스켓 {flu_rt:+.2f}%)"
             reason = f"{label}({session_tag}) 양호({flu_rt:+.2f}%, 시가대비 {intraday_chg_pct:+.2f}%) ➔ 정석 파동 매매 가동"
 
         return {

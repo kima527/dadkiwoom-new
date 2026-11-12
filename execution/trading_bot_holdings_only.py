@@ -49,10 +49,12 @@ try:
     from execution.indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_pred_volume_ratio
     from execution.strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker, calculate_wma
     from execution.watchlist_scanner import scan_and_save_holy_grail_watchlist, load_saved_watchlist
+    from execution.overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
 except ImportError:
     from indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_pred_volume_ratio
     from strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker, calculate_wma
     from watchlist_scanner import scan_and_save_holy_grail_watchlist, load_saved_watchlist
+    from overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
 
 # 2) 실전 API(KiwoomRealClient)가 참조하는 real trading/config.py를 sys.modules['config']에 확정 바인딩
 _real_cfg_path = os.path.join(REAL_TRADING_PATH, "config.py")
@@ -265,9 +267,11 @@ class SafeHoldingsThemeGateBot:
             'log_path': os.path.join(CURRENT_DIR, "dryrun_trade_history.log")
         }
         self.stock_name_cache: dict[str, str] = {
+            '035900': 'JYP Ent.',
             '052260': '현대바이오랜드',
             '138360': '앤로보틱스',
             '263750': '펄어비스',
+            '263860': '지니언스',
             '281820': '케이씨텍',
             '386380': '스카이랩스',
             '393210': '토마토시스템',
@@ -285,10 +289,12 @@ class SafeHoldingsThemeGateBot:
         if not clean_code.isdigit() or len(clean_code) != 6:
             return
 
-        # 👑 [09:05 풀 락온 후 신규 조건검색 100% 차단]
-        # 대표님 절대 원칙: 09:05 이후에 조건검색식으로 편입되는 종목들은 100% 무시/차단 (오직 Top 5 정예군으로만 매매 진행)
-        if self.pool_locked and clean_code not in self.elite_top5_pool and clean_code not in self.active_holdings:
-            logger.debug(f"🚫 [09:05 풀 락온 차단] [{clean_code}] 신규 조건검색 무시 (Top 5 정예군 외 종목 100% 차단)")
+        # 👑 [09:30 이후 장중 뇌동매매 100% 차단]
+        # 09:00~09:30 장초반 주도주 골든타임(09:08 JYP, 09:17 지니언스 등)에는 신규 대장주 수혈 전면 허용!
+        # 09:30 이후에야 비로소 신규 편입을 차단하여 장중 잡주 뇌동매매를 방어합니다.
+        cur_t = datetime.now().time()
+        if self.pool_locked and cur_t >= dtime(9, 30, 0) and clean_code not in self.elite_top5_pool and clean_code not in self.active_holdings:
+            logger.debug(f"🚫 [09:30 이후 풀 락온 차단] [{clean_code}] 신규 조건검색 무시 (Top 5 정예군 외 종목 100% 차단)")
             return
 
         effective_cond = cond_name.strip() if cond_name and cond_name.strip() else "Traiding"
@@ -401,6 +407,7 @@ class SafeHoldingsThemeGateBot:
 
         now_t = datetime.now().time()
         today_str = datetime.now().strftime("%Y-%m-%d")
+        today_nodash = datetime.now().strftime("%Y%m%d")
 
         anchor = {'open': 0.0, 'low': 0.0, 'high': 0.0, 'locked': False}
 
@@ -411,7 +418,8 @@ class SafeHoldingsThemeGateBot:
                 if df_5m is not None and not df_5m.empty:
                     date_col = 'date' if 'date' in df_5m.columns else ('time' if 'time' in df_5m.columns else None)
                     if date_col:
-                        df_today = df_5m[df_5m[date_col].astype(str).str.contains(today_str)]
+                        s_date = df_5m[date_col].astype(str)
+                        df_today = df_5m[s_date.str.contains(today_str) | s_date.str.contains(today_nodash)]
                         if not df_today.empty:
                             first_bar = df_today.iloc[0]
                             anchor['open'] = float(first_bar.get('open', 0.0))
@@ -451,24 +459,14 @@ class SafeHoldingsThemeGateBot:
         self.m5_anchors[clean_code] = anchor
         return anchor
 
-    def _lock_top5_pool(self):
+    def _update_top5_pool(self, is_final_lock: bool = False):
         """
-        👑 [09:05:00 정각] 장초반 5분 관찰 완료 ➔ 당일 최상위 5개(Top 5) 정예군 풀 락온(Pool Lock)
-        - 09:00~09:05 동안 Traiding 조건검색에 편입된 종목 + 기존 실계좌 보유 종목 대상
-        - 선정 기준:
-          1) 조건식 중복 포착 수 (많은 조건식에 동시 포착된 대장주 우선)
-          2) 당일 시가 대비 등락률 및 양봉 순도
-          3) 거래대금 / 전일대비 거래량 잠식률
-          4) 시장 지수 대비 초과강도 (RS Alpha)
-        - 상위 5개만 self.elite_top5_pool 에 영구 락온
-        - 09:05:01 이후 조건검색에 새로 뜨는 종목은 100% 무시/차단
+        👑 [09:05~09:30 골든타임 동적 롤링 Top 5 & 09:30 최종 락온]
+        - 09:05~09:30 사이에는 실시간 조건검색에 새로 잡히는 대장주(지니언스, JYP 등)를 실시간 평가하여 상위 5개를 동적으로 갱신
+        - 09:30:00 정각 이후에는 최종 5개로 영구 락온(is_final_lock=True)하여 이후 신규 조건검색 100% 차단
         """
-        if self.pool_locked:
+        if self.pool_locked and is_final_lock:
             return
-
-        logger.info("================================================================================")
-        logger.info("👑 [09:05:00 정각] 장초반 5분 관찰 완료 ➔ 당일 최상위 5개(Top 5) 정예군 풀 락온 시작!")
-        logger.info("================================================================================")
 
         candidates = {}
         with self.condition_lock:
@@ -486,7 +484,6 @@ class SafeHoldingsThemeGateBot:
                 }
 
         if not candidates:
-            logger.warning("⚠️ 09:05 정각 포착된 종목이 없습니다. 풀 잠금 보류 후 다음 사이클 재시도.")
             return
 
         scored_candidates = []
@@ -516,7 +513,6 @@ class SafeHoldingsThemeGateBot:
                 fut_flu = float(matched_fut.get('flu_rt', 0.0) or 0.0)
                 day_alpha = details.get('day_ret_pct', 0.0) - fut_flu
 
-                # 5분봉 앵커 사전 확보
                 self.get_5m_anchor(code, df_60m, df_daily, tick_close)
 
                 scored_candidates.append({
@@ -530,39 +526,42 @@ class SafeHoldingsThemeGateBot:
                     'details': details
                 })
             except Exception as e:
-                logger.debug(f"09:05 후보 평가 예외 ({name}): {e}")
+                logger.debug(f"후보 평가 예외 ({name}): {e}")
 
-        # 정렬: 1순위 조건중복 수 -> 2순위 우선순위 스코어 -> 3순위 거래대금
         scored_candidates.sort(key=lambda x: (x['overlap'], x['score'], x['day_val_eok']), reverse=True)
 
-        # 상위 5개 선정 (최대 5개)
         top5 = scored_candidates[:5]
-        self.elite_top5_pool = {item['code'] for item in top5}
-        # 실계좌 실제 보유분(qty > 1)은 매도 관리를 위해 풀에 영구 유지
-        for code, h in self.active_holdings.items():
-            if int(h.get('qty', 0)) > 1:
-                self.elite_top5_pool.add(code)
+        new_pool = {item['code'] for item in top5}
+        for code, st in self.strategies.items():
+            if st.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION] and st.position.entry_mode:
+                new_pool.add(code)
 
-        self.pool_locked = True
+        self.elite_top5_pool = new_pool
 
-        logger.info("👑 ────────────────────────────────────────────────────────────────────────────")
-        logger.info(f"👑 [09:05 정각 확정] 당일 최상위 5개(Top 5) 정예 주도주 락온 완료 (총 {len(self.elite_top5_pool)}종목)")
-        for rank, item in enumerate(top5, 1):
-            logger.info(
-                f"   🥇 {rank}위: [{item['name']}({item['code']})] | 점수: {item['score']:.1f}점 | "
-                f"조건중복: {item['overlap']}/{self.condition_total} | 등락률: {item['day_ret_pct']:+.2f}% | "
-                f"지수초과(RS): {item['day_alpha']:+.2f}%p | 거래대금: {item['day_val_eok']:.1f}억"
-            )
-        logger.info("🔒 [안내] 09:05:01 이후 조건검색식에 새로 뜨는 종목은 100% 무시(차단)됩니다.")
-        logger.info("   [제1전략] 09:05~09:30: 첫 5분봉 앵커 & 호가창 스나이핑 (2주 실전 매수)")
-        logger.info("   [제2전략] 1차 매도 후: 120틱 관문선 저점 2주 회전 매매 가동")
-        logger.info("👑 ────────────────────────────────────────────────────────────────────────────")
+        if is_final_lock:
+            self.pool_locked = True
+            logger.info("👑 ────────────────────────────────────────────────────────────────────────────")
+            logger.info(f"👑 [09:30 정각 최종 확정] 당일 최상위 5개(Top 5) 정예 주도주 영구 락온 완료 (총 {len(self.elite_top5_pool)}종목)")
+            for rank, item in enumerate(top5, 1):
+                logger.info(
+                    f"   🥇 {rank}위: [{item['name']}({item['code']})] | 점수: {item['score']:.1f}점 | "
+                    f"조건중복: {item['overlap']}/{self.condition_total} | 등락률: {item['day_ret_pct']:+.2f}% | "
+                    f"지수초과(RS): {item['day_alpha']:+.2f}%p | 거래대금: {item['day_val_eok']:.1f}억"
+                )
+            logger.info("🔒 [안내] 09:30:00 이후 조건검색식에 새로 뜨는 종목은 100% 무시(차단)됩니다.")
+            logger.info("   [제1전략] 09:00~09:30: 첫 5분봉 앵커 & 호가창 스나이핑 (2주 실전 매수)")
+            logger.info("   [제2전략] 1차 매도 후: 120틱 관문선 저점 2주 회전 매매 가동")
+            logger.info("👑 ────────────────────────────────────────────────────────────────────────────")
 
-        # 탈락한 종목 중 실보유가 없는 종목은 condition_picks에서 정리
-        with self.condition_lock:
-            for c in list(self.condition_picks.keys()):
-                if c not in self.elite_top5_pool and c not in self.active_holdings:
-                    self.condition_picks.pop(c, None)
+            # 최종 락온 시 탈락한 종목 중 미보유 종목만 condition_picks에서 정리
+            with self.condition_lock:
+                for c in list(self.condition_picks.keys()):
+                    if c not in self.elite_top5_pool and c not in self.active_holdings:
+                        self.condition_picks.pop(c, None)
+
+    def _lock_top5_pool(self):
+        """09:30 정각 영구 락온 호출용 헬퍼"""
+        self._update_top5_pool(is_final_lock=True)
 
 
     def _start_condition_ws_daemon(self):
@@ -790,23 +789,32 @@ class SafeHoldingsThemeGateBot:
                 self.last_watchlist_scan_time = now_ts
 
         # 1) 우선순위 정렬된 통합 감시 딕셔너리 구성:
-        #    [1순위] 실계좌 다수 보유종목(qty > 1) -> [2순위] 🔔키움 실시간 조건검색(Traiding) 포착 종목 -> [3순위] 🌟성배타점 자동발굴 관종 -> [4순위] 실계좌 1주 관종 마커
+        #    [1순위] 봇 당일 진입 운용종목 -> [2순위] 🔔키움 실시간 조건검색(Traiding) 포착 종목 -> [3순위] 🌟성배타점 자동발굴 관종 -> [4순위] 실계좌 1주 관종 마커
         holdings: dict[str, dict] = {}
 
-        # (A) 실계좌 실보유 종목 (qty > 1) 최우선 배치
+        # (A) 봇이 당일 직접 매수한 실계좌 보유 종목만 감시 편입 (기존 중장기 보유 자산은 100% 배제하여 원천 보호)
         for code, h in real_holdings.items():
             if int(h.get('qty', 0)) > 1:
-                h_copy = dict(h)
-                if code in self.condition_picks:
-                    h_copy['is_condition_pick'] = True
-                    h_copy['target_tag'] = self.condition_picks[code].get('target_tag', '🔔실시간조건(Traiding)')
-                holdings[code] = h_copy
+                is_bot_trade = (
+                    code in self.strategies
+                    and self.strategies[code].position.entry_mode in ["STAGE1_5M_ANCHOR", "120T_TEMA", "120T_ROTATION"]
+                )
+                if is_bot_trade:
+                    h_copy = dict(h)
+                    if code in self.condition_picks:
+                        h_copy['is_condition_pick'] = True
+                        h_copy['target_tag'] = self.condition_picks[code].get('target_tag', '🔔실시간조건(Traiding)')
+                    holdings[code] = h_copy
+                else:
+                    # 대표님의 기존 계좌 중장기 보유 자산(한화에어로스페이스 등) -> 감시 및 매도 대상에서 원천 배제!
+                    pass
 
         # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입
-        # 🔒 풀 락온 상태에서는 elite_top5_pool에 속한 종목만 엄선 편입!
+        # 🔒 09:30 이후 풀 락온 상태에서는 elite_top5_pool에 속한 종목만 엄선 편입!
         cond_added_count = 0
         with self.condition_lock:
-            if self.pool_locked:
+            cur_t = datetime.now().time()
+            if self.pool_locked and cur_t >= dtime(9, 30, 0):
                 sorted_cond_picks = [p for p in self.condition_picks.values() if p['code'] in self.elite_top5_pool]
             else:
                 sorted_cond_picks = sorted(
@@ -914,7 +922,7 @@ class SafeHoldingsThemeGateBot:
                     if buy_prc > 0:
                         strat.position.avg_price = buy_prc
                     logger.info(f"   🎯 [{name}({code})] 계좌 관심종목(1주 마커) 등록 완료 (IDLE 대기 | 기존 수량: {account_qty}주 ➔ 1차/기준선 돌파 매수 시 흡수 합산)")
-                elif self.holdings_state == "first_buy_done" or is_cond_pick or (code in self.condition_picks):
+                elif self.holdings_state == "first_buy_done" and account_qty > 0:
                     strat.position.state = StrategyState.FIRST_BUY_DONE
                     strat.position.total_qty = account_qty
                     strat.position.avg_price = buy_prc
@@ -923,16 +931,17 @@ class SafeHoldingsThemeGateBot:
                     strat.position.base_account_qty = 0
                     strat.position.entry_mode = "120T_TEMA"
                     strat.position.entry_time = time.time()
-                    logger.info(f"   ➔ [{name}({code})] 1차 매수 보유 상태 등록 (FIRST_BUY_DONE | 당일 조건검색/타점 진입) | 보유: {account_qty}주 (매수가: {buy_prc:,.0f}원) ➔ 120틱 2차 불타기 및 익절 대기")
+                    logger.info(f"   ➔ [{name}({code})] 1차 매수 보유 상태 등록 (FIRST_BUY_DONE | 명령행 옵션 지정) | 보유: {account_qty}주 (매수가: {buy_prc:,.0f}원) ➔ 120틱 2차 불타기 및 익절 대기")
                 else:
-                    # 기존 계좌 보유분 (account_qty > 1) -> M/3 수식선 및 기준선 변곡선 이탈 매도 감시 (FULL_POSITION)
-                    strat.position.state = StrategyState.FULL_POSITION
-                    strat.position.total_qty = account_qty
-                    strat.position.avg_price = buy_prc
-                    strat.position.base_account_qty = 0
-                    strat.position.entry_time = time.time()
+                    # 🛡️ [기존 계좌 보유 자산 절대 보호 원칙]
+                    # 봇이 이번 세션에 직접 매수한 주식이 아닌 기존 계좌 보유분은 매도 감시 대상에서 원천 배제 (IDLE 대기)
+                    strat.position.state = StrategyState.IDLE
+                    strat.position.total_qty = 0
+                    strat.position.base_account_qty = account_qty
                     strat.position.entry_mode = ""
-                    logger.info(f"   ➔ [{name}({code})] 기존 계좌 보유분 등록 완료 (FULL_POSITION | M/3 수식선 & 기준선 변곡선 매도 감시) | 보유: {account_qty}주 | 매수가: {buy_prc:,.0f}원")
+                    if buy_prc > 0:
+                        strat.position.avg_price = buy_prc
+                    logger.info(f"   🛡️ [{name}({code})] 기존 계좌 보유 자산 감지 (보유: {account_qty}주 | 매수가: {buy_prc:,.0f}원) ➔ 봇 자동 매도 대상에서 원천 배제 (IDLE 자산 안전 보존)")
                 ordered_strategies[code] = strat
             else:
                 # 이미 등록된 전략 객체에도 최신 예수금 및 고정 수량 반영
@@ -1107,9 +1116,22 @@ class SafeHoldingsThemeGateBot:
                 logger.info(f"   ➕ [수량 흡수] 기존 관심용 1주({strat.position.base_account_qty}주)를 포지션에 합산 ➔ 총 {strat.position.total_qty}주 보유")
                 strat.position.base_account_qty = 0
 
-        # 3. 매도 집행 (계좌 전량 100% 매도)
+        # 3. 매도 집행 (봇 진입 수량 한정 매도 및 기존 계좌 자산 절대 보호)
         elif order.action in ["TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]:
             self.pending_buy_orders.pop(code, None)
+
+            # 🛡️ [철통 자산 보호 1단계: 봇 직접 매수 포지션 검증]
+            entry_mode = strat.position.entry_mode if strat else ""
+            if not entry_mode or entry_mode not in ["STAGE1_5M_ANCHOR", "120T_TEMA", "120T_ROTATION"]:
+                logger.error(
+                    f"🛑 [기존 계좌 보유 자산 보호 긴급 차단] [{name}({code})] 봇이 당일 매수한 포지션이 아닙니다 (entry_mode: '{entry_mode}'). "
+                    f"대표님의 기존 투자 자산(한화에어로스페이스 등) 보호를 위해 매도 주문 발송을 100% 원천 차단합니다!"
+                )
+                if strat:
+                    strat.position = PositionTracker()
+                    strat.position.state = StrategyState.IDLE
+                return
+
             account_holding_qty = 0
             if self.is_real and self.api:
                 cur_holdings = self.api.get_account_holdings()
@@ -1144,7 +1166,10 @@ class SafeHoldingsThemeGateBot:
                     strat.position = PositionTracker()
                 return
 
-            final_sell_qty = effective_qty
+            # 🛡️ [철통 자산 보호 2단계: 매도 수량 고정 수량(fixed_qty) 엄격 제한]
+            # 계좌에 100주가 있어도 봇이 매수한 수량(최대 fixed_qty)만 매도하고 기존 계좌 물량은 1주도 건드리지 않음!
+            bot_bought_qty = strat.position.total_qty if (strat and strat.position.total_qty > 0) else self.fixed_qty
+            final_sell_qty = min(effective_qty, bot_bought_qty, self.fixed_qty)
             if final_sell_qty <= 0:
                 logger.warning(f"⚠️ [매도 스킵] [{name}({code})] 매도 가능 수량이 0주이므로 주문을 발송하지 않습니다.")
                 return
@@ -1203,10 +1228,10 @@ class SafeHoldingsThemeGateBot:
 
             if exchange_hint == "NXT":
                 sell_order_type = "00"  # NXT 지정가 필수
-                logger.info(f"🚨 [실전 전량 매도 발송(NXT 지정가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (계좌 전량 100%) | 지정가: {sell_price:,.0f}원 | 사유: {order.reason}")
+                logger.info(f"🚨 [실전 매도 발송(NXT 지정가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (봇 매수분 한정) | 지정가: {sell_price:,.0f}원 | 사유: {order.reason}")
             else:
                 sell_order_type = "03"  # KRX 정규장 시장가
-                logger.info(f"🚨 [실전 전량 매도 발송(KRX 시장가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (계좌 전량 100%) | 기준가: {sell_price:,.0f}원 | 사유: {order.reason}")
+                logger.info(f"🚨 [실전 매도 발송(KRX 시장가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (봇 매수분 한정) | 기준가: {sell_price:,.0f}원 | 사유: {order.reason}")
 
             if self.is_real and self.api:
                 order_no = self.api.place_sell_order(code, final_sell_qty, price=sell_price, order_type=sell_order_type)
@@ -1385,7 +1410,14 @@ class SafeHoldingsThemeGateBot:
             elif change_from_open >= 1.0:
                 score_morning = 5.0
 
-        total_score = score_speed + score_shape + score_anchor + score_120t + score_morning
+        # 6. 🌐 글로벌 선행 지수 주도 섹터(필반지수 강세 시 반도체주 등) 연동 가산점 (+0.0 ~ +5.0점)
+        score_global = 0.0
+        try:
+            score_global = get_stock_theme_alignment_score(code)
+        except Exception:
+            score_global = 0.0
+
+        total_score = score_speed + score_shape + score_anchor + score_120t + score_morning + score_global
         details = {
             'total_score': total_score,
             'vol_ratio_prev': vol_ratio_prev,
@@ -1400,6 +1432,7 @@ class SafeHoldingsThemeGateBot:
             'score_shape': score_shape,
             'score_120t': score_120t,
             'score_morning': score_morning,
+            'score_global': score_global,
             'score_candle': score_shape + score_anchor,
             'day_ret_pct': day_ret_pct,
             'day_val_eok': day_val_eok
@@ -1435,17 +1468,36 @@ class SafeHoldingsThemeGateBot:
         cur_t = datetime.now().time()
         is_krx_session = (exchange_hint == "KRX")
 
-        # 👑 [09:05:00 정각] 최상위 5개(Top 5) 정예군 풀 락온 트리거!
-        if is_krx_session and cur_t >= dtime(9, 5, 0) and not self.pool_locked:
-            self._lock_top5_pool()
+        # 👑 [09:05~09:30 동적 롤링 Top 5 & 09:30 최종 락온]
+        # 장초반 30분 동안은 지니언스, JYP 등 새로 터지는 대장주를 Top 5 풀에 실시간 교체 수혈!
+        # 09:30 정각 이후에 최종 영구 락온하여 장중 뇌동매매 100% 차단!
+        if is_krx_session:
+            if dtime(9, 5, 0) <= cur_t < dtime(9, 30, 0):
+                self._update_top5_pool(is_final_lock=False)
+            elif cur_t >= dtime(9, 30, 0) and not self.pool_locked:
+                self._lock_top5_pool()
 
-        # 🔍 09:00~09:05 장초반 관찰 모드 (첫 5분봉 완성 대기, 신규 매수 차단)
-        is_morning_obs = (dtime(9, 0, 0) <= cur_t < dtime(9, 5, 0) and is_krx_session)
-        if is_morning_obs:
-            logger.info("🔍 [09:00~09:05 장초반 5분 관찰 모드] 첫 5분봉 완성 대기 중... 신규 매수 전면 차단 (09:05 정각 상위 5개 락온 예정)")
+        # ⚡ 09:00:45부터 실시간 조건검색 포착 즉시 시초가 번개 돌파 및 5분봉 앵커 스나이핑 전면 개방 (규제 해제)
+        is_morning_obs = False
 
         market_status_str = f"🟢 {session_name}" if is_active else f"🔴 {session_name}"
         logger.info(f"⏱️ 감시 루프 실행 중... [현재 시장 상태: {market_status_str}]")
+
+        # 🌐 [글로벌 선행지수 & 야간선물 기상도 실시간 브리핑]
+        if cur_t < dtime(9, 30, 0):
+            try:
+                g_radar = get_overnight_market_radar()
+                sox_pct = g_radar.get('sox_pct', 0.0)
+                ixic_pct = g_radar.get('ixic_pct', 0.0)
+                fut_pct = g_radar.get('fut_pct', 0.0)
+                lead_th = ", ".join(g_radar.get('lead_themes', [])) or "전체"
+                logger.info(
+                    f"🌐 [글로벌 & 야간선물 기상도] {g_radar.get('badge', '')} | "
+                    f"미국 필반(SOX): {sox_pct:+.2f}% | 나스닥: {ixic_pct:+.2f}% | 야간/국내선물: {fut_pct:+.2f}% | "
+                    f"주도섹터: [{lead_th}]"
+                )
+            except Exception as e:
+                logger.debug(f"글로벌 기상도 브리핑 예외: {e}")
 
         # 🌡️ [코스피200선물 & 코스닥150선물 실시간 1:1 시장 온도계 점검]
         futures_regimes = self.get_futures_market_regime()
@@ -1479,8 +1531,8 @@ class SafeHoldingsThemeGateBot:
             if not strat or strat.position.state == StrategyState.TERMINATED:
                 continue
 
-            # 🔒 풀 락온 상태에서 Top 5 정예군 외 비보유 종목은 스킵 (불필요한 TR 호출 차단)
-            if self.pool_locked and code not in self.elite_top5_pool and strat.position.total_qty <= 0:
+            # 🔒 09:30 이후 풀 락온 상태에서 Top 5 정예군 외 비보유 종목은 스킵 (불필요한 TR 호출 차단)
+            if self.pool_locked and cur_t >= dtime(9, 30, 0) and code not in self.elite_top5_pool and strat.position.total_qty <= 0:
                 continue
 
             # 💡 쿨다운 확인: 매도 직후 단기 쿨다운(3분) 중인지 체크 (종목을 버리지 않고 계속 들여다봄)
@@ -1574,8 +1626,11 @@ class SafeHoldingsThemeGateBot:
                 intraday_alpha = stock_intraday_chg - fut_intraday_chg
 
                 # 🏆 [금일 시장 지수보다 강하게 움직이는 종목 판정 (RS Alpha Gate)]:
-                # 전일대비 등락률이 소속 시장 지수보다 +1.5%p 이상 강하고, 당일 시가 위 양봉(시가대비 초과탄력 +0.5%p 이상) 유지!
-                is_outperforming_index = (day_alpha >= 1.5) and (intraday_alpha >= 0.5) and (tick_close >= day_open * 0.999)
+                # NXT 프리마켓(08:00~08:45)에서는 선물시장이 미개장(08:45 개장) 상태이므로 지수 초과강도 검사를 유연하게 자동 면제!
+                if exchange_hint == "NXT" and now_t < dtime(8, 45, 0):
+                    is_outperforming_index = (day_ret_pct >= 1.0) and (tick_close >= day_open * 0.998)
+                else:
+                    is_outperforming_index = (day_alpha >= 1.5) and (intraday_alpha >= 0.5) and (tick_close >= day_open * 0.999)
 
                 # 🧹 [조건검색 편입 종목 중 지수 대비 약세/시가 훼손 종목 자동 정리 (Pruning)]:
                 if is_cond_pick and strat.position.state == StrategyState.IDLE and (day_alpha < 0.0 or tick_close < day_open * 0.990):
@@ -1587,6 +1642,8 @@ class SafeHoldingsThemeGateBot:
                 # IDLE 상태에서 선물 서킷브레이커가 아니고 + 지수 초과강세(is_outperforming_index) + 일봉 상승추세 + M/3선 지지 + 60분봉 20선 지지 종목은 120틱 즉시 조회!
                 need_120t = (
                     strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
+                    or (dtime(8, 0, 45) <= cur_t < dtime(8, 45, 0))
+                    or (dtime(9, 0, 45) <= cur_t <= dtime(9, 30, 0) and (not self.pool_locked or code in self.elite_top5_pool))
                     or (
                         fut_regime != "CRASH_LOCK"
                         and daily_bull
@@ -1605,8 +1662,8 @@ class SafeHoldingsThemeGateBot:
                 now_t = datetime.now().time()
                 is_eod_window = (dtime(15, 15, 0) <= now_t <= dtime(15, 30, 0) and exchange_hint == "KRX")
                 is_opening_whipsaw_window = (
-                    (dtime(8, 0, 0) <= now_t < dtime(8, 3, 0) and exchange_hint == "NXT")
-                    or (dtime(9, 0, 0) <= now_t < dtime(9, 3, 0) and exchange_hint == "KRX")
+                    (dtime(8, 0, 0) <= now_t < dtime(8, 0, 45) and exchange_hint == "NXT")
+                    or (dtime(9, 0, 0) <= now_t < dtime(9, 0, 45) and exchange_hint == "KRX")
                 )
                 is_premarket_bridge_window = (dtime(8, 45, 0) <= now_t < dtime(8, 50, 0) and exchange_hint == "NXT")
                 cur_qty = h_info.get('qty', 0)
@@ -1618,7 +1675,13 @@ class SafeHoldingsThemeGateBot:
                 low_5m = float(anchor_5m.get('low', 0.0) or 0.0)
                 high_5m = float(anchor_5m.get('high', 0.0) or 0.0)
                 ask_bid_ratio = self.get_orderbook_stats(code)
-                is_first_strat = (dtime(9, 5, 0) <= now_t <= dtime(9, 30, 0) and strat.position.trade_count_today == 0)
+                is_first_strat = (
+                    (
+                        (dtime(8, 0, 45) <= now_t < dtime(8, 45, 0) and exchange_hint == "NXT")
+                        or (dtime(9, 0, 45) <= now_t <= dtime(9, 30, 0) and exchange_hint == "KRX")
+                    )
+                    and strat.position.trade_count_today == 0
+                )
 
                 # 장 운영 시간(또는 DRY-RUN 테스트 모드)에만 전략 상태 전이 평가 실행
                 # (단, 15:15~15:30 정규장 마감 동시호가 구간에서는 신규 매수 원천 차단 및 보유분 일괄 청산 우선)
@@ -1706,9 +1769,9 @@ class SafeHoldingsThemeGateBot:
                     f"60분: {align_str} | {m3_str} | 관문선: {gate_val:,.0f} | {gijun_str}"
                 )
 
-                # 🕒 [15:15~15:30 정규장 마감 청산 - 데이트레이딩 오버나이트 리스크 원천 차단]
-                if is_eod_window and pre_holding_qty > 1:
-                    logger.info(f"🕒 [장마감 동시호가 전량 청산] [{name}({code})] 당일 청산 원칙에 따라 전량 매도 집행 ({pre_holding_qty}주)")
+                # 🕒 [15:15~15:30 정규장 마감 청산 - 데이트레이딩 오버나이트 리스크 원천 차단 (봇 매수 종목 전용)]
+                if is_eod_window and pre_holding_qty > 1 and strat.position.entry_mode:
+                    logger.info(f"🕒 [장마감 동시호가 봇 매수분 청산] [{name}({code})] 당일 청산 원칙에 따라 매도 집행 ({pre_holding_qty}주)")
                     eod_order = TradeOrder(
                         timestamp=last_60m.name if hasattr(last_60m, 'name') else str(datetime.now()),
                         action="TERMINATE_EXIT",
@@ -1726,8 +1789,12 @@ class SafeHoldingsThemeGateBot:
                 )
 
                 if order:
-                    # 1) 매도 주문(전량 익절/손절/이탈): 실보유 물량에 한해 전량 집행
+                    # 1) 매도 주문(익절/손절): 봇이 직접 매수한 포지션에 한해 집행 (기존 계좌 보유 자산 100% 보호)
                     if order.action in ["TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]:
+                        # 🛡️ [계좌 기존 보유 자산 절대 보호]: 봇이 직접 매수한 포지션(entry_mode != "")이 아니면 매도 신호 차단
+                        if not strat.position.entry_mode:
+                            logger.info(f"   🛡️ [{name}({code})] 봇 매수 포지션 아님 (계좌 기존 자산) ➔ 매도 주문 발송 차단 및 자산 보존")
+                            continue
                         # 🛡️ 관종 1주 종목은 매수가 실제로 체결되기 전에는 매도하지 않음
                         if eff_qty <= 1:
                             logger.info(f"   🛡️ [{name}({code})] 관종 1주 보유 종목 ➔ 매수 미완료 상태 매도 신호 무시 (1주 보존)")
@@ -1738,15 +1805,7 @@ class SafeHoldingsThemeGateBot:
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
                     # 3) 신규 1차 매수: 쿨다운/시초 휩소 방어 검사 후 우선순위 스코어링 수집
                     elif order.action == "BUY_1":
-                        if is_morning_obs and not self.dry_run:
-                            logger.info(
-                                f"   🔍 [09:00~09:05 관찰 모드 매수 차단] [{name}({code})] 첫 5분봉 완성 대기 중 "
-                                f"➔ 09:05 정각 상위 5개 락온 후 매수 가동 (상태 안전 복원)"
-                            )
-                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
-                            continue
-
-                        if self.pool_locked and code not in self.elite_top5_pool:
+                        if self.pool_locked and cur_t >= dtime(9, 30, 0) and code not in self.elite_top5_pool:
                             logger.info(
                                 f"   🚫 [Top 5 풀 외부 매수 차단] [{name}({code})] 정예 5개 외 종목 차단 (상태 안전 복원)"
                             )
@@ -1762,11 +1821,11 @@ class SafeHoldingsThemeGateBot:
                             continue
 
                         if is_opening_whipsaw_window and not self.dry_run:
-                            whipsaw_label = "08:00~08:03 프리마켓 시초 3분 호가 휩소 방어" if exchange_hint == "NXT" else "09:00~09:03 정규장 시초가 휩소 방어"
-                            resume_time_str = "08:03:00" if exchange_hint == "NXT" else "09:03:00"
+                            whipsaw_label = "08:00~08:00:45 프리마켓 시초 45초 호가 안정화" if exchange_hint == "NXT" else "09:00~09:00:45 정규장 시초 45초 호가 안정화"
+                            resume_time_str = "08:00:45" if exchange_hint == "NXT" else "09:00:45"
                             logger.info(
-                                f"   🛡️ [{whipsaw_label}] [{name}({code})] 시초 얇은 호가창/차익 매물 소화 대기 중 "
-                                f"➔ {resume_time_str} 이후 양봉·지지 유지 확인 시 진입 (상태 안전 복원)"
+                                f"   🛡️ [{whipsaw_label}] [{name}({code})] 시초 동시호가 체결 안정화 대기 중 "
+                                f"➔ {resume_time_str} 이후 양봉·지지 유지 확인 시 즉시 진입 (상태 안전 복원)"
                             )
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
@@ -1838,12 +1897,7 @@ class SafeHoldingsThemeGateBot:
         # 동시 기준선 돌파 종목 우선순위(Priority Score) 옥석 가리기 및 최우선주 매수 집행
         # ─────────────────────────────────────────────────────────────
         if buy_candidates:
-            if is_morning_obs and not self.dry_run:
-                logger.info("🔍 [09:00~09:05 장초반 관찰 모드] 5분봉 완성 대기 중 신규 매수 보류 (09:05 정각 상위 5개 락온 후 매매 시작)")
-                for cand in buy_candidates:
-                    self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
-                buy_candidates = []
-            elif self.pool_locked:
+            if self.pool_locked and cur_t >= dtime(9, 30, 0):
                 filtered_cands = []
                 for cand in buy_candidates:
                     if cand['code'] in self.elite_top5_pool:
@@ -1881,7 +1935,19 @@ class SafeHoldingsThemeGateBot:
                 bear_ratio = (bear_align_count / total_eval_count) if total_eval_count > 0 else 0.0
                 is_market_slump = (total_eval_count >= 4 and bear_ratio >= 0.60)
 
-                if w_fut_regime == "CRASH_LOCK":
+                is_stage1_trade = (
+                    winner.get('order')
+                    and getattr(winner['order'], 'stage', '') == "FULL_POSITION"
+                    and getattr(winner['strat'].position, 'entry_mode', '') == "STAGE1_5M_ANCHOR"
+                )
+
+                if is_stage1_trade:
+                    # 👑 [JYP Ent. 09:08:22 모델 Stage 1 정예군 스나이핑]: 
+                    # 이미 09:05 정각 정량 스코어링을 통해 Top 5로 락온된 주도주이므로,
+                    # 장초반 전일대비 거래량 누적 지연(65점 미달)으로 억울하게 취소되지 않도록 Stage 1 전용 커트라인(45.0점) 적용!
+                    min_required_score = 45.0 if w_fut_regime != "CRASH_LOCK" else 999.0
+                    market_mode_tag = f"{w_fut_label} Stage1 정예 스나이핑(JYP Ent. 모델 45점+)"
+                elif w_fut_regime == "CRASH_LOCK":
                     min_required_score = 999.0  # 선물투매 서킷브레이커 발동 시 전면 차단
                     market_mode_tag = f"{w_fut_label} {w_fut_badge} 서킷브레이커 잠금"
                 elif w_fut_regime == "CAUTION_DEFENSE" or is_market_slump:

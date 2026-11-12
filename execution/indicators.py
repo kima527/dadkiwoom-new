@@ -240,9 +240,10 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
         (df['tema60_slope'] > 0) & (df['tema5'] >= df['tema20'])
     )
 
-    # 🌟 [120틱 핵심 타점 1]: 테마60-120 골든크로스 및 노란색 양운 구름대(tema60 >= tema120), 크로스 시점 가격 기록
+    # 🌟 [120틱 핵심 타점 1]: 테마60-120 골든크로스(GC) 및 데드크로스(DC), 크로스 시점 가격 기록
     df['is_yellow_cloud'] = df['tema60'] >= df['tema120']
     df['is_tema60_120_gc'] = (df['tema60'].shift(1) <= df['tema120'].shift(1)) & (df['tema60'] > df['tema120'])
+    df['is_tema60_120_dc'] = (df['tema60'].shift(1) >= df['tema120'].shift(1)) & (df['tema60'] < df['tema120'])
     df['tema60_120_gc_price'] = df['close'].where(df['is_tema60_120_gc']).ffill()
 
     # 🌟 [120틱 핵심 타점 2]: SMA 40-60 골든크로스 및 크로스 시점 가격 기록
