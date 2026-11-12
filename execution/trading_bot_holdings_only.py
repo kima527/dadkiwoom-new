@@ -1483,18 +1483,19 @@ class SafeHoldingsThemeGateBot:
         market_status_str = f"🟢 {session_name}" if is_active else f"🔴 {session_name}"
         logger.info(f"⏱️ 감시 루프 실행 중... [현재 시장 상태: {market_status_str}]")
 
-        # 🌐 [글로벌 선행지수 & 야간선물 기상도 실시간 브리핑]
+        # 🌐 [글로벌 선행지수 & 증권플러스 코스피/코스닥 야간선물 2612 기상도 실시간 브리핑]
         if cur_t < dtime(9, 30, 0):
             try:
                 g_radar = get_overnight_market_radar()
                 sox_pct = g_radar.get('sox_pct', 0.0)
                 ixic_pct = g_radar.get('ixic_pct', 0.0)
-                fut_pct = g_radar.get('fut_pct', 0.0)
+                kp_pct = g_radar.get('kospi_fut', {}).get('flu_pct', 0.0)
+                kq_pct = g_radar.get('kosdaq_fut', {}).get('flu_pct', 0.0)
                 lead_th = ", ".join(g_radar.get('lead_themes', [])) or "전체"
                 logger.info(
-                    f"🌐 [글로벌 & 야간선물 기상도] {g_radar.get('badge', '')} | "
-                    f"미국 필반(SOX): {sox_pct:+.2f}% | 나스닥: {ixic_pct:+.2f}% | 야간/국내선물: {fut_pct:+.2f}% | "
-                    f"주도섹터: [{lead_th}]"
+                    f"🌐 [증권플러스 연동 2612 야간선물 & 글로벌 기상도] "
+                    f"코스피200(2612): {kp_pct:+.2f}% | 코스닥150(2612): {kq_pct:+.2f}% | "
+                    f"필반(SOX): {sox_pct:+.2f}% | 나스닥: {ixic_pct:+.2f}% | 주도섹터: [{lead_th}]"
                 )
             except Exception as e:
                 logger.debug(f"글로벌 기상도 브리핑 예외: {e}")

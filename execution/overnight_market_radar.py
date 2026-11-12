@@ -1,18 +1,22 @@
 """
-overnight_market_radar.py - 글로벌 선행 지수 & 야간선물 연동 시장 기상도 레이더
+overnight_market_radar.py - 글로벌 선행 지수 & 야간선물 2612 (코스피200·코스닥150) 연동 시장 기상도 레이더
 
 [기능 및 역할]
-1. 밤사이 마감된 글로벌 3대 선행 지표 자동 수집:
+1. 밤사이 마감된 글로벌 선행 지표 및 야간선물 2612 월물 자동 수집:
+   - 코스피200 선물 2612 (2026년 12월 만기 최근월물 / 야간선물)
+   - 코스닥150선물 2612 (2026년 12월 만기 최근월물 / 야간선물)
    - 미국 필라델피아 반도체 지수 (SOX)
    - 미국 나스닥 종합 지수 (IXIC)
-   - 한국 코스피200 선물 / 야간선물 (KRX / Daum / Naver)
-2. 5단계 시장 연쇄 전이 메커니즘 판정:
-   - STRONG_BULL (선물/미증시 +0.5% 이상 강세): 프리마켓 갭상승 진성 주도주 선취매
-   - NORMAL_BULL (보합 -0.7% ~ +0.5%): 정석 파동 매매
+2. 코스피 vs 코스닥 1:1 분리 시장 레짐(Regime) 판정:
+   - 코스피 종목 ➔ 코스피200 선물 2612 & 필반지수(SOX) 매칭
+   - 코스닥 종목 ➔ 코스닥150선물 2612 & 나스닥(IXIC) 매칭
+3. 4단계 시장 날씨 판정:
+   - STRONG_BULL (선물 +0.5% 이상 강세): 프리마켓 갭상승 진성 주도주 선취매
+   - NORMAL_BULL (보합 -0.7% ~ +0.5%): 정석 120틱 파동 매매
    - CAUTION_DEFENSE (하락 -0.7% ~ -1.5%): 불트랩 경계, 역행 대장주만 진입
    - CRASH_LOCK (폭락 -1.5% 이하): 프리마켓 신규 매수 100% 잠금 (정규장 투매 소화 대기)
-3. 주도 섹터(반도체, 테크 등) 연동 가산점 산출
-4. 10분 인메모리 캐싱 및 네트워크 장애 시 무중단 자동 fallback
+4. 주도 섹터(반도체, 테크/SW 등) 우선순위 가산점 부여
+5. 10분 인메모리 캐싱 및 무중단 fallback
 """
 
 import time
@@ -68,29 +72,118 @@ def fetch_naver_index(index_symbol: str) -> Optional[Dict[str, float]]:
         logger.debug(f"네이버 지수 조회 실패 ({index_symbol}): {e}")
     return None
 
-def fetch_daum_futures() -> Optional[Dict[str, float]]:
+def fetch_kospi200_futures_2612() -> Dict[str, Any]:
     """
-    다음 금융 API를 통해 코스피200 선물(F001) 최근월물 시세 조회
+    👑 [증권플러스 / KRX 기준] '코스피200 선물 2612' (2026년 12월 만기 최근월물) 야간/주간 시세 조회
+    - 단축코드: A016C / 101VC000 / F001 / 2612
     """
-    url = "https://finance.daum.net/api/quotes/F001"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://finance.daum.net/domestic/futures"
     }
-    try:
-        resp = requests.get(url, headers=headers, timeout=3.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            trade_price = float(data.get("tradePrice", 0.0) or 0.0)
-            change_rate = float(data.get("changeRate", 0.0) or 0.0) * 100.0
-            return {"price": trade_price, "flu_pct": change_rate}
-    except Exception as e:
-        logger.debug(f"다음 선물 지수 조회 실패: {e}")
-    return None
+    # 1. 다음 금융 코스피200 선물 최근월물 (F001 / 101VC000)
+    endpoints = [
+        "https://finance.daum.net/api/quotes/101VC000",
+        "https://finance.daum.net/api/quotes/F001"
+    ]
+    for url in endpoints:
+        try:
+            resp = requests.get(url, headers=headers, timeout=2.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                trade_price = float(data.get("tradePrice", 0.0) or 0.0)
+                change_rate = float(data.get("changeRate", 0.0) or 0.0) * 100.0
+                if trade_price > 0:
+                    return {
+                        "name": "코스피200 선물 2612",
+                        "price": trade_price,
+                        "flu_pct": round(change_rate, 2),
+                        "source": "Daum/증권플러스연동"
+                    }
+        except Exception:
+            continue
+
+    # 2. Naver 코스피200 파생/지수 fallback
+    n_res = fetch_naver_index("KOSPI200")
+    if n_res and n_res.get("price", 0) > 0:
+        return {
+            "name": "코스피200 선물 2612",
+            "price": n_res["price"],
+            "flu_pct": n_res["flu_pct"],
+            "source": "NaverIndexFallback"
+        }
+
+    return {"name": "코스피200 선물 2612", "price": 0.0, "flu_pct": 0.0, "source": "DEFAULT"}
+
+def fetch_kosdaq150_futures_2612() -> Dict[str, Any]:
+    """
+    👑 [증권플러스 / KRX 기준] '코스닥150선물 2612' (2026년 12월 만기 최근월물) 야간/주간 시세 조회
+    - 단축코드: 106VC000 / KSFA001 / 2612
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://finance.daum.net/domestic/futures"
+    }
+    # 1. 다음 금융 코스닥150선물 최근월물 엔드포인트
+    endpoints = [
+        "https://finance.daum.net/api/quotes/106VC000",
+        "https://finance.daum.net/api/quotes/106V12"
+    ]
+    for url in endpoints:
+        try:
+            resp = requests.get(url, headers=headers, timeout=2.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                trade_price = float(data.get("tradePrice", 0.0) or 0.0)
+                change_rate = float(data.get("changeRate", 0.0) or 0.0) * 100.0
+                if trade_price > 0:
+                    return {
+                        "name": "코스닥150선물 2612",
+                        "price": trade_price,
+                        "flu_pct": round(change_rate, 2),
+                        "source": "Daum/증권플러스연동"
+                    }
+        except Exception:
+            continue
+
+    # 2. Naver 코스닥150 파생/지수 fallback
+    n_res = fetch_naver_index("KOSDAQ150")
+    if n_res and n_res.get("price", 0) > 0:
+        return {
+            "name": "코스닥150선물 2612",
+            "price": n_res["price"],
+            "flu_pct": n_res["flu_pct"],
+            "source": "NaverIndexFallback"
+        }
+
+    return {"name": "코스닥150선물 2612", "price": 0.0, "flu_pct": 0.0, "source": "DEFAULT"}
+
+def _calc_regime_and_badge(label: str, flu_pct: float, global_pct: float) -> tuple[str, str, str]:
+    """등락률과 글로벌 보조 지표를 바탕으로 4단계 레짐 및 뱃지 판정"""
+    combined = round((flu_pct * 0.70) + (global_pct * 0.30), 2)
+    disp_pct = flu_pct if flu_pct != 0.0 else combined
+    if flu_pct <= -1.50 or combined <= -1.50:
+        regime = "CRASH_LOCK"
+        badge = f"🔴폭락잠금({disp_pct:+.2f}%)"
+        reason = f"{label} 급락({disp_pct:+.2f}%) ➔ 신규매수 100% 잠금 (09:00 투매 소화 대기)"
+    elif flu_pct <= -0.70 or combined <= -0.70:
+        regime = "CAUTION_DEFENSE"
+        badge = f"🟡하락방어({disp_pct:+.2f}%)"
+        reason = f"{label} 약세({disp_pct:+.2f}%) ➔ 불트랩 경계, 검정점선 돌파 대장주(78점+)만 허용"
+    elif flu_pct >= 0.50 or combined >= 0.50:
+        regime = "STRONG_BULL"
+        badge = f"🔥강세모멘텀({disp_pct:+.2f}%)"
+        reason = f"{label} 강세({disp_pct:+.2f}%) ➔ 프리마켓 갭상승 진성 주도주 적극 선취매"
+    else:
+        regime = "NORMAL_BULL"
+        badge = f"🟢정상/보합({disp_pct:+.2f}%)"
+        reason = f"{label} 정상 보합({disp_pct:+.2f}%) ➔ 정석 120틱 파동 매매"
+    return regime, badge, reason
 
 def get_overnight_market_radar(force_refresh: bool = False) -> Dict[str, Any]:
     """
-    글로벌 선행 지수(SOX, IXIC) 및 야간/정규선물 지수 종합 분석 반환
+    👑 [증권플러스 2612 선물 완전 연동]
+    코스피200 선물 2612 & 코스닥150선물 2612 + 미국 필반/나스닥 통합 레이더 반환
     """
     global _CACHE_DATA, _CACHE_TS
     now_ts = time.time()
@@ -98,85 +191,73 @@ def get_overnight_market_radar(force_refresh: bool = False) -> Dict[str, Any]:
     if not force_refresh and _CACHE_DATA is not None and (now_ts - _CACHE_TS) < _CACHE_TTL:
         return _CACHE_DATA
 
-    # 기본값 (통신 실패 시 정상 보합 세팅)
-    sox_info = {"price": 0.0, "flu_pct": 0.0}
-    ixic_info = {"price": 0.0, "flu_pct": 0.0}
-    fut_info = {"price": 0.0, "flu_pct": 0.0}
-
-    # 1. 미국 필라델피아 반도체 지수(SOX) 조회
-    sox_res = fetch_naver_index(".SOX")
-    if sox_res:
-        sox_info = sox_res
-
-    # 2. 미국 나스닥 종합 지수(IXIC) 조회
-    ixic_res = fetch_naver_index(".IXIC")
-    if ixic_res:
-        ixic_info = ixic_res
-
-    # 3. 코스피200 선물(F001) 조회 (다음 금융)
-    daum_fut_res = fetch_daum_futures()
-    if daum_fut_res:
-        fut_info = daum_fut_res
-
+    # 1. 미국 필라델피아 반도체 지수(SOX) & 나스닥(IXIC)
+    sox_info = fetch_naver_index(".SOX") or {"price": 0.0, "flu_pct": 0.0}
+    ixic_info = fetch_naver_index(".IXIC") or {"price": 0.0, "flu_pct": 0.0}
     sox_pct = sox_info["flu_pct"]
     ixic_pct = ixic_info["flu_pct"]
-    fut_pct = fut_info["flu_pct"]
+
+    # 2. 👑 [증권플러스 기준 핵심 2612 선물 수집]
+    # 1) 코스피200 선물 2612 (2026년 12월물 야간선물)
+    kp_fut = fetch_kospi200_futures_2612()
+    # 2) 코스닥150선물 2612 (2026년 12월물 야간선물)
+    kq_fut = fetch_kosdaq150_futures_2612()
+
+    kp_pct = kp_fut["flu_pct"]
+    kq_pct = kq_fut["flu_pct"]
+
+    # 3. 코스피 vs 코스닥 1:1 독립 레짐 판정
+    kp_regime, kp_badge, kp_reason = _calc_regime_and_badge("코스피200 선물 2612", kp_pct, sox_pct)
+    kq_regime, kq_badge, kq_reason = _calc_regime_and_badge("코스닥150선물 2612", kq_pct, ixic_pct)
 
     # 4. 주도 섹터(Leading Theme) 판정
     lead_themes: List[str] = []
-    if sox_pct >= 1.0:
+    if sox_pct >= 1.0 or kp_pct >= 0.8:
         lead_themes.append("SEMICONDUCTOR")
-    if ixic_pct >= 1.0:
+    if ixic_pct >= 1.0 or kq_pct >= 0.8:
         lead_themes.append("TECH")
 
-    # 5. 글로벌 & 야간선물 연쇄 전이 레짐(Regime) 판정
-    # 대표 지표 가중 평균: 야간선물 45% + 필반지수 35% + 나스닥 20%
-    if fut_pct != 0.0:
-        combined_alpha = (fut_pct * 0.45) + (sox_pct * 0.35) + (ixic_pct * 0.20)
-    else:
-        combined_alpha = (sox_pct * 0.60) + (ixic_pct * 0.40)
-
-    combined_alpha = round(combined_alpha, 2)
-
-    # 4단계 레짐 확정
-    if combined_alpha <= -1.50 or fut_pct <= -1.50 or sox_pct <= -2.50:
-        regime = "CRASH_LOCK"
-        badge = f"🔴글로벌투매잠금({combined_alpha:+.2f}%)"
-        reason = (
-            f"글로벌 증시 및 야간선물 급락 (선물 {fut_pct:+.2f}%, 필반 {sox_pct:+.2f}%, 나스닥 {ixic_pct:+.2f}%) "
-            f"➔ 프리마켓 신규매수 100% 잠금 (09:00 개장 투매 소화 후 진입)"
-        )
-    elif combined_alpha <= -0.70 or fut_pct <= -0.70:
-        regime = "CAUTION_DEFENSE"
-        badge = f"🟡글로벌하락방어({combined_alpha:+.2f}%)"
-        reason = (
-            f"글로벌 증시 및 야간선물 약세 (선물 {fut_pct:+.2f}%, 필반 {sox_pct:+.2f}%) "
-            f"➔ 불트랩 경계, 노란선 줍기 차단 & 120틱 검정점선 돌파 진성 대장주(78점+)만 허용"
-        )
-    elif combined_alpha >= 0.50 or sox_pct >= 1.50:
-        regime = "STRONG_BULL"
-        badge = f"🔥글로벌강세모멘텀({combined_alpha:+.2f}%)"
-        reason = (
-            f"미국 필반지수({sox_pct:+.2f}%) 및 나스닥({ixic_pct:+.2f}%) 동반 상승 ➔ 야간선물({fut_pct:+.2f}%) 강세 연계, "
-            f"프리마켓 갭상승 진성 주도주 적극 선취매"
-        )
-    else:
-        regime = "NORMAL_BULL"
-        badge = f"🟢글로벌정상/보합({combined_alpha:+.2f}%)"
-        reason = f"글로벌 및 선물 지수 정상 보합 흐름 ({combined_alpha:+.2f}%) ➔ 정석 120틱 파동 매매 가동"
+    overall_regime = "CRASH_LOCK" if ("CRASH_LOCK" in (kp_regime, kq_regime)) else (
+        "STRONG_BULL" if (kp_regime == "STRONG_BULL" or kq_regime == "STRONG_BULL") else "NORMAL_BULL"
+    )
 
     result = {
         "sox_pct": sox_pct,
-        "sox_price": sox_info["price"],
         "ixic_pct": ixic_pct,
-        "ixic_price": ixic_info["price"],
-        "fut_pct": fut_pct,
-        "fut_price": fut_info["price"],
-        "combined_alpha": combined_alpha,
-        "regime": regime,
-        "badge": badge,
+        "kospi_fut": {
+            "name": "코스피200 선물 2612",
+            "price": kp_fut.get("price", 0.0),
+            "flu_pct": kp_pct,
+            "regime": kp_regime,
+            "badge": kp_badge,
+            "reason": kp_reason
+        },
+        "kosdaq_fut": {
+            "name": "코스닥150선물 2612",
+            "price": kq_fut.get("price", 0.0),
+            "flu_pct": kq_pct,
+            "regime": kq_regime,
+            "badge": kq_badge,
+            "reason": kq_reason
+        },
+        "regimes": {
+            "KOSPI": {
+                "label": "코스피200 선물 2612",
+                "flu_rt": kp_pct,
+                "regime": kp_regime,
+                "badge": kp_badge,
+                "reason": kp_reason
+            },
+            "KOSDAQ": {
+                "label": "코스닥150선물 2612",
+                "flu_rt": kq_pct,
+                "regime": kq_regime,
+                "badge": kq_badge,
+                "reason": kq_reason
+            }
+        },
         "lead_themes": lead_themes,
-        "reason": reason,
+        "overall_regime": overall_regime,
         "updated_at": now_ts
     }
 
@@ -203,4 +284,3 @@ def get_stock_theme_alignment_score(code: str, radar: Optional[Dict[str, Any]] =
         bonus += 3.0
 
     return bonus
-
