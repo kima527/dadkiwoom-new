@@ -778,7 +778,7 @@ class SafeHoldingsThemeGateBot:
                         self.api, max_picks=12, exclude_codes=exclude_set
                     )
                     self.last_watchlist_scan_time = now_ts
-            elif (now_ts - self.last_watchlist_scan_time >= 1800.0) and not self.get_active_stock_code():
+            elif (now_ts - self.last_watchlist_scan_time >= 1800.0):
                 try:
                     exclude_set = set(real_holdings.keys())
                     self.auto_watchlist_picks = scan_and_save_holy_grail_watchlist(
@@ -1221,9 +1221,11 @@ class SafeHoldingsThemeGateBot:
                 for st_obj in self.strategies.values():
                     if st_obj.position.state == StrategyState.IDLE:
                         st_obj.cash = self.dryrun_stats['virtual_cash']
-                # 매도 종목 영구 차단 없이 관심종목 지속 유지 + 3분(180초) 휩소 방지 쿨다운 적용
-                self.sold_cooldowns[code] = time.time() + 180.0
-                logger.info(f"   👀 [{name}({code})] 모의 전량 매도 완료 ➔ 관심종목 지속 유지! (3분 쿨다운 후 120틱 신규 골든크로스 재진입 감시)")
+                # 👑 [대표님 지시: 즉시 재매수 및 순환매매 지원]
+                # 매도 직후 동일봉 초단타 꼬임 방지용 초단기 쿨다운(20초)만 적용하여,
+                # 타점 재발생 시 즉각 '재매수' 또는 '다음 1위 종목 매수'가 가능하도록 보장!
+                self.sold_cooldowns[code] = time.time() + 20.0
+                logger.info(f"   👀 [{name}({code})] 모의 전량 매도 완료 ➔ 관심종목 즉시 유지! (20초 후 120틱 재매수/순환매매 감시)")
                 return
 
             if exchange_hint == "NXT":
@@ -1245,23 +1247,32 @@ class SafeHoldingsThemeGateBot:
                 # 전량 매도 완료 즉시 포지션 초기화 (IDLE 복귀)
                 strat.position = PositionTracker()
 
-            # 매도 종목 영구 차단 없이 관심종목 지속 유지 + 3분(180초) 휩소 방지 쿨다운 적용
-            self.sold_cooldowns[code] = time.time() + 180.0
-            logger.info(f"   👀 [{name}({code})] 전량 매도 완료 ➔ 관심종목 지속 유지! (3분 쿨다운 후 120틱 신규 골든크로스 재진입 감시)")
+            # 👑 [대표님 지시: 즉시 재매수 및 순환매매 지원]
+            # 매도 직후 동일봉 초단타 꼬임 방지용 초단기 쿨다운(20초)만 적용하여,
+            # 타점 재발생 시 즉각 '재매수' 또는 '다음 1위 종목 매수'가 가능하도록 보장!
+            self.sold_cooldowns[code] = time.time() + 20.0
+            logger.info(f"   👀 [{name}({code})] 전량 매도 완료 ➔ 관심종목 즉시 유지! (20초 후 120틱 재매수/순환매매 감시)")
 
     def get_active_stock_code(self, exclude_codes: Optional[set[str]] = None) -> str | None:
         """
-        현재 활성 포지션을 보유/운용 중인 종목 코드 반환 (1종목 집중 매매 락)
-        - 활성 상태: FIRST_BUY_DONE, FULL_POSITION 중 하나이거나 실보유 수량(total_qty) > 0
-        - exclude_codes: 이번 사이클에 막 신규 매수 후보(buy_candidates)로 올라온 종목들을 제외하고 기존 활성 종목만 조회할 때 사용
+        👑 [대표님 지시]: 로직으로 사지 않은 기존 보유종목은 100% 완전 제외하고,
+        '봇이 로직으로 직접 매수한 활성 종목(1종목)'만 반환합니다.
+        - 봇 직접 매수 증표:
+          1) entry_mode 가 ["STAGE1_5M_ANCHOR", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"] 중 하나여야 함
+          2) 전략 상태가 FIRST_BUY_DONE 또는 FULL_POSITION 이어야 함
+          3) 봇 매수 수량(total_qty) > 0 이어야 함
+        - 로직으로 사지 않은 기존 중장기 보유주식(한화에어로스페이스 등) 및 관심 1주 마커는 슬롯을 점유하지 않습니다!
         """
         for code, strat in self.strategies.items():
             if exclude_codes and code in exclude_codes:
                 continue
-            if strat.position.state in [
-                StrategyState.FIRST_BUY_DONE,
-                StrategyState.FULL_POSITION
-            ] or strat.position.total_qty > 0:
+            
+            entry_mode = getattr(strat.position, 'entry_mode', '')
+            is_bot_trade = entry_mode in ["STAGE1_5M_ANCHOR", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]
+            is_active_state = strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
+            has_qty = strat.position.total_qty > 0
+
+            if is_bot_trade and is_active_state and has_qty:
                 return code
         return None
 
@@ -1510,17 +1521,23 @@ class SafeHoldingsThemeGateBot:
             f"코스닥150선물: {kq_fut.get('badge', '🟢정상')} (시가대비 {kq_fut.get('intraday_chg_pct', 0.0):+.2f}%, 고점대비 -{kq_fut.get('drawdown_from_high_pct', 0.0):.2f}%p)"
         )
         if kp_fut.get('regime') == "CRASH_LOCK":
-            logger.warning(f"   🚨 [코스피 서킷브레이커 발동] {kp_fut.get('reason')} (코스피 종목 신규매수 자동 잠금)")
+            logger.warning(f"   🚨 [코스피 서킷브레이커 알림] {kp_fut.get('reason')} (지수 참고 모니터링 — 개별 주도주는 시가지지 기반 독립 매매)")
         if kq_fut.get('regime') == "CRASH_LOCK":
-            logger.warning(f"   🚨 [코스닥 서킷브레이커 발동] {kq_fut.get('reason')} (코스닥 종목 신규매수 자동 잠금)")
+            logger.warning(f"   🚨 [코스닥 서킷브레이커 알림] {kq_fut.get('reason')} (지수 참고 모니터링 — 개별 주도주는 시가지지 기반 독립 매매)")
 
         active_code = self.get_active_stock_code()
         if active_code:
             act_name = self.get_stock_name(active_code)
             act_state = self.strategies[active_code].position.state.value
-            logger.info(f"🔒 [1종목 집중 매매 락 ON] 현재 운용 종목: [{act_name}({active_code})] 상태: {act_state} (슬롯 1/1 점유) | 기타 관심종목 신규 매수 차단 대기")
+            logger.info(
+                f"🔒 [1종목 순환매매 슬롯 1/1 점유] 봇 운용 종목: [{act_name}({active_code})] 상태: {act_state} "
+                f"➔ 전량 매도(테마 60-120 데드크로스) 시까지 1종목 집중 운용 (신규 매수 대기)"
+            )
         else:
-            logger.info("🔓 [1종목 집중 매매 슬롯 OPEN] 현재 활성 보유 종목 없음 (슬롯 0/1 비어있음) ➔ 기준선(M선)/관문선 옥석 가리기 1위 종목 진입 대기")
+            logger.info(
+                "🔓 [1종목 순환매매 슬롯 0/1 비어있음] 봇 운용 종목 없음 (로직 미매수 기존 계좌 잔고는 100% 제외) "
+                "➔ 실시간 조건검색 1위 주도주 1종목 즉시 진입 대기"
+            )
 
         buy_candidates = []
         total_eval_count = 0
@@ -1626,31 +1643,22 @@ class SafeHoldingsThemeGateBot:
                 day_alpha = day_ret_pct - fut_flu_rt
                 intraday_alpha = stock_intraday_chg - fut_intraday_chg
 
-                # 🏆 [금일 시장 지수보다 강하게 움직이는 종목 판정 (RS Alpha Gate)]:
-                # NXT 프리마켓(08:00~08:45)에서는 선물시장이 미개장(08:45 개장) 상태이므로 지수 초과강도 검사를 유연하게 자동 면제!
-                if exchange_hint == "NXT" and now_t < dtime(8, 45, 0):
-                    is_outperforming_index = (day_ret_pct >= 1.0) and (tick_close >= day_open * 0.998)
-                else:
-                    is_outperforming_index = (day_alpha >= 1.5) and (intraday_alpha >= 0.5) and (tick_close >= day_open * 0.999)
+                # 🏆 [대표님 지시: 지수/RS Alpha 규제 전면 철폐 — 지수는 참고/대응 모니터링용]
+                # 지수 등락률 및 Alpha는 로그 및 참고 지표로만 보존하고 매수 차단 게이트를 전면 해제합니다.
+                is_outperforming_index = True
 
-                # 🧹 [조건검색 편입 종목 중 지수 대비 약세/시가 훼손 종목 자동 정리 (Pruning)]:
-                if is_cond_pick and strat.position.state == StrategyState.IDLE and (day_alpha < 0.0 or tick_close < day_open * 0.990):
-                    with self.condition_lock:
-                        self.condition_picks.pop(code, None)
-
-                # ⚡ [스마트 120틱 TR 호출 최적화]:
-                # 활성 보유 중(FIRST_BUY_DONE / FULL_POSITION)이거나,
-                # IDLE 상태에서 선물 서킷브레이커가 아니고 + 지수 초과강세(is_outperforming_index) + 일봉 상승추세 + M/3선 지지 + 60분봉 20선 지지 종목은 120틱 즉시 조회!
+                # ⚡ [120틱 TR 호출 최적화]:
+                # 활성 보유 중이거나, 조건검색 포착 종목, 프리마켓(08:00~08:45), 정규장 시초(09:00~09:30) 및
+                # 장중 60분봉 20선/당일 시가 지지 종목은 지수 제약 없이 120틱 즉시 조회!
                 need_120t = (
                     strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
-                    or (dtime(8, 0, 45) <= cur_t < dtime(8, 45, 0))
-                    or (dtime(9, 0, 45) <= cur_t <= dtime(9, 30, 0) and (not self.pool_locked or code in self.elite_top5_pool))
+                    or is_cond_pick
+                    or (dtime(8, 0, 0) <= cur_t < dtime(8, 45, 0))
+                    or (dtime(9, 0, 0) <= cur_t <= dtime(9, 30, 0))
                     or (
-                        fut_regime != "CRASH_LOCK"
-                        and daily_bull
-                        and is_outperforming_index
-                        and (day3_m_line <= 0 or tick_close >= day3_m_line * 0.995)
-                        and close_val >= sma20_val * 0.990
+                        daily_bull
+                        and (day3_m_line <= 0 or tick_close >= day3_m_line * 0.990)
+                        and close_val >= sma20_val * 0.985
                     )
                 )
                 df_120t = self.get_120t_candles(code) if need_120t else pd.DataFrame()
@@ -1663,8 +1671,8 @@ class SafeHoldingsThemeGateBot:
                 now_t = datetime.now().time()
                 is_eod_window = (dtime(15, 15, 0) <= now_t <= dtime(15, 30, 0) and exchange_hint == "KRX")
                 is_opening_whipsaw_window = (
-                    (dtime(8, 0, 0) <= now_t < dtime(8, 0, 45) and exchange_hint == "NXT")
-                    or (dtime(9, 0, 0) <= now_t < dtime(9, 0, 45) and exchange_hint == "KRX")
+                    (dtime(8, 0, 0) <= now_t < dtime(8, 0, 15) and exchange_hint == "NXT")
+                    or (dtime(9, 0, 0) <= now_t < dtime(9, 0, 15) and exchange_hint == "KRX")
                 )
                 is_premarket_bridge_window = (dtime(8, 45, 0) <= now_t < dtime(8, 50, 0) and exchange_hint == "NXT")
                 cur_qty = h_info.get('qty', 0)
@@ -1678,8 +1686,8 @@ class SafeHoldingsThemeGateBot:
                 ask_bid_ratio = self.get_orderbook_stats(code)
                 is_first_strat = (
                     (
-                        (dtime(8, 0, 45) <= now_t < dtime(8, 45, 0) and exchange_hint == "NXT")
-                        or (dtime(9, 0, 45) <= now_t <= dtime(9, 30, 0) and exchange_hint == "KRX")
+                        (dtime(8, 0, 15) <= now_t < dtime(8, 45, 0) and exchange_hint == "NXT")
+                        or (dtime(9, 0, 15) <= now_t <= dtime(9, 30, 0) and exchange_hint == "KRX")
                     )
                     and strat.position.trade_count_today == 0
                 )
@@ -1806,7 +1814,7 @@ class SafeHoldingsThemeGateBot:
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
                     # 3) 신규 1차 매수: 쿨다운/시초 휩소 방어 검사 후 우선순위 스코어링 수집
                     elif order.action == "BUY_1":
-                        if self.pool_locked and cur_t >= dtime(9, 30, 0) and code not in self.elite_top5_pool:
+                        if self.pool_locked and cur_t >= dtime(9, 30, 0) and code not in self.elite_top5_pool and not is_cond_pick:
                             logger.info(
                                 f"   🚫 [Top 5 풀 외부 매수 차단] [{name}({code})] 정예 5개 외 종목 차단 (상태 안전 복원)"
                             )
@@ -1815,8 +1823,8 @@ class SafeHoldingsThemeGateBot:
 
                         if cooldown_rem > 0:
                             logger.info(
-                                f"   ⏳ [매도 후 쿨다운 대기] [{name}({code})] 3분 쿨다운 잔여 {cooldown_rem:.0f}초 "
-                                f"➔ 동일봉 휩소 방어 대기 중 (관심종목은 계속 유지하며 120틱 재진입 추적)"
+                                f"   ⏳ [매도 후 재매수 쿨다운 대기] [{name}({code})] 잔여 {cooldown_rem:.0f}초 "
+                                f"➔ 체결 안정화 후 즉시 재매수/순환매매 평가 (상태 보존)"
                             )
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
@@ -1880,6 +1888,7 @@ class SafeHoldingsThemeGateBot:
                             'name': name,
                             'market': stock_market,
                             'cond_overlap': cond_overlap,
+                            'is_cond_pick': is_cond_pick,
                             'fut_regime': fut_regime,
                             'fut_label': fut_label,
                             'fut_badge': fut_badge,
@@ -1901,7 +1910,7 @@ class SafeHoldingsThemeGateBot:
             if self.pool_locked and cur_t >= dtime(9, 30, 0):
                 filtered_cands = []
                 for cand in buy_candidates:
-                    if cand['code'] in self.elite_top5_pool:
+                    if cand['code'] in self.elite_top5_pool or cand.get('is_cond_pick') or (cand['code'] in self.condition_picks):
                         filtered_cands.append(cand)
                     else:
                         logger.info(f"   🚫 [Top 5 풀 외부 매수 차단] [{cand['name']}({cand['code']})] 정예 5개 외 종목 차단")
@@ -1909,90 +1918,70 @@ class SafeHoldingsThemeGateBot:
                 buy_candidates = filtered_cands
 
         if buy_candidates:
-            # 🚨 핵심 결함 수정: 이번 루프에서 막 BUY_1 후보가 되어 FIRST_BUY_DONE으로 임시 전이된 종목들은
-            # 기존 활성 종목 조회 대상에서 제외해야 1위 후보(winner) 주문이 정상 발송됨!
+            # 👑 [대표님 지시]: 1종목 순환매매 (로직으로 사지 않은 기존 보유종목은 100% 완전 제외!)
+            # 1. 봇이 직접 매수한 활성 종목이 이미 1개 운용 중인지 확인 (기존 계좌 잔고는 슬롯 점유에서 완전 배제!)
             candidate_codes = {c['code'] for c in buy_candidates}
             current_active = self.get_active_stock_code(exclude_codes=candidate_codes)
+
             if current_active:
                 cur_act_name = self.get_stock_name(current_active)
                 cur_act_state = self.strategies[current_active].position.state.value
                 for cand in buy_candidates:
                     logger.info(
-                        f"   ⏸️ [1종목 집중 매매 락 차단] 현재 [{cur_act_name}] 포지션({cur_act_state}) 운용 중 ➔ "
-                        f"[{cand['name']}] (우선순위: {cand['priority_score']:.1f}점) 신규 매수 차단 대기"
+                        f"   🔒 [1종목 순환매매 대기] 현재 봇 운용 종목 [{cur_act_name}] 포지션({cur_act_state}) 보유 중 ➔ "
+                        f"[{cand['name']}] (점수: {cand['priority_score']:.1f}점) 전량 매도 완료 전까지 신규 매수 대기"
                     )
-                    # 상태 안전 원복 (스냅샷 기반 포지션/예수금/거래내역 완벽 복구)
                     self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
             else:
-                # 슬롯 0/1 비어있음! [1순위] 조건식 중복 포착 수 → [2순위] 우선순위 점수 순으로 종목 선정
-                # (점수는 100점 상한이라 가산점만으로는 동점이 생기므로, 중복 수를 1차 정렬키로 사용)
+                # 2. 봇 운용 슬롯이 비어있음 (0/1): 동시 포착 후보 중 [우선순위 1위 단 1종목만 2주 매수 집행]
                 buy_candidates.sort(key=lambda x: (x.get('cond_overlap', 0), x['priority_score']), reverse=True)
                 winner = buy_candidates[0]
-                w_d = winner['details']
-                w_fut_regime = winner.get('fut_regime', 'NORMAL_BULL')
+                w_code = winner['code']
+                w_name = winner['name']
+                w_score = winner['priority_score']
+                w_order = winner['order']
+                w_strat = winner['strat']
                 w_fut_label = winner.get('fut_label', '선물지수')
                 w_fut_badge = winner.get('fut_badge', '🟢정상')
+                w_d = winner['details']
 
-                bear_ratio = (bear_align_count / total_eval_count) if total_eval_count > 0 else 0.0
-                is_market_slump = (total_eval_count >= 4 and bear_ratio >= 0.60)
-
-                is_stage1_trade = (
-                    winner.get('order')
-                    and getattr(winner['order'], 'stage', '') == "FULL_POSITION"
-                    and getattr(winner['strat'].position, 'entry_mode', '') == "STAGE1_5M_ANCHOR"
+                is_stage1 = (
+                    w_order
+                    and getattr(w_order, 'stage', '') == "FULL_POSITION"
+                    and getattr(w_strat.position, 'entry_mode', '') == "STAGE1_5M_ANCHOR"
                 )
 
-                if is_stage1_trade:
-                    # 👑 [JYP Ent. 09:08:22 모델 Stage 1 정예군 스나이핑]: 
-                    # 이미 09:05 정각 정량 스코어링을 통해 Top 5로 락온된 주도주이므로,
-                    # 장초반 전일대비 거래량 누적 지연(65점 미달)으로 억울하게 취소되지 않도록 Stage 1 전용 커트라인(45.0점) 적용!
-                    min_required_score = 45.0 if w_fut_regime != "CRASH_LOCK" else 999.0
-                    market_mode_tag = f"{w_fut_label} Stage1 정예 스나이핑(JYP Ent. 모델 45점+)"
-                elif w_fut_regime == "CRASH_LOCK":
-                    min_required_score = 999.0  # 선물투매 서킷브레이커 발동 시 전면 차단
-                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 서킷브레이커 잠금"
-                elif w_fut_regime == "CAUTION_DEFENSE" or is_market_slump:
-                    min_required_score = 78.0
-                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 하락방어모드(대장주 78점+ 엄선)"
-                elif w_fut_regime == "STRONG_BULL":
-                    min_required_score = 62.0
-                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 강세공격모드(62점+)"
-                else:
-                    min_required_score = 65.0
-                    market_mode_tag = f"{w_fut_label} {w_fut_badge} 정상/강세모드(65점+)"
+                # 지수는 참고용 모니터링 (매수 차단 규제 없이 합리적 커트라인 적용)
+                min_required_score = 45.0 if is_stage1 else 50.0
+                mode_tag = f"{w_fut_label} {w_fut_badge} {'Stage1 시초가 스나이핑(45점+)' if is_stage1 else '장중 타점(50점+)'}"
 
-                if winner['priority_score'] < min_required_score:
+                if w_score < min_required_score:
                     logger.info(
-                        f"🛡️ [선물지수 연동 커트라인 미달 매수 보류] 1위 후보 [{winner['name']}({winner['code']})] "
-                        f"점수 {winner['priority_score']:.1f}점 < 최소 커트라인 {min_required_score:.1f}점 ({market_mode_tag}) "
-                        f"➔ 선물 약세/변동성 구간에서 억지 매매를 차단하고 현금을 100% 보존합니다."
+                        f"   ⏳ 1위 후보 [{w_name}({w_code})] 점수 미달로 보류 (현재 {w_score:.1f}점 < 기준 {min_required_score:.1f}점 | {mode_tag})"
                     )
                     for cand in buy_candidates:
                         self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
                 else:
                     logger.info(
-                        f"👑 [동시 기준선 돌파 1픽 선정] 총 {len(buy_candidates)}개 돌파 후보 중 [{winner['name']}({winner['code']})] "
-                        f"[🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
-                        f"우선순위 1위 ({winner['priority_score']:.1f}점/100점 | {market_mode_tag} 커트라인 {min_required_score:.0f}점 통과) 선정 및 매수 집행! "
-                        f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}% 돌파({w_d.get('score_speed', 0.0):.0f}점), "
+                        f"👑 [1종목 순환매매 1위 매수 집행] [{w_name}({w_code})] [🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
+                        f"점수 1위: {w_score:.1f}점 ({mode_tag}) ➔ 2주 실전 매수 집행! "
+                        f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}%, "
                         f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
-                        f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%({w_d.get('score_anchor', 0.0):.0f}점), "
-                        f"120틱WMA: {w_d.get('score_120t', 0.0):.0f}점, 모멘텀: {w_d.get('score_morning', 0.0):.0f}점]"
+                        f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%, 120틱WMA: {w_d.get('score_120t', 0.0):.0f}점]"
                     )
-
                     self.execute_order(
-                        winner['code'],
-                        winner['name'],
-                        winner['order'],
+                        w_code,
+                        w_name,
+                        w_order,
                         prev_pos=winner['prev_pos'],
                         prev_cash=winner['prev_cash']
                     )
 
-                    # 2위 이하 탈락 후보들은 슬롯 마감 대기 및 상태 원복 (스냅샷 기반 완벽 복구)
+                    # 1위 종목 진입으로 슬롯(1/1) 점유 ➔ 2위 이하 탈락 후보들은 상태 안전 원복 후 대기 (매도 후 다음 순환 때 매수 가능)
                     for other in buy_candidates[1:]:
                         logger.info(
-                            f"   ⏸️ [{other['name']}({other['code']})] (우선순위: {other['priority_score']:.1f}점) - "
-                            f"1위 [{winner['name']}] 진입으로 슬롯 마감 ➔ 다음 회차 대기"
+                            f"   ⏸️ [{other['name']}({other['code']})] (점수: {other['priority_score']:.1f}점) - "
+                            f"1위 [{w_name}] 진입으로 슬롯(1/1) 마감 ➔ 매도 후 다음 순환매매 대기"
                         )
                         self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
 

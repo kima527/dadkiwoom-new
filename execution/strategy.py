@@ -320,10 +320,7 @@ class ThemeGate60mStrategy:
             # ═════════════════════════════════════════════════════════════════
             # 1차 매매 완료 후(trade_count_today >= 1) 또는 Stage 1 미해당 일반 장중 타점
             if not can_trigger_buy:
-                # 🏆 [금일 시장 지수 대비 상대강도(RS Alpha) 필수 필터]:
-                if not is_outperforming_index:
-                    return None
-
+                # 🏆 [대표님 지시]: 지수/RS Alpha 규제 전면 철폐 — 지수는 참고용이며 매수 진입을 차단하지 않음
                 if not daily_bull:
                     return None  # 일봉이 하락 추세(5<20)일 때는 신규 1차 매수 진입 차단
 
