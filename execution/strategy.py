@@ -70,6 +70,7 @@ class PositionTracker:
     low_5m: float = 0.0                 # 첫 5분봉 저가 (제1전략 손절선 기준)
     open_5m: float = 0.0                # 첫 5분봉 시가 (제1전략 지지선 기준)
     trade_count_today: int = 0          # 당일 매매 완료 횟수 (제1전략 ➔ 제2전략 회전 전환용)
+    tema60_bull_armed: bool = False     # 매수 진입 이후 120틱 테마60 > 테마120 정배열 안착 확인 여부 (사자마자 즉시 매도 원천 방지)
 
 class ThemeGate60mStrategy:
     """
@@ -177,8 +178,9 @@ class ThemeGate60mStrategy:
                 is_yellow_cloud_120t = bool(last_120t.get('is_yellow_cloud', False))
                 t60 = float(last_120t.get('tema60', np.nan))
                 t120 = float(last_120t.get('tema120', np.nan))
-                recent_tema60_120_dc = bool(df_120t_calc['is_tema60_120_dc'].tail(3).any()) if 'is_tema60_120_dc' in df_120t_calc else False
-                is_tema60_120_dead = bool((t60 < t120) or recent_tema60_120_dc) if (not np.isnan(t60) and not np.isnan(t120)) else False
+                # 🛡️ [사자마자 즉시 매도 원천 차단]: 과거 3봉 데드크로스 잔상(recent_tema60_120_dc) 제거!
+                # 현재 실시간 120틱에서 테마60이 테마120을 확실히 하향 이탈(t60 < t120 * 0.9995)했을 때만 데드 상태로 판정
+                is_tema60_120_dead = bool(t60 < t120 * 0.9995) if (not np.isnan(t60) and not np.isnan(t120) and t120 > 0) else False
 
                 # 🌟 [120틱 핵심 타점 1]: 테마60-120 골든크로스 발생 여부(최근 5봉) 및 크로스 가격
                 recent_tema60_120_gc = bool(df_120t_calc['is_tema60_120_gc'].tail(5).any()) if 'is_tema60_120_gc' in df_120t_calc else False
@@ -207,46 +209,13 @@ class ThemeGate60mStrategy:
         active_gijun = gijun_120t if (has_120t_wave and not np.isnan(gijun_120t) and gijun_120t > 0) else gijun_line
         active_gate_up = is_gate_up_120t or is_gate_up
 
-        # ─────────────────────────────────────────────────────────────
-        # 0. 최우선 규칙: 일봉 기준 테마 5-20 데드크로스 발생 시 전량 청산 및 종료
-        # ─────────────────────────────────────────────────────────────
-        if daily_dead_cross:
-            # 🛡️ 실보유 물량이 실제로 2차 매수까지 체결된 경우(수량 > 1)에만 청산 주문 발생 (관종 1주는 매도 차단)
-            if self.position.total_qty > 1:
-                sell_qty = self.position.total_qty
-                sell_amt = sell_qty * tick_close
-                self.cash += sell_amt
-                self.last_sell_time = time.time()
-                order = TradeOrder(
-                    timestamp=timestamp,
-                    action="TERMINATE_EXIT",
-                    price=tick_close,
-                    qty=sell_qty,
-                    amount=sell_amt,
-                    reason="일봉 테마 5-20 데드크로스 발생 전량 청산 및 전략 종료",
-                    stage="TERMINATED"
-                )
-                self.trade_history.append(order)
-                self.position.total_qty = 0
-                self.position.state = StrategyState.TERMINATED
-                return order
-            else:
-                self.position.state = StrategyState.TERMINATED
-                return None
-                
+        # 🛡️ [사자마자 즉시 매도 원천 차단]:
+        # 장중 미완성 일봉의 일시적 흔들림(daily_dead_cross)으로 인해 매수 직후 즉시 강제 청산(TERMINATE_EXIT)되는 구 로직 완전 제거!
         if self.position.state == StrategyState.TERMINATED:
-            # 일봉이 다시 상승 추세로 복귀하면 리셋 가능 여부
-            if daily_bull and gate_cross_up:
-                self.position = PositionTracker() # 재시작
-            else:
-                return None
+            self.position = PositionTracker()
 
         # ─────────────────────────────────────────────────────────────
         # 1. IDLE 상태: 1차 매수 (예수금 50% — 발목 선취매)
-        # [정석 공식]:
-        # - 정석 1차(일반장 90%): 노란색 급등관문선(active_gate) 상승변곡 또는 바닥 지지 안착 시 1차 50% 매수
-        #   (이후 검정 점선 급등관문고가돌파선 확실한 돌파 확인 시 2차 50% 불타기!)
-        # - 강세 예외 1차(강한 상승 10%): 테마120 상승 전환(is_tema120_up) + 검정 점선(급등관문고가선) 돌파 시 1차 50% 매수
         # ─────────────────────────────────────────────────────────────
         sma5 = row.get('sma5', np.nan)
         sma20 = row.get('sma20', np.nan)
@@ -263,8 +232,8 @@ class ThemeGate60mStrategy:
             if futures_regime == "CRASH_LOCK" or is_premarket_bridge_window:
                 return None
 
-            # 🛡️ 매도 직후 재매수 방지 쿨다운 (3분 동일 종목 재진입 휩소 방어)
-            if self.last_sell_time > 0 and (time.time() - self.last_sell_time < 180):
+            # 🛡️ 매도 직후 재매수 방지 쿨다운 (20초 동일 종목 체결 안정화 대기)
+            if self.last_sell_time > 0 and (time.time() - self.last_sell_time < 20):
                 return None
 
             open_5m = float(kwargs.get('open_5m', 0.0) or 0.0)
@@ -399,6 +368,7 @@ class ThemeGate60mStrategy:
                     self.position.last_gijun_line = active_gijun
                     self.position.state = StrategyState.FULL_POSITION  # 저점에서 100% 풀포지션 완료!
                     self.position.entry_mode = entry_mode_tag
+                    self.position.tema60_bull_armed = False  # 매수 진입 이후 120틱 테마60 > 테마120 정배열 안착 확인 전까지 즉시 매도 차단
                     self.position.low_5m = ref_low if ref_low > 0 else (low_5m if low_5m > 0 else buy_price * 0.992)
                     self.position.open_5m = ref_open if ref_open > 0 else buy_price
 
@@ -561,20 +531,25 @@ class ThemeGate60mStrategy:
                     holding_sec = (time.time() - self.position.entry_time) if self.position.entry_time > 0 else 999.0
                     p_rate = first_pnl
 
+                    # 🛡️ [사자마자 바로 파는 현상 원천 차단]:
+                    # 매수 진입 후 최소 60초 이상 경과한 상태에서 120틱 테마60 > 테마120 정배열 안착이 먼저 확인되어야만 데드크로스 매도 감시 장전!
+                    if holding_sec >= 60.0 and not np.isnan(t60) and not np.isnan(t120) and t120 > 0 and t60 > t120 * 1.0005:
+                        self.position.tema60_bull_armed = True
+
                     is_first_exit = False
                     exit_action = "STOP_LOSS"
                     sl_reason = ""
 
-                    # 1. ⚡ [최우선 핵심 매도]: 120틱 테마 60-120 데드크로스 (TEMA 60 < TEMA 120)
-                    if holding_sec >= 30.0 and is_tema60_120_dead:
+                    # 1. ⚡ [최우선 핵심 매도]: 정배열 안착 확인 후 120틱 테마 60-120 데드크로스 발생 시 매도 (최소 120초 보유 보호)
+                    if holding_sec >= 120.0 and self.position.tema60_bull_armed and is_tema60_120_dead:
                         is_first_exit = True
                         exit_action = "TAKE_PROFIT" if p_rate >= 0.0 else "STOP_LOSS"
                         sl_reason = (
                             f"⚡ [테마 60-120 데드크로스 일원화 매도] 120틱 테마60({t60:,.0f}원) < 테마120({t120:,.0f}원) "
                             f"데드크로스 발생 1차 물량 전량 매도 (체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
                         )
-                    # 2. 🛑 [비상 하드 방어선]: 만약의 급락 시 계좌 보호용 -2.5% 방어
-                    elif base_p1 > 0 and tick_close <= base_p1 * 0.975:
+                    # 2. 🛑 [비상 하드 방어선]: 만약의 급락 시 계좌 보호용 -2.5% 방어 (매수 직후 15초 내 틱 노이즈 방어)
+                    elif holding_sec >= 15.0 and base_p1 > 0 and tick_close <= base_p1 * 0.975:
                         is_first_exit = True
                         exit_action = "STOP_LOSS"
                         sl_reason = f"🛑 [비상 하드 방어선] -2.5% 도달 1차 물량 전량 손절 (체결가: {tick_close:,.0f}원, 수익률: {p_rate:+.2f}%)"
@@ -613,29 +588,38 @@ class ThemeGate60mStrategy:
             action_type = "TAKE_PROFIT"
             exit_price = tick_close
 
+            # 봇 자체 진입 단가 우선 참조 (계좌 기존 보유분 평단가 오염 원천 차단)
+            bot_entry_price = self.position.first_buy_price if self.position.first_buy_price > 0 else self.position.avg_price
+
             # 현재 수익률 계산 및 최고 수익률 추적 (ZeroDivisionError 원천 방어)
-            profit_rate = ((exit_price - self.position.avg_price) / self.position.avg_price) * 100.0 if self.position.avg_price > 0 else 0.0
+            profit_rate = ((exit_price - bot_entry_price) / bot_entry_price) * 100.0 if bot_entry_price > 0 else 0.0
             if profit_rate > self.position.max_profit_pct:
                 self.position.max_profit_pct = profit_rate
 
             # 👑 [대표님 지시 확정]: 매도 로직 '120틱 테마 60-120 데드크로스'로 전면 일원화!
             holding_sec = (time.time() - self.position.entry_time) if self.position.entry_time > 0 else 999.0
 
-            # 1. ⚡ [최우선 핵심 매도]: 120틱 테마 60-120 데드크로스 (TEMA 60 < TEMA 120)
-            if not is_sell_signal and holding_sec >= 30.0 and is_tema60_120_dead:
+            # 🛡️ [사자마자 바로 파는 현상 원천 차단]:
+            # 매수 진입 후 최소 60초 이상 경과한 상태에서 120틱 테마60 > 테마120 정배열 안착이 먼저 확인되어야만 데드크로스 매도 감시 장전!
+            # (장초반 M/3 돌파 최초매수 시 아직 120틱 60<120 역배열 상태이거나, 눌림목 재매수 직후 미세 흔들림에 즉시 매도되는 현상 100% 방지)
+            if holding_sec >= 60.0 and not np.isnan(t60) and not np.isnan(t120) and t120 > 0 and t60 > t120 * 1.0005:
+                self.position.tema60_bull_armed = True
+
+            # 1. ⚡ [최우선 핵심 매도]: 정배열 안착 확인 후 120틱 테마 60-120 데드크로스 발생 시 매도 (최소 120초 보유 보호)
+            if not is_sell_signal and holding_sec >= 120.0 and self.position.tema60_bull_armed and is_tema60_120_dead:
                 is_sell_signal = True
                 action_type = "TAKE_PROFIT" if profit_rate >= 0.0 else "STOP_LOSS"
                 sell_reason = (
                     f"⚡ [테마 60-120 데드크로스 일원화 매도] 120틱 테마60({t60:,.0f}원) < 테마120({t120:,.0f}원) "
                     f"데드크로스 발생 전량 매도 (체결가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
                 )
-            # 2. 🛑 [비상 하드 방어선]: 만약의 급락 시 계좌 보호용 -2.5% 방어
-            elif not is_sell_signal and tick_close <= self.position.avg_price * 0.975:
+            # 2. 🛑 [비상 하드 방어선]: 만약의 급락 시 계좌 보호용 -2.5% 방어 (매수 직후 15초 내 틱 노이즈 방어)
+            elif not is_sell_signal and holding_sec >= 15.0 and bot_entry_price > 0 and tick_close <= bot_entry_price * 0.975:
                 is_sell_signal = True
                 action_type = "STOP_LOSS"
                 sell_reason = (
                     f"🛑 [비상 하드 방어선] -2.5% 도달 계좌 보호 전량 손절 "
-                    f"(매수가: {self.position.avg_price:,.0f}원, 현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                    f"(매수가: {bot_entry_price:,.0f}원, 현재가: {exit_price:,.0f}원, 수익률: {profit_rate:+.2f}%)"
                 )
 
             if is_sell_signal:

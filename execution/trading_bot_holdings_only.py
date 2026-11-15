@@ -1014,19 +1014,8 @@ class SafeHoldingsThemeGateBot:
                     strat.position.state = StrategyState.IDLE
                     strat.position.total_qty = 0
                     strat.position.base_account_qty = account_qty
-                    if buy_prc > 0:
-                        strat.position.avg_price = buy_prc
-                    logger.info(f"   🎯 [{name}({code})] 계좌 관심종목(1주 마커) 등록 완료 (IDLE 대기 | 기존 수량: {account_qty}주 ➔ 1차/기준선 돌파 매수 시 흡수 합산)")
-                elif self.holdings_state == "first_buy_done" and account_qty > 0:
-                    strat.position.state = StrategyState.FIRST_BUY_DONE
-                    strat.position.total_qty = account_qty
-                    strat.position.avg_price = buy_prc
-                    strat.position.first_buy_price = buy_prc
-                    strat.position.first_buy_qty = account_qty
-                    strat.position.base_account_qty = 0
-                    strat.position.entry_mode = "120T_TEMA"
-                    strat.position.entry_time = time.time()
-                    logger.info(f"   ➔ [{name}({code})] 1차 매수 보유 상태 등록 (FIRST_BUY_DONE | 명령행 옵션 지정) | 보유: {account_qty}주 (매수가: {buy_prc:,.0f}원) ➔ 120틱 2차 불타기 및 익절 대기")
+                    strat.position.entry_mode = ""
+                    logger.info(f"   🎯 [{name}({code})] 계좌 관심종목(1주 마커) 등록 완료 (IDLE 대기 | 기존 수량: {account_qty}주)")
                 else:
                     # 🛡️ [기존 계좌 보유 자산 절대 보호 원칙]
                     # 봇이 이번 세션에 직접 매수한 주식이 아닌 기존 계좌 보유분은 매도 감시 대상에서 원천 배제 (IDLE 대기)
@@ -1034,8 +1023,6 @@ class SafeHoldingsThemeGateBot:
                     strat.position.total_qty = 0
                     strat.position.base_account_qty = account_qty
                     strat.position.entry_mode = ""
-                    if buy_prc > 0:
-                        strat.position.avg_price = buy_prc
                     logger.info(f"   🛡️ [{name}({code})] 기존 계좌 보유 자산 감지 (보유: {account_qty}주 | 매수가: {buy_prc:,.0f}원) ➔ 봇 자동 매도 대상에서 원천 배제 (IDLE 자산 안전 보존)")
                 ordered_strategies[code] = strat
             else:
@@ -1045,18 +1032,13 @@ class SafeHoldingsThemeGateBot:
                 if self.is_real and not self.dry_run:
                     existing_strat.cash = cash
 
-                # 🎯 [장중 실시간 1주 수동 매수 동기화]: IDLE 상태에서 수동 1주 매수 확인 시 기본 수량 업데이트
+                # 🎯 [장중 실시간 1주 수동 매수 동기화]: IDLE 상태에서 수동 1주 매수 확인 시 기본 수량만 기록 (평단가 오염 방지)
                 if existing_strat.position.state == StrategyState.IDLE and account_qty >= 1:
                     existing_strat.position.base_account_qty = account_qty
-                    if buy_prc > 0:
-                        existing_strat.position.avg_price = buy_prc
 
-                # 실전 모드(not dry_run)에서 실체결 수량이 1주를 초과한 경우에만 실계좌 수량/단가 동기화
-                # (DRY-RUN이나 지정가 미체결 상태에서 가상 포지션 total_qty가 덮어써지는 현상 원천 차단)
-                if self.is_real and not self.dry_run and existing_strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION] and account_qty > 1:
-                    existing_strat.position.total_qty = account_qty
-                    if buy_prc > 0:
-                        existing_strat.position.avg_price = buy_prc
+                # 🛡️ [사자마자 즉시 손절 원천 차단]:
+                # 봇이 당일 매수한 포지션(FIRST_BUY_DONE / FULL_POSITION)의 avg_price 및 total_qty를
+                # 계좌 전체 합산 평단가(buy_prc, 과거 고가 매수 1주 마커 등 포함)로 덮어쓰지 않고 봇 자체 체결 단가를 100% 보존합니다!
                 ordered_strategies[code] = existing_strat
 
         self.strategies = ordered_strategies
@@ -1168,12 +1150,11 @@ class SafeHoldingsThemeGateBot:
 
             # ⚡ 돌파 역선택(Adverse Selection) 및 미체결 방지: +1~2호가 공격적 스마트 지정가 산출 (상한 슬리피지 +0.3% 이내)
             buy_price = get_smart_buy_price(order.price) if order.price > 0 else 0
+            if strat and buy_price > 0:
+                strat.position.avg_price = buy_price
+                strat.position.first_buy_price = buy_price
 
             if self.dry_run:
-                if strat and strat.position.base_account_qty > 0:
-                    strat.position.total_qty += strat.position.base_account_qty
-                    logger.info(f"   ➕ [수량 흡수] 기존 관심용 1주({strat.position.base_account_qty}주)를 포지션에 합산 ➔ 총 {strat.position.total_qty}주 보유")
-                    strat.position.base_account_qty = 0
                 buy_msg = (
                     f"💻 [가상매매(DRY-RUN) 매수 체결] [{name}({code})] {order.action} | 세션: {session_name} | "
                     f"수량: {order.qty}주 | 체결가: {buy_price:,.0f}원 | 사유: {order.reason}"
@@ -1205,18 +1186,16 @@ class SafeHoldingsThemeGateBot:
                     'order': order
                 }
 
-            # 주문 성공 확인 후 기존 관심용 1주 포지션 흡수
-            if strat and strat.position.base_account_qty > 0:
-                strat.position.total_qty += strat.position.base_account_qty
-                logger.info(f"   ➕ [수량 흡수] 기존 관심용 1주({strat.position.base_account_qty}주)를 포지션에 합산 ➔ 총 {strat.position.total_qty}주 보유")
-                strat.position.base_account_qty = 0
-
         # 3. 매도 집행 (봇 진입 수량 한정 매도 및 기존 계좌 자산 절대 보호)
         elif order.action in ["TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]:
             self.pending_buy_orders.pop(code, None)
 
-            # 🛡️ [철통 자산 보호 1단계: 봇 직접 매수 포지션 검증]
-            entry_mode = strat.position.entry_mode if strat else ""
+            # 🛡️ [철통 자산 보호 1단계: 봇 직접 매수 포지션 검증 (매도 시 초기화된 strat.position 대비 prev_pos 병행 참조)]
+            entry_mode = (
+                strat.position.entry_mode
+                if (strat and strat.position.entry_mode)
+                else (prev_pos.entry_mode if prev_pos else "")
+            )
             if not entry_mode or entry_mode not in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]:
                 logger.error(
                     f"🛑 [기존 계좌 보유 자산 보호 긴급 차단] [{name}({code})] 봇이 당일 매수한 포지션이 아닙니다 (entry_mode: '{entry_mode}'). "
@@ -1263,7 +1242,11 @@ class SafeHoldingsThemeGateBot:
 
             # 🛡️ [철통 자산 보호 2단계: 매도 수량 고정 수량(fixed_qty) 엄격 제한]
             # 계좌에 100주가 있어도 봇이 매수한 수량(최대 fixed_qty)만 매도하고 기존 계좌 물량은 1주도 건드리지 않음!
-            bot_bought_qty = strat.position.total_qty if (strat and strat.position.total_qty > 0) else self.fixed_qty
+            bot_bought_qty = (
+                strat.position.total_qty
+                if (strat and strat.position.total_qty > 0)
+                else (prev_pos.total_qty if (prev_pos and prev_pos.total_qty > 0) else self.fixed_qty)
+            )
             final_sell_qty = min(effective_qty, bot_bought_qty, self.fixed_qty)
             if final_sell_qty <= 0:
                 logger.warning(f"⚠️ [매도 스킵] [{name}({code})] 매도 가능 수량이 0주이므로 주문을 발송하지 않습니다.")
@@ -1912,13 +1895,20 @@ class SafeHoldingsThemeGateBot:
                 if order:
                     # 1) 매도 주문(익절/손절): 봇이 직접 매수한 포지션에 한해 집행 (기존 계좌 보유 자산 100% 보호)
                     if order.action in ["TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]:
+                        # 🛡️ 미체결 매수 주문 대기 중일 때는 사자마자 즉시 매도 원천 차단
+                        if code in self.pending_buy_orders:
+                            logger.info(f"   ⏳ [{name}({code})] 매수 주문 체결 확인 대기 중 ➔ 조기 매도 평가 보류 (상태 복원)")
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
                         # 🛡️ [계좌 기존 보유 자산 절대 보호]: 봇이 직접 매수한 포지션(entry_mode != "")이 아니면 매도 신호 차단
-                        if not strat.position.entry_mode:
+                        active_entry_mode = strat.position.entry_mode if strat.position.entry_mode else (prev_pos.entry_mode if prev_pos else "")
+                        if not active_entry_mode:
                             logger.info(f"   🛡️ [{name}({code})] 봇 매수 포지션 아님 (계좌 기존 자산) ➔ 매도 주문 발송 차단 및 자산 보존")
                             continue
                         # 🛡️ 관종 1주 종목은 매수가 실제로 체결되기 전에는 매도하지 않음
                         if eff_qty <= 1:
                             logger.info(f"   🛡️ [{name}({code})] 관종 1주 보유 종목 ➔ 매수 미완료 상태 매도 신호 무시 (1주 보존)")
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
                     # 2) 2차 불타기 매수: 이미 활성 운용 중인 종목이므로 즉시 집행
