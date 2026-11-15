@@ -46,12 +46,12 @@ _exec_spec.loader.exec_module(_exec_cfg_mod)
 DEFAULT_CONFIG = _exec_cfg_mod.DEFAULT_CONFIG
 
 try:
-    from execution.indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_pred_volume_ratio
+    from execution.indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_daily_ma3_5_gc_m3_line, calculate_pred_volume_ratio
     from execution.strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker, calculate_wma
     from execution.watchlist_scanner import scan_and_save_holy_grail_watchlist, load_saved_watchlist
     from execution.overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
 except ImportError:
-    from indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_pred_volume_ratio
+    from indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_daily_ma3_5_gc_m3_line, calculate_pred_volume_ratio
     from strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker, calculate_wma
     from watchlist_scanner import scan_and_save_holy_grail_watchlist, load_saved_watchlist
     from overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
@@ -183,6 +183,75 @@ def get_smart_buy_price(price: float) -> int:
     return base_p
 
 
+class BigOrderStreakTracker:
+    """
+    👑 [대표님 비기]: 실시간 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 추적기
+    - 단일 체결대금 = 체결가 * 순간체결량 >= 30,000,000원 (3천만 원 이상)
+    - 매도호가를 위로 긁어먹는 적극적 매수 체결(빨간 체결) 기준
+    - 직전 3천만+ 체결 이후 5.0초 이내에 연달아 터지면 streak + 1 연속 카운팅!
+    - 5초 초과 시 streak 0 리셋
+    """
+    def __init__(self, threshold_won: float = 30_000_000.0, streak_window_sec: float = 5.0):
+        self.threshold_won = threshold_won
+        self.streak_window_sec = streak_window_sec
+        self.streaks: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def on_tick(self, code: str, current_price: float, tick_qty: int, is_buy_tick: bool = True, chegyul_gangdo: float = 0.0) -> int:
+        amt = current_price * tick_qty
+        now_ts = time.time()
+        
+        with self._lock:
+            info = self.streaks.setdefault(code, {
+                'streak': 0,
+                'last_ts': 0.0,
+                'last_amt': 0.0,
+                'gangdo': 0.0,
+                'total_big_amt': 0.0
+            })
+            
+            # 3,000만 원 이상 매수 체결 발생!
+            if amt >= self.threshold_won and is_buy_tick:
+                if now_ts - info['last_ts'] <= self.streak_window_sec:
+                    info['streak'] += 1
+                else:
+                    info['streak'] = 1  # 신규 연속 체결 시작
+                    
+                info['last_ts'] = now_ts
+                info['last_amt'] = amt
+                info['gangdo'] = chegyul_gangdo
+                info['total_big_amt'] += amt
+                return info['streak']
+            else:
+                if now_ts - info['last_ts'] > self.streak_window_sec:
+                    info['streak'] = 0
+                return info['streak']
+
+    def get_streak(self, code: str) -> int:
+        now_ts = time.time()
+        with self._lock:
+            info = self.streaks.get(code)
+            if not info:
+                return 0
+            if now_ts - info.get('last_ts', 0.0) > self.streak_window_sec:
+                info['streak'] = 0
+            return info['streak']
+
+    def get_info(self, code: str) -> dict:
+        now_ts = time.time()
+        with self._lock:
+            info = self.streaks.get(code, {})
+            streak = info.get('streak', 0)
+            if now_ts - info.get('last_ts', 0.0) > self.streak_window_sec:
+                streak = 0
+            return {
+                'streak': streak,
+                'last_amt': info.get('last_amt', 0.0),
+                'gangdo': info.get('gangdo', 0.0),
+                'total_big_amt': info.get('total_big_amt', 0.0)
+            }
+
+
 class SafeHoldingsThemeGateBot:
     def __init__(
         self,
@@ -257,6 +326,8 @@ class SafeHoldingsThemeGateBot:
         self.pool_locked: bool = False               # 🔒 풀 락온 완료 여부 플래그
         self.m5_anchors: dict[str, dict] = {}        # 🎯 첫 5분봉 앵커 캐시 (open_5m, low_5m, high_5m, locked)
         self._orderbook_cache: dict[str, dict] = {}  # 📊 호가창 매도/매수 잔량비 캐시 (ask_bid_ratio, ts)
+        # 👑 [대표님 비기]: 실시간 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 추적기 (임계치: 3,000만 원, 윈도우: 5초)
+        self.big_order_tracker = BigOrderStreakTracker(threshold_won=30_000_000.0, streak_window_sec=5.0)
         self.dryrun_stats: dict[str, Any] = {
             'initial_seed': 0.0,
             'virtual_cash': 0.0,
@@ -563,6 +634,29 @@ class SafeHoldingsThemeGateBot:
         """09:30 정각 영구 락온 호출용 헬퍼"""
         self._update_top5_pool(is_final_lock=True)
 
+    def _on_real_tick(self, tick_data: dict):
+        """
+        👑 [대표님 비기]: 실시간 주식체결(0B) 패킷 수신 콜백
+        ➔ 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 실시간 카운팅!
+        """
+        code = str(tick_data.get('code', '')).replace('_AL', '').replace('_NX', '').lstrip('A').strip().zfill(6)
+        if not code or len(code) != 6:
+            return
+        price = float(tick_data.get('price', 0.0) or 0.0)
+        qty = int(tick_data.get('qty', 0) or 0)
+        is_buy = bool(tick_data.get('is_buy', True))
+        gangdo = float(tick_data.get('gangdo', 0.0) or 0.0)
+        amt = float(tick_data.get('amount', price * qty) or 0.0)
+
+        streak = self.big_order_tracker.on_tick(code, price, qty, is_buy_tick=is_buy, chegyul_gangdo=gangdo)
+        if streak >= 2:
+            name = self.get_stock_name(code)
+            logger.info(
+                f"🔥 [세력 3,000만+ 연속 체결 {streak}연타 포착!] [{name}({code})] "
+                f"단가: {price:,.0f}원 | 순간체결: {amt/10000:,.0f}만 원({qty:,}주) (체결강도: {gangdo:.1f}%) "
+                f"➔ 세력 시장가 쓸어담기 확인! 즉각 매수 락온!"
+            )
+            self.condition_wakeup_event.set()
 
     def _start_condition_ws_daemon(self):
         """백그라운드 데몬 스레드에서 KiwoomWebSocketClient 실시간 조건검색 수신 루프 구동"""
@@ -573,7 +667,8 @@ class SafeHoldingsThemeGateBot:
                 self.ws_client = KiwoomWebSocketClient(
                     target_condition_name=self.condition_name,
                     on_insert=self._on_condition_insert,
-                    on_delete=self._on_condition_delete
+                    on_delete=self._on_condition_delete,
+                    on_real_tick=self._on_real_tick
                 )
                 self.ws_client.init_sync_event = self.condition_init_event
                 logger.info(f"📡 [실시간 조건검색 웹소켓 가동] 목표 조건식: [{self.condition_name}] 실시간 수신 대기 중...")
@@ -797,7 +892,7 @@ class SafeHoldingsThemeGateBot:
             if int(h.get('qty', 0)) > 1:
                 is_bot_trade = (
                     code in self.strategies
-                    and self.strategies[code].position.entry_mode in ["STAGE1_5M_ANCHOR", "120T_TEMA", "120T_ROTATION"]
+                    and self.strategies[code].position.entry_mode in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]
                 )
                 if is_bot_trade:
                     h_copy = dict(h)
@@ -1122,7 +1217,7 @@ class SafeHoldingsThemeGateBot:
 
             # 🛡️ [철통 자산 보호 1단계: 봇 직접 매수 포지션 검증]
             entry_mode = strat.position.entry_mode if strat else ""
-            if not entry_mode or entry_mode not in ["STAGE1_5M_ANCHOR", "120T_TEMA", "120T_ROTATION"]:
+            if not entry_mode or entry_mode not in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]:
                 logger.error(
                     f"🛑 [기존 계좌 보유 자산 보호 긴급 차단] [{name}({code})] 봇이 당일 매수한 포지션이 아닙니다 (entry_mode: '{entry_mode}'). "
                     f"대표님의 기존 투자 자산(한화에어로스페이스 등) 보호를 위해 매도 주문 발송을 100% 원천 차단합니다!"
@@ -1258,7 +1353,7 @@ class SafeHoldingsThemeGateBot:
         👑 [대표님 지시]: 로직으로 사지 않은 기존 보유종목은 100% 완전 제외하고,
         '봇이 로직으로 직접 매수한 활성 종목(1종목)'만 반환합니다.
         - 봇 직접 매수 증표:
-          1) entry_mode 가 ["STAGE1_5M_ANCHOR", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"] 중 하나여야 함
+          1) entry_mode 가 ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"] 중 하나여야 함
           2) 전략 상태가 FIRST_BUY_DONE 또는 FULL_POSITION 이어야 함
           3) 봇 매수 수량(total_qty) > 0 이어야 함
         - 로직으로 사지 않은 기존 중장기 보유주식(한화에어로스페이스 등) 및 관심 1주 마커는 슬롯을 점유하지 않습니다!
@@ -1268,7 +1363,7 @@ class SafeHoldingsThemeGateBot:
                 continue
             
             entry_mode = getattr(strat.position, 'entry_mode', '')
-            is_bot_trade = entry_mode in ["STAGE1_5M_ANCHOR", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]
+            is_bot_trade = entry_mode in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]
             is_active_state = strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
             has_qty = strat.position.total_qty > 0
 
@@ -1428,7 +1523,18 @@ class SafeHoldingsThemeGateBot:
         except Exception:
             score_global = 0.0
 
-        total_score = score_speed + score_shape + score_anchor + score_120t + score_morning + score_global
+        # 7. 👑 [대표님 비기]: 실시간 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 가산점 (+0.0 ~ +15.0점)
+        score_big_streak = 0.0
+        streak_info = self.big_order_tracker.get_info(code)
+        b_streak = streak_info.get('streak', 0)
+        if b_streak >= 3:
+            score_big_streak = 15.0  # 3연타 이상 슈퍼 세력 시장가 쓸어담기 폭발! (최고 가산점)
+        elif b_streak == 2:
+            score_big_streak = 10.0  # 2연타 세력 매집 확인
+        elif b_streak == 1:
+            score_big_streak = 5.0   # 1회 3천만+ 체결 포착
+
+        total_score = score_speed + score_shape + score_anchor + score_120t + score_morning + score_global + score_big_streak
         details = {
             'total_score': total_score,
             'vol_ratio_prev': vol_ratio_prev,
@@ -1444,6 +1550,9 @@ class SafeHoldingsThemeGateBot:
             'score_120t': score_120t,
             'score_morning': score_morning,
             'score_global': score_global,
+            'score_big_streak': score_big_streak,
+            'big_order_streak': b_streak,
+            'big_order_last_amt': streak_info.get('last_amt', 0.0),
             'score_candle': score_shape + score_anchor,
             'day_ret_pct': day_ret_pct,
             'day_val_eok': day_val_eok
@@ -1619,6 +1728,8 @@ class SafeHoldingsThemeGateBot:
 
                 # M/3 수식선 계산: M = 종가 + nPreDayClose(1) + nPreDayClose(2); 수식선 = M / 3.0
                 day3_m_line, m_val, pred1, pred2 = calculate_day3_m_line(df_daily, tick_close)
+                # 👑 [대표님 지정 핵심 기준선]: 일봉 기준 3-5 골든크로스 시점의 M/3 기준선 단가 (전일 백데이터 100% 확정)
+                daily_gc_m3_line = calculate_daily_ma3_5_gc_m3_line(df_daily)
 
                 gate_val = last_60m.get('theme_gate', 0.0)
                 high_val = last_60m.get('theme_gate_high', 0.0)
@@ -1714,7 +1825,8 @@ class SafeHoldingsThemeGateBot:
                         high_5m=high_5m,
                         day_open=day_open,
                         ask_bid_ratio=ask_bid_ratio,
-                        is_first_strategy=is_first_strat
+                        is_first_strategy=is_first_strat,
+                        daily_gc_m3_line=daily_gc_m3_line
                     )
                 else:
                     order = None
@@ -1948,7 +2060,7 @@ class SafeHoldingsThemeGateBot:
                 is_stage1 = (
                     w_order
                     and getattr(w_order, 'stage', '') == "FULL_POSITION"
-                    and getattr(w_strat.position, 'entry_mode', '') == "STAGE1_5M_ANCHOR"
+                    and getattr(w_strat.position, 'entry_mode', '') in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT"]
                 )
 
                 # 지수는 참고용 모니터링 (매수 차단 규제 없이 합리적 커트라인 적용)
@@ -1962,12 +2074,13 @@ class SafeHoldingsThemeGateBot:
                     for cand in buy_candidates:
                         self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
                 else:
+                    streak_tag = f", 🔥세력3천만+: {w_d.get('big_order_streak')}연타(+{w_d.get('score_big_streak', 0.0):.0f}점)" if w_d.get('big_order_streak', 0) > 0 else ""
                     logger.info(
                         f"👑 [1종목 순환매매 1위 매수 집행] [{w_name}({w_code})] [🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
                         f"점수 1위: {w_score:.1f}점 ({mode_tag}) ➔ 2주 실전 매수 집행! "
                         f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}%, "
                         f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
-                        f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%, 120틱WMA: {w_d.get('score_120t', 0.0):.0f}점]"
+                        f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%, 120틱WMA: {w_d.get('score_120t', 0.0):.0f}점{streak_tag}]"
                     )
                     self.execute_order(
                         w_code,

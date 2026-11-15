@@ -310,6 +310,49 @@ def calculate_day3_m_line(df_daily: Optional[pd.DataFrame], current_price: float
     return day3_m_line, m_val, pred1, pred2
 
 
+def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame]) -> float:
+    """
+    👑 [대표님 지정 공식]: 일봉 기준 3-5 이동평균선 골든크로스 시점의 M/3 기준선 가격
+    수식:
+    MA3 = avg(C, 3);
+    MA5 = avg(C, 5);
+    조건 = CrossUp(MA3, MA5);
+    M3 = (C + nPreDayClose(1) + nPreDayClose(2)) / 3.0;
+    기준선 = ValueWhen(1, 조건, M3);
+    
+    장 시작 전(08:00 프리마켓 및 09:00 시초가)에도 일봉 백데이터를 통해 
+    1원 단위까지 100% 사전에 확정되어 나오는 절대 기준선 단가입니다.
+    """
+    if df_daily is None or len(df_daily) < 6:
+        return 0.0
+
+    df_d = df_daily.copy()
+    col_map = {col: str(col).lower() for col in df_d.columns if str(col).lower() in ('open', 'high', 'low', 'close', 'date')}
+    df_d.rename(columns=col_map, inplace=True)
+    if 'close' not in df_d.columns:
+        return 0.0
+
+    close_s = pd.to_numeric(df_d['close'], errors='coerce').ffill().bfill()
+    if len(close_s) < 6:
+        return 0.0
+
+    ma3 = close_s.rolling(3).mean()
+    ma5 = close_s.rolling(5).mean()
+    m3_val = (close_s + close_s.shift(1) + close_s.shift(2)) / 3.0
+
+    # CrossUp(MA3, MA5)
+    cross_up = (ma3.shift(1) <= ma5.shift(1)) & (ma3 > ma5)
+    gc_m3 = np.where(cross_up, m3_val, np.nan)
+    gc_m3_series = pd.Series(gc_m3, index=df_d.index).ffill()
+
+    valid_vals = gc_m3_series.dropna()
+    if not valid_vals.empty and float(valid_vals.iloc[-1]) > 0:
+        return float(valid_vals.iloc[-1])
+
+    # 3-5 GC가 아직 감지 안 된 경우 fallback M/3
+    return float(m3_val.dropna().iloc[-1]) if not m3_val.dropna().empty else 0.0
+
+
 def calculate_pred_volume_ratio(df_daily: Optional[pd.DataFrame], curr_day_vol: float) -> Tuple[float, float]:
     """
     ⚡ [장초반 3% 번개 돌파]: 전일 거래량 대비 당일 누적 거래량 잠식률(%) 및 전일 거래량 산출

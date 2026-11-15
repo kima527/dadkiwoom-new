@@ -272,6 +272,7 @@ class ThemeGate60mStrategy:
             day_open_val = float(kwargs.get('day_open', 0.0) or open_price or 0.0)
             ask_bid_ratio = float(kwargs.get('ask_bid_ratio', 1.0) or 1.0)
             is_first_strategy = bool(kwargs.get('is_first_strategy', False))
+            daily_gc_m3_line = float(kwargs.get('daily_gc_m3_line', 0.0) or 0.0)
 
             entry_mode_tag = "120T_TEMA"
             trigger_str = ""
@@ -279,15 +280,15 @@ class ThemeGate60mStrategy:
             t_gc_p = 0.0
 
             # ═════════════════════════════════════════════════════════════════
-            # 👑 [제1전략: 09:00:45~09:30 시초가 번개돌파 & 첫 5분봉 앵커 스나이핑 — JYP Ent. 모델]
+            # 👑 [제1전략: 08:00~08:45 / 09:00~09:30 시초가 최초 매수 — 일봉 3-5골든 M/3 기준선 돌파 & 5분봉 앵커]
             # ═════════════════════════════════════════════════════════════════
-            # 09:00:45 이후 포착된 주도주는 120틱 60>120 정배열 상승추세가 이미 '기정사실'!
-            # 장초반 미완성 60분봉 윗꼬리 노이즈나 일봉 5<20 제약을 전면 면제하고,
-            # 당일 시가 및 5분봉 저가 지지 안착 & 당일 시가 위 붉은 양봉 사수 확인 시 2주 즉시 스나이핑!
+            # 120틱 백데이터 부재 문제 완전 극복:
+            # 장 시작 전 전일 일봉으로 100% 확정된 [일봉 기준 3-5 골든크로스 시점의 M/3 기준선]을 실시간 상향 돌파하거나,
+            # 당일 시가 및 5분봉 저가 지지 안착 & 당일 시가 위 붉은 양봉 사수 확인 시 2주 즉시 최초 매수 스나이핑!
             is_stage1_mode = (
                 is_first_strategy
                 and self.position.trade_count_today == 0
-                and (open_5m > 0 or low_5m > 0 or day_open_val > 0)
+                and (open_5m > 0 or low_5m > 0 or day_open_val > 0 or daily_gc_m3_line > 0)
             )
 
             if is_stage1_mode:
@@ -295,24 +296,32 @@ class ThemeGate60mStrategy:
                 ref_open = day_open_val if day_open_val > 0 else (open_5m if open_5m > 0 else tick_close)
 
                 # 🎯 [시초가 번개돌파(09:02:37) 및 5분봉 지지반등(09:08:22) 정밀 매수 기준]:
-                # 1) 기준 저가(ref_low)를 거래량 실려 깨지 않고 사수 (-0.5% 오차 허용)
                 holds_5m_low = (ref_low > 0 and tick_close >= ref_low * 0.995)
-                # 2) 당일 시가(ref_open) 위 붉은 양봉 사수 (-0.3% 이내 지지 반등)
-                holds_day_open = (ref_open > 0 and tick_close >= ref_open * 0.997)
-                # 3) 장초반 건전한 상승/눌림목 구간 (시가 대비 +7.0% 이하 안정적 안착, 뇌동 과열 방지)
-                not_too_overheated = (ref_open > 0 and tick_close <= ref_open * 1.070)
-                # 4) 호가창 수급: 매수세가 적극 유입되는 구간 (매도/매수비 0.70 이상)
+                # 👑 [대표님 지시 확정]: 2번(당일 시가 양봉 사수) 및 3번(당일 시가 대비 +7% 과열 추격 방지) 제약 전면 삭제!
+                # (강한 갭상승 주도주나 시초 일시적 흔들기 후 급등하는 종목도 지체 없이 즉시 최초 매수 집행)
                 is_hoga_active = (ask_bid_ratio >= 0.70)
-                # 5) 120틱 실시간 캔들 순도 (120틱 윗꼬리 60% 이하)
                 is_120t_clean = (upper_shadow_ratio_120t <= 0.60)
 
-                if holds_5m_low and holds_day_open and not_too_overheated and is_hoga_active and is_120t_clean:
+                # 👑 [대표님 지정 핵심 기준선 돌파 최초 매수]:
+                # 일봉 기준 3-5 골든크로스 시점의 M/3 기준선 단가 돌파 확인 시 최우선 매수!
+                is_m3_breakout = (
+                    daily_gc_m3_line > 0 
+                    and tick_close >= daily_gc_m3_line * 0.998
+                    and is_hoga_active
+                )
+
+                if is_m3_breakout:
+                    can_trigger_buy = True
+                    entry_mode_tag = "STAGE1_M3_BREAKOUT"
+                    diff_m3_pct = ((tick_close - daily_gc_m3_line) / daily_gc_m3_line * 100.0) if daily_gc_m3_line > 0 else 0.0
+                    trigger_str = (
+                        f"👑 [일봉 3-5골든 M/3 기준선 돌파] 확정기준선({daily_gc_m3_line:,.0f}원, {diff_m3_pct:+.2f}%) 상향돌파 2주 즉시 최초 매수"
+                    )
+                elif holds_5m_low and is_hoga_active and is_120t_clean:
                     can_trigger_buy = True
                     entry_mode_tag = "STAGE1_5M_ANCHOR"
-                    diff_open_pct = ((tick_close - ref_open) / ref_open * 100.0) if ref_open > 0 else 0.0
                     trigger_str = (
-                        f"👑 [시초 번개돌파 & 5분봉 앵커] 기준저가({ref_low:,.0f}원) 지지 안착 & "
-                        f"당일시가({ref_open:,.0f}원, {diff_open_pct:+.2f}%) 붉은 양봉 사수 2주 즉시 스나이핑"
+                        f"👑 [시초 번개돌파 & 5분봉 앵커] 기준저가({ref_low:,.0f}원) 지지 안착 2주 즉시 스나이핑"
                     )
 
             # ═════════════════════════════════════════════════════════════════
@@ -333,16 +342,8 @@ class ThemeGate60mStrategy:
                 if open_p > 0 and tick_close < open_p:
                     return None
 
-                # 🛡️ [60분봉 윗꼬리 매물폭탄 방어벽]: 60분봉 고점 대비 윗꼬리 비율 45% 초과 차단
-                c_range = max(float(high) - float(low), 1.0)
-                upper_shadow = max(float(high) - max(open_p, tick_close), 0.0)
-                if (upper_shadow / c_range) > 0.45:
-                    return None
-
-                # 🛡️ [기준선 과열 추격매수 차단]: 유효 기준선 대비 +4.5% 초과 이격 과열 시 차단
-                ref_overheat_gijun = gijun_120t if (has_120t_wave and not np.isnan(gijun_120t) and gijun_120t > 0) else gijun_line
-                if not np.isnan(ref_overheat_gijun) and ref_overheat_gijun > 0 and tick_close > ref_overheat_gijun * 1.045:
-                    return None
+                # 👑 [대표님 지시 확정]: 재매수 시 불필요한 '60분봉 윗꼬리 45% 차단' 및 '기준선 +4.5% 과열 추격차단' 규제 전면 삭제!
+                # (1차 상승 후 건강한 눌림목 및 강한 주도주의 2차 파동 재매수 기회를 100% 개방)
 
                 # ⚡ [120틱 WMA/TEMA 순차돌파 & 실시간 현재가 반영 검증]
                 is_120t_breakout = True

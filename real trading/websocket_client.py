@@ -306,16 +306,25 @@ class KiwoomWebSocketClient:
                                         
                         elif name == '주식체결':
                             code = values.get('9001', '').replace('A', '') # 종목코드
-                            # FID 10: 현재가, FID 15: 거래량, FID 13: 누적거래량
+                            # FID 10: 현재가(부호: 매수/매도), FID 15: 순간체결량, FID 13: 누적거래량, FID 228: 체결강도
                             try:
-                                current_price = abs(float(values.get('10', 0)))
+                                raw_price = float(values.get('10', 0))
+                                current_price = abs(raw_price)
+                                is_buy = (raw_price >= 0)
+                                tick_qty = abs(int(values.get('15', 0)))
                                 accum_volume = int(values.get('13', 0))
                                 tick_time = values.get('20', '') # 체결시간
+                                chegyul_gangdo = abs(float(values.get('228', 0)))
+                                tick_amount = current_price * tick_qty
                                 
                                 if current_price > 0 and self.on_real_tick:
                                     tick_data = {
                                         'code': code,
                                         'price': current_price,
+                                        'qty': tick_qty,
+                                        'amount': tick_amount,
+                                        'is_buy': is_buy,
+                                        'gangdo': chegyul_gangdo,
                                         'accum_volume': accum_volume,
                                         'time': tick_time
                                     }
