@@ -78,11 +78,18 @@ except Exception as e:
     logging.warning(f"⚠️ 실시간 조건검색 웹소켓(KiwoomWebSocketClient) 로드 실패: {e}")
     HAS_WS_CLIENT = False
 
-# 로깅
+# 로깅 (콘솔 + 일별 로그 파일 자동 영구 기록)
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+DAILY_LOG_PATH = os.path.join(LOG_DIR, f"trading_bot_{datetime.now().strftime('%Y%m%d')}.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(DAILY_LOG_PATH, encoding="utf-8")
+    ]
 )
 logger = logging.getLogger("ThemeGateHoldingsBot")
 
@@ -358,14 +365,6 @@ class SafeHoldingsThemeGateBot:
         """키움 실시간 조건검색(Traiding, traiding, Traiding1) 종목 편입 콜백"""
         clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
         if not clean_code.isdigit() or len(clean_code) != 6:
-            return
-
-        # 👑 [09:30 이후 장중 뇌동매매 100% 차단]
-        # 09:00~09:30 장초반 주도주 골든타임(09:08 JYP, 09:17 지니언스 등)에는 신규 대장주 수혈 전면 허용!
-        # 09:30 이후에야 비로소 신규 편입을 차단하여 장중 잡주 뇌동매매를 방어합니다.
-        cur_t = datetime.now().time()
-        if self.pool_locked and cur_t >= dtime(9, 30, 0) and clean_code not in self.elite_top5_pool and clean_code not in self.active_holdings:
-            logger.debug(f"🚫 [09:30 이후 풀 락온 차단] [{clean_code}] 신규 조건검색 무시 (Top 5 정예군 외 종목 100% 차단)")
             return
 
         effective_cond = cond_name.strip() if cond_name and cond_name.strip() else "Traiding"
@@ -904,19 +903,14 @@ class SafeHoldingsThemeGateBot:
                     # 대표님의 기존 계좌 중장기 보유 자산(한화에어로스페이스 등) -> 감시 및 매도 대상에서 원천 배제!
                     pass
 
-        # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입
-        # 🔒 09:30 이후 풀 락온 상태에서는 elite_top5_pool에 속한 종목만 엄선 편입!
+        # (B-1) 🔔 키움 실시간 조건검색 포착 종목 편입 (09:30 이후에도 실시간 포착 주도주 상시 편입 허용)
         cond_added_count = 0
         with self.condition_lock:
-            cur_t = datetime.now().time()
-            if self.pool_locked and cur_t >= dtime(9, 30, 0):
-                sorted_cond_picks = [p for p in self.condition_picks.values() if p['code'] in self.elite_top5_pool]
-            else:
-                sorted_cond_picks = sorted(
-                    self.condition_picks.values(),
-                    key=lambda x: (int(x.get('overlap', 1)), float(x.get('last_update', x.get('captured_at', 0.0)))),
-                    reverse=True
-                )[:15]
+            sorted_cond_picks = sorted(
+                self.condition_picks.values(),
+                key=lambda x: (int(x.get('overlap', 1)), float(x.get('last_update', x.get('captured_at', 0.0)))),
+                reverse=True
+            )[:15]
         for c_pick in sorted_cond_picks:
             code = c_pick['code']
             if code not in real_holdings:
@@ -932,28 +926,25 @@ class SafeHoldingsThemeGateBot:
                 }
                 cond_added_count += 1
 
-        # (B-2) 🌟 성배 로직 최적합 자동 발굴 관심종목 편입 (풀 락온 전까지만 허용)
+        # (B-2) 🌟 성배 로직 최적합 자동 발굴 관심종목 상시 편입 (09:30 이후 감시 목록 증발 현상 원천 차단)
         auto_added_count = 0
-        if not self.pool_locked:
-            for code, pick in self.auto_watchlist_picks.items():
-                if code not in holdings and code not in real_holdings:
-                    holdings[code] = {
-                        'name': pick.get('name', ''),
-                        'qty': 0,
-                        'buy_price': 0.0,
-                        'current_price': float(pick.get('price', 0.0)),
-                        'is_auto_watchlist': True,
-                        'is_condition_pick': False,
-                        'target_tag': pick.get('target_tag', '🌟성배타점관종'),
-                        'fit_score': pick.get('fit_score', 0.0)
-                    }
-                    auto_added_count += 1
+        for code, pick in self.auto_watchlist_picks.items():
+            if code not in holdings and code not in real_holdings:
+                holdings[code] = {
+                    'name': pick.get('name', ''),
+                    'qty': 0,
+                    'buy_price': 0.0,
+                    'current_price': float(pick.get('price', 0.0)),
+                    'is_auto_watchlist': True,
+                    'is_condition_pick': False,
+                    'target_tag': pick.get('target_tag', '🌟성배타점관종'),
+                    'fit_score': pick.get('fit_score', 0.0)
+                }
+                auto_added_count += 1
 
         # (C) 실계좌 1주 보유 관심종목 마커 배치
         for code, h in real_holdings.items():
-            if code not in holdings:
-                if self.pool_locked and code not in self.elite_top5_pool and int(h.get('qty', 0)) <= 1:
-                    continue  # 락온 이후 비정예 1주 마커는 감시 대상에서 제외하여 TR 부하 축소
+            if code not in holdings and int(h.get('qty', 0)) <= 1:
                 holdings[code] = h
 
         # (D) 지정가 주문 발송 직후 아직 잔고에 미반영된 활성 전략 종목 보호
@@ -1571,16 +1562,11 @@ class SafeHoldingsThemeGateBot:
         cur_t = datetime.now().time()
         is_krx_session = (exchange_hint == "KRX")
 
-        # 👑 [09:05~09:30 동적 롤링 Top 5 & 09:30 최종 락온]
-        # 장초반 30분 동안은 지니언스, JYP 등 새로 터지는 대장주를 Top 5 풀에 실시간 교체 수혈!
-        # 09:30 정각 이후에 최종 영구 락온하여 장중 뇌동매매 100% 차단!
-        if is_krx_session:
-            if dtime(9, 5, 0) <= cur_t < dtime(9, 30, 0):
-                self._update_top5_pool(is_final_lock=False)
-            elif cur_t >= dtime(9, 30, 0) and not self.pool_locked:
-                self._lock_top5_pool()
+        # 👑 [장중 상시 동적 롤링 Top 풀 갱신 — 09:30 이후 감시 목록 증발 및 신규 조건검색 차단 규제 해제]
+        if is_krx_session and cur_t >= dtime(9, 5, 0):
+            self._update_top5_pool(is_final_lock=False)
 
-        # ⚡ 09:00:45부터 실시간 조건검색 포착 즉시 시초가 번개 돌파 및 5분봉 앵커 스나이핑 전면 개방 (규제 해제)
+        # ⚡ 09:00:15부터 실시간 조건검색 포착 즉시 M/3 기준선 돌파 및 5분봉 앵커 스나이핑 전면 개방
         is_morning_obs = False
 
         market_status_str = f"🟢 {session_name}" if is_active else f"🔴 {session_name}"
@@ -1641,11 +1627,7 @@ class SafeHoldingsThemeGateBot:
             if not strat or strat.position.state == StrategyState.TERMINATED:
                 continue
 
-            # 🔒 09:30 이후 풀 락온 상태에서 Top 5 정예군 외 비보유 종목은 스킵 (불필요한 TR 호출 차단)
-            if self.pool_locked and cur_t >= dtime(9, 30, 0) and code not in self.elite_top5_pool and strat.position.total_qty <= 0:
-                continue
-
-            # 💡 쿨다운 확인: 매도 직후 단기 쿨다운(3분) 중인지 체크 (종목을 버리지 않고 계속 들여다봄)
+            # 💡 쿨다운 확인: 매도 직후 단기 쿨다운(20초) 중인지 체크 (종목을 버리지 않고 계속 들여다봄)
             now_ts = time.time()
             cooldown_rem = max(0.0, self.sold_cooldowns.get(code, 0.0) - now_ts)
 
@@ -1778,10 +1760,13 @@ class SafeHoldingsThemeGateBot:
                 low_5m = float(anchor_5m.get('low', 0.0) or 0.0)
                 high_5m = float(anchor_5m.get('high', 0.0) or 0.0)
                 ask_bid_ratio = self.get_orderbook_stats(code)
+                # 👑 [제1전략(일봉 3-5골든 M/3 기준선 돌파 최초매수) 시간 제한(09:30 마감) 전면 해제]:
+                # 당일 아직 매수 이력이 없는 종목(trade_count_today == 0)은 09:30 이후에 봇을 켜거나 장중에 돌파하더라도 즉시 최초 매수 허용!
                 is_first_strat = (
                     (
                         (dtime(8, 0, 15) <= now_t < dtime(8, 45, 0) and exchange_hint == "NXT")
-                        or (dtime(9, 0, 15) <= now_t <= dtime(9, 30, 0) and exchange_hint == "KRX")
+                        or (dtime(9, 0, 15) <= now_t < dtime(15, 15, 0) and exchange_hint == "KRX")
+                        or self.dry_run
                     )
                     and strat.position.trade_count_today == 0
                 )
@@ -1916,13 +1901,6 @@ class SafeHoldingsThemeGateBot:
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
                     # 3) 신규 1차 매수: 쿨다운/시초 휩소 방어 검사 후 우선순위 스코어링 수집
                     elif order.action == "BUY_1":
-                        if self.pool_locked and cur_t >= dtime(9, 30, 0) and code not in self.elite_top5_pool and not is_cond_pick:
-                            logger.info(
-                                f"   🚫 [Top 5 풀 외부 매수 차단] [{name}({code})] 정예 5개 외 종목 차단 (상태 안전 복원)"
-                            )
-                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
-                            continue
-
                         if cooldown_rem > 0:
                             logger.info(
                                 f"   ⏳ [매도 후 재매수 쿨다운 대기] [{name}({code})] 잔여 {cooldown_rem:.0f}초 "

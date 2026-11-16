@@ -330,21 +330,25 @@ class ThemeGate60mStrategy:
                     if not np.isnan(w20) and not np.isnan(w40) and not np.isnan(w60) and w20 > 0 and w40 > 0 and w60 > 0:
                         is_120t_wma_seq_breakout = (w1 >= w20 * 0.998) and (w1 >= w40 * 0.998) and (w1 >= w60 * 0.998)
 
-                # ⚡ 제2전략: 120틱 테마 60-120 골든크로스 & 테마 5-20 관문선 저점 안착 매수
+                # ⚡ 제2전략: 120틱 테마 60-120 골든크로스 & (테마 5-20 관문선 지지 OR 기준선 돌파) 회전 매수
                 if has_120t_wave:
                     t_gc_p = tema60_120_gc_price if (not np.isnan(tema60_120_gc_price) and tema60_120_gc_price > 0) else 0.0
                     has_tema60_120_crossed = (recent_tema60_120_gc or is_yellow_cloud_120t)
                     is_near_gate_floor = (
                         not np.isnan(active_gate) and active_gate > 0
-                        and (active_gate * 0.992 <= tick_close <= active_gate * 1.010)
+                        and (active_gate * 0.990 <= tick_close <= active_gate * 1.035)
                     )
-                    if has_tema60_120_crossed and is_near_gate_floor and upper_shadow_ratio_120t <= 0.50:
+                    is_gijun_breakout = (
+                        not np.isnan(active_gijun) and active_gijun > 0
+                        and tick_close >= active_gijun * 0.998
+                    )
+                    if has_tema60_120_crossed and (is_near_gate_floor or is_gijun_breakout) and upper_shadow_ratio_120t <= 0.60:
                         can_trigger_buy = is_60m_sma20_support
                         entry_mode_tag = "STAGE2_120T_GATE"
                         gate_diff = ((tick_close - active_gate) / active_gate * 100.0) if (not np.isnan(active_gate) and active_gate > 0) else 0.0
                         trigger_str = (
-                            f"⚡ [Top5 풀 제2전략] 120틱 테마 60-120 골든크로스 확인 후 "
-                            f"테마 5-20 관문선({active_gate:,.0f}원, 이격 {gate_diff:+.2f}%) 저점 2주 회전 매수"
+                            f"⚡ [제2전략 회전매수] 120틱 테마 60-120 정배열 확인 & "
+                            f"관문선/기준선({active_gate:,.0f}원, 이격 {gate_diff:+.2f}%) 타점 2주 회전 매수"
                         )
 
             if can_trigger_buy:
