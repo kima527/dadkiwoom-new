@@ -310,7 +310,7 @@ def calculate_day3_m_line(df_daily: Optional[pd.DataFrame], current_price: float
     return day3_m_line, m_val, pred1, pred2
 
 
-def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame]) -> float:
+def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame], current_price: Optional[float] = None) -> float:
     """
     👑 [대표님 지정 공식]: 일봉 기준 3-5 이동평균선 골든크로스 시점의 M/3 기준선 가격
     수식:
@@ -320,10 +320,10 @@ def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame]) -> float:
     M3 = (C + nPreDayClose(1) + nPreDayClose(2)) / 3.0;
     기준선 = ValueWhen(1, 조건, M3);
     
-    장 시작 전(08:00 프리마켓 및 09:00 시초가)에도 일봉 백데이터를 통해 
-    1원 단위까지 100% 사전에 확정되어 나오는 절대 기준선 단가입니다.
+    - 이미 3>5 정배열 상태인 종목: 과거 가장 최근 CrossUp(MA3, MA5) 시점의 M/3 수평 기준선이 ffill()로 유지됨.
+    - 당일 실시간 3<=5 -> 3>5 돌파 종목: current_price를 당일 종가로 실시간 반영하여 즉각 기준선 갱신!
     """
-    if df_daily is None or len(df_daily) < 6:
+    if df_daily is None or len(df_daily) < 5:
         return 0.0
 
     df_d = df_daily.copy()
@@ -332,7 +332,22 @@ def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame]) -> float:
     if 'close' not in df_d.columns:
         return 0.0
 
-    close_s = pd.to_numeric(df_d['close'], errors='coerce').ffill().bfill()
+    close_s = pd.to_numeric(df_d['close'], errors='coerce').ffill().bfill().reset_index(drop=True)
+
+    # 실시간 현재가(current_price)가 전달되면 금일 일봉 종가에 즉시 반영 (08:00 프리마켓 포함)
+    if current_price is not None and float(current_price) > 0 and len(close_s) > 0:
+        cp = float(current_price)
+        today_str = datetime.now().strftime('%Y%m%d')
+        if 'date' in df_d.columns:
+            last_dt = str(df_d['date'].iloc[-1]).replace('-', '').replace('/', '').strip()[:8]
+        else:
+            last_dt = str(df_d.index[-1]).replace('-', '').replace('/', '').strip()[:8]
+
+        if last_dt == today_str:
+            close_s.iloc[-1] = cp
+        else:
+            close_s = pd.concat([close_s, pd.Series([cp])], ignore_index=True)
+
     if len(close_s) < 6:
         return 0.0
 
@@ -343,13 +358,13 @@ def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame]) -> float:
     # CrossUp(MA3, MA5)
     cross_up = (ma3.shift(1) <= ma5.shift(1)) & (ma3 > ma5)
     gc_m3 = np.where(cross_up, m3_val, np.nan)
-    gc_m3_series = pd.Series(gc_m3, index=df_d.index).ffill()
+    gc_m3_series = pd.Series(gc_m3, index=close_s.index).ffill()
 
     valid_vals = gc_m3_series.dropna()
     if not valid_vals.empty and float(valid_vals.iloc[-1]) > 0:
         return float(valid_vals.iloc[-1])
 
-    # 3-5 GC가 아직 감지 안 된 경우 fallback M/3
+    # 3-5 GC가 아직 감지 안 된 경우(전체 구간 3>5 정배열 등) fallback M/3
     return float(m3_val.dropna().iloc[-1]) if not m3_val.dropna().empty else 0.0
 
 

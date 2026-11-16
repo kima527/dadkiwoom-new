@@ -1693,8 +1693,8 @@ class SafeHoldingsThemeGateBot:
 
                 # M/3 수식선 계산: M = 종가 + nPreDayClose(1) + nPreDayClose(2); 수식선 = M / 3.0
                 day3_m_line, m_val, pred1, pred2 = calculate_day3_m_line(df_daily, tick_close)
-                # 👑 [대표님 지정 핵심 기준선]: 일봉 기준 3-5 골든크로스 시점의 M/3 기준선 단가 (전일 백데이터 100% 확정)
-                daily_gc_m3_line = calculate_daily_ma3_5_gc_m3_line(df_daily)
+                # 👑 [대표님 지정 핵심 기준선]: 일봉 기준 3-5 골든크로스 시점의 M/3 기준선 단가 (실시간 현재가 반영)
+                daily_gc_m3_line = calculate_daily_ma3_5_gc_m3_line(df_daily, current_price=tick_close)
 
                 gate_val = last_60m.get('theme_gate', 0.0)
                 high_val = last_60m.get('theme_gate_high', 0.0)
