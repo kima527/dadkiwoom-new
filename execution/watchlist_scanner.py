@@ -222,8 +222,7 @@ def evaluate_holy_grail_fit(
         if day_ret_pct < -1.0 or day_ret_pct > 9.5:
             return None
 
-        # 🏆 [금일 시장 지수 대비 상대강도(RS Alpha) 필터]:
-        # 소속 시장 지수(코스피200선물/코스닥150선물) 대비 최소 +1.5%p 이상 강하게 움직이는 종목만 통과!
+        # 🏆 [금일 시장 지수 대비 상대강도(RS Alpha) 산출 — 지수 대비 +1.5%p 하드 차단은 폐지하고 순위 참고만 반영]:
         day_alpha = day_ret_pct
         if futures_regimes:
             m_type = "KOSDAQ"
@@ -235,8 +234,6 @@ def evaluate_holy_grail_fit(
             m_fut = futures_regimes.get(m_type, {})
             fut_flu = float(m_fut.get("flu_rt", 0.0) or 0.0)
             day_alpha = day_ret_pct - fut_flu
-            if day_alpha < 1.5:
-                return None
 
         # 🛡️ [시가총액 탄력 구간 필터 (1,000억 ~ 8조 원)]:
         # 시총 8조 초과 초대형 둔중주(KB금융 60조, 셀트리온 45조, 현대모비스 33조, 한국전력 20조 등) 및

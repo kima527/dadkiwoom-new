@@ -46,12 +46,26 @@ _exec_spec.loader.exec_module(_exec_cfg_mod)
 DEFAULT_CONFIG = _exec_cfg_mod.DEFAULT_CONFIG
 
 try:
-    from execution.indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_daily_ma3_5_gc_m3_line, calculate_pred_volume_ratio
+    from execution.indicators import (
+        calculate_all_60m_indicators,
+        calculate_daily_tema_deadcross,
+        calculate_day3_m_line,
+        calculate_daily_ma3_5_gc_m3_line,
+        calculate_pred_volume_ratio,
+        calculate_120t_tema_indicators,
+    )
     from execution.strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker, calculate_wma
     from execution.watchlist_scanner import scan_and_save_holy_grail_watchlist, load_saved_watchlist
     from execution.overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
 except ImportError:
-    from indicators import calculate_all_60m_indicators, calculate_daily_tema_deadcross, calculate_day3_m_line, calculate_daily_ma3_5_gc_m3_line, calculate_pred_volume_ratio
+    from indicators import (
+        calculate_all_60m_indicators,
+        calculate_daily_tema_deadcross,
+        calculate_day3_m_line,
+        calculate_daily_ma3_5_gc_m3_line,
+        calculate_pred_volume_ratio,
+        calculate_120t_tema_indicators,
+    )
     from strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker, calculate_wma
     from watchlist_scanner import scan_and_save_holy_grail_watchlist, load_saved_watchlist
     from overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
@@ -78,19 +92,25 @@ except Exception as e:
     logging.warning(f"⚠️ 실시간 조건검색 웹소켓(KiwoomWebSocketClient) 로드 실패: {e}")
     HAS_WS_CLIENT = False
 
-# 로깅 (콘솔 + 일별 로그 파일 자동 영구 기록)
+# 로깅 (콘솔 + 일별 로그 파일 자동 영구 기록 — 선행 모듈의 basicConfig 유무와 무관하게 파일 핸들러 강제 바인딩)
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 DAILY_LOG_PATH = os.path.join(LOG_DIR, f"trading_bot_{datetime.now().strftime('%Y%m%d')}.log")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(DAILY_LOG_PATH, encoding="utf-8")
-    ]
-)
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+_log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+
+if not any(isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, 'baseFilename', '')) == os.path.abspath(DAILY_LOG_PATH) for h in _root_logger.handlers):
+    _fh = logging.FileHandler(DAILY_LOG_PATH, encoding="utf-8")
+    _fh.setFormatter(_log_formatter)
+    _root_logger.addHandler(_fh)
+
+if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in _root_logger.handlers):
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(_log_formatter)
+    _root_logger.addHandler(_sh)
+
 logger = logging.getLogger("ThemeGateHoldingsBot")
 
 def get_market_session() -> tuple[bool, str, str]:
@@ -333,6 +353,7 @@ class SafeHoldingsThemeGateBot:
         self.pool_locked: bool = False               # 🔒 풀 락온 완료 여부 플래그
         self.m5_anchors: dict[str, dict] = {}        # 🎯 첫 5분봉 앵커 캐시 (open_5m, low_5m, high_5m, locked)
         self._orderbook_cache: dict[str, dict] = {}  # 📊 호가창 매도/매수 잔량비 캐시 (ask_bid_ratio, ts)
+        self._live_tick_prices: dict[str, dict] = {} # ⚡ 웹소켓 0B 실시간 체결 현재가 캐시 (price, ts)
         # 👑 [대표님 비기]: 실시간 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 추적기 (임계치: 3,000만 원, 윈도우: 5초)
         self.big_order_tracker = BigOrderStreakTracker(threshold_won=30_000_000.0, streak_window_sec=5.0)
         self.dryrun_stats: dict[str, Any] = {
@@ -481,49 +502,60 @@ class SafeHoldingsThemeGateBot:
 
         anchor = {'open': 0.0, 'low': 0.0, 'high': 0.0, 'locked': False}
 
-        # 1) API 5분봉 직접 조회 시도
+        # 1) API 5분봉 직접 조회 시도 (_convert_raw_candles_to_df가 time을 index로 변환하므로 DatetimeIndex 우선 확인)
         if self.is_real and self.api and hasattr(self.api, 'get_5m_candles'):
             try:
                 df_5m = self.api.get_5m_candles(clean_code)
                 if df_5m is not None and not df_5m.empty:
-                    date_col = 'date' if 'date' in df_5m.columns else ('time' if 'time' in df_5m.columns else None)
-                    if date_col:
-                        s_date = df_5m[date_col].astype(str)
-                        df_today = df_5m[s_date.str.contains(today_str) | s_date.str.contains(today_nodash)]
-                        if not df_today.empty:
-                            first_bar = df_today.iloc[0]
-                            anchor['open'] = float(first_bar.get('open', 0.0))
-                            anchor['low'] = float(first_bar.get('low', 0.0))
-                            anchor['high'] = float(first_bar.get('high', 0.0))
+                    df_today = pd.DataFrame()
+                    if isinstance(df_5m.index, pd.DatetimeIndex):
+                        idx_str = df_5m.index.strftime("%Y%m%d")
+                        df_today = df_5m[idx_str == today_nodash]
+                    else:
+                        date_col = 'date' if 'date' in df_5m.columns else ('time' if 'time' in df_5m.columns else None)
+                        if date_col:
+                            s_date = df_5m[date_col].astype(str)
+                            df_today = df_5m[s_date.str.contains(today_str) | s_date.str.contains(today_nodash)]
+                    if not df_today.empty:
+                        first_bar = df_today.iloc[0]
+                        anchor['open'] = float(first_bar.get('open', 0.0) or 0.0)
+                        anchor['low'] = float(first_bar.get('low', 0.0) or 0.0)
+                        anchor['high'] = float(first_bar.get('high', 0.0) or 0.0)
             except Exception as e:
                 logger.debug(f"5분봉 앵커 조회 예외 ({clean_code}): {e}")
 
-        # 2) Fallback: 일봉/60분봉 시가 및 저가 활용
-        if anchor['open'] <= 0:
+        # 2) Fallback: 금일 캔들이 실제로 존재할 때만 당일 일봉/60분봉 활용 (전일 저가 오인 방지!)
+        has_today_bar = False
+        if anchor['open'] > 0:
+            has_today_bar = True
+        else:
             day_open = 0.0
             day_low = 0.0
             day_high = 0.0
             if df_daily is not None and not df_daily.empty:
                 last_d = df_daily.iloc[-1]
-                day_open = float(last_d.get('open', 0.0))
-                day_low = float(last_d.get('low', 0.0))
-                day_high = float(last_d.get('high', 0.0))
+                last_d_dt = str(last_d.get('date', '')).replace('-', '').replace('/', '').strip()[:8]
+                if last_d_dt == today_nodash:
+                    day_open = float(last_d.get('open', 0.0) or 0.0)
+                    day_low = float(last_d.get('low', 0.0) or 0.0)
+                    day_high = float(last_d.get('high', 0.0) or 0.0)
+                    has_today_bar = True
             if day_open <= 0 and df_60m is not None and not df_60m.empty:
-                last_60 = df_60m.iloc[-1]
-                day_open = float(last_60.get('open', 0.0))
-                day_low = float(last_60.get('low', 0.0))
-                day_high = float(last_60.get('high', 0.0))
-            if day_open <= 0:
-                day_open = tick_close
-                day_low = tick_close * 0.995
-                day_high = tick_close * 1.015
+                if isinstance(df_60m.index, pd.DatetimeIndex):
+                    df_60_today = df_60m[df_60m.index.strftime("%Y%m%d") == today_nodash]
+                    if not df_60_today.empty:
+                        first_60 = df_60_today.iloc[0]
+                        day_open = float(first_60.get('open', 0.0) or 0.0)
+                        day_low = float(first_60.get('low', 0.0) or 0.0)
+                        day_high = float(first_60.get('high', 0.0) or 0.0)
+                        has_today_bar = True
+            if has_today_bar and day_open > 0:
+                anchor['open'] = day_open
+                anchor['low'] = day_low if day_low > 0 else min(day_open * 0.992, tick_close)
+                anchor['high'] = day_high if day_high > 0 else max(day_open * 1.015, tick_close)
 
-            anchor['open'] = day_open
-            anchor['low'] = day_low if day_low > 0 else min(day_open * 0.992, tick_close)
-            anchor['high'] = day_high if day_high > 0 else max(day_open * 1.015, tick_close)
-
-        # 09:05 이후이거나 pool_locked 상태이면 앵커 영구 고정
-        if now_t >= dtime(9, 5, 0) or self.pool_locked:
+        # 09:05 이후 금일 첫 5분봉이 정상 확보된 경우에만 앵커 영구 고정
+        if has_today_bar and anchor['open'] > 0 and now_t >= dtime(9, 5, 0):
             anchor['locked'] = True
 
         self.m5_anchors[clean_code] = anchor
@@ -646,6 +678,9 @@ class SafeHoldingsThemeGateBot:
         is_buy = bool(tick_data.get('is_buy', True))
         gangdo = float(tick_data.get('gangdo', 0.0) or 0.0)
         amt = float(tick_data.get('amount', price * qty) or 0.0)
+
+        if price > 0:
+            self._live_tick_prices[code] = {'price': price, 'ts': time.time()}
 
         streak = self.big_order_tracker.on_tick(code, price, qty, is_buy_tick=is_buy, chegyul_gangdo=gangdo)
         if streak >= 2:
@@ -1390,10 +1425,18 @@ class SafeHoldingsThemeGateBot:
             target_vol, target_name = get_session_volume_target()
 
         # 1. 전일 거래량 돌파 속도 점수 (40점 만점)
+        today_str = datetime.now().strftime('%Y%m%d')
+        today_dash = datetime.now().strftime('%Y-%m-%d')
+        last_daily_dt = str(last_daily.get('date', '')).replace('-', '').replace('/', '').strip()[:8]
         if vol_ratio_prev is None:
-            curr_vol = float(last_daily.get('volume', 0.0))
-            if curr_vol <= 0:
-                curr_vol = float(last_60m.get('volume', 0.0))
+            if last_daily_dt == today_str:
+                curr_vol = float(last_daily.get('volume', 0.0) or 0.0)
+            elif df_60m is not None and not df_60m.empty and isinstance(df_60m.index, pd.DatetimeIndex):
+                curr_vol = float(df_60m[df_60m.index.strftime('%Y-%m-%d') == today_dash]['volume'].sum())
+            else:
+                curr_vol = 0.0
+            if curr_vol <= 0 and last_daily_dt == today_str:
+                curr_vol = float(last_60m.get('volume', 0.0) or 0.0)
             vol_ratio_prev, pre_day_vol = calculate_pred_volume_ratio(df_daily, curr_vol)
         else:
             pre_day_vol = 0.0
@@ -1411,7 +1454,8 @@ class SafeHoldingsThemeGateBot:
         else:
             score_speed = 5.0
 
-        # 2. 시가 무훼손 양봉 순도 점수 (20점 만점)
+        # 2. 당일 시가·60분봉 양봉 순도 및 실시간 3일선(M/3) 안착 점수 (20점 만점)
+        day_open_p = float(last_daily.get('open', 0.0) or 0.0) if last_daily_dt == today_str else 0.0
         c_open = float(last_60m.get('open', tick_close))
         c_high = float(last_60m.get('high', tick_close))
         c_low = float(last_60m.get('low', tick_close))
@@ -1422,19 +1466,29 @@ class SafeHoldingsThemeGateBot:
         upper_shadow = max(c_high - max(c_open, c_close), 0.0)
         upper_shadow_ratio = upper_shadow / c_range
 
-        if tick_close >= c_open and upper_shadow_ratio <= 0.25 and body_ratio >= 0.40:
+        is_day_yang = (day_open_p > 0 and tick_close >= day_open_p)
+        if is_day_yang and tick_close >= c_open and upper_shadow_ratio <= 0.25 and body_ratio >= 0.40:
             score_shape = 20.0
+        elif is_day_yang and tick_close >= c_open:
+            score_shape = 16.0
+        elif is_day_yang:
+            score_shape = 12.0
         elif tick_close >= c_open and upper_shadow_ratio <= 0.40:
-            score_shape = 15.0
+            score_shape = 10.0
         elif tick_close < c_open:
             score_shape = 0.0
         else:
-            score_shape = 8.0
+            score_shape = 5.0
 
-        # 3. 기준선(M선) 안착 이격도 (20점 만점)
-        gijun_val = float(last_60m.get('theme_gijun', 0.0))
-        if gijun_val <= 0:
-            gijun_val = float(last_60m.get('theme_gate', tick_close))
+        # 3. 기준선(M선) 및 실시간 3일선(M/3) 안착 이격도 (20점 만점 — NaN 안전 처리)
+        raw_gijun = last_60m.get('theme_gijun', np.nan)
+        raw_gate = last_60m.get('theme_gate', np.nan)
+        if pd.notna(raw_gijun) and float(raw_gijun) > 0:
+            gijun_val = float(raw_gijun)
+        elif pd.notna(raw_gate) and float(raw_gate) > 0:
+            gijun_val = float(raw_gate)
+        else:
+            gijun_val = tick_close
 
         gijun_diff_pct = ((tick_close - gijun_val) / gijun_val * 100.0) if gijun_val > 0 else 0.0
 
@@ -1457,6 +1511,8 @@ class SafeHoldingsThemeGateBot:
 
         if pre_day_close is not None and pre_day_close > 0:
             pre_close = float(pre_day_close)
+        elif df_daily is not None and len(df_daily) >= 2 and last_daily_dt == today_str:
+            pre_close = float(df_daily['close'].iloc[-2])
         else:
             pre_close = float(last_daily.get('close', tick_close))
         day_ret_pct = ((tick_close - pre_close) / pre_close * 100.0) if pre_close > 0 else 0.0
@@ -1643,14 +1699,18 @@ class SafeHoldingsThemeGateBot:
                     continue
 
                 # 실시간 현재가 최우선 확보:
-                # - NXT 프리마켓/애프터마켓 세션에서는 _AL 통합 차트 현재가(candle_close)가 실시간 NXT 체결가를 반영하므로 최우선 적용!
-                # - KRX 정규장에서는 실계좌 수신가(acc_price) 또는 실시간 60분봉 현재가(candle_close) 적용
+                # 1) 웹소켓 실시간 0B 체결가가 15초 이내로 수신되었다면 초단타 지연 없는 실시간 가격 최우선!
+                # 2) NXT 세션에서는 _AL 통합 차트 현재가(candle_close) 적용
+                # 3) KRX 정규장에서는 계좌/차트 현재가 적용
                 h_info = self.active_holdings.get(code, {})
                 is_auto_wl = bool(h_info.get('is_auto_watchlist', False))
                 acc_price = float(h_info.get('current_price', 0.0) or 0.0)
 
                 candle_close = float(df_60m.iloc[-1]['close']) if not df_60m.empty else 0.0
-                if exchange_hint == "NXT" and candle_close > 0:
+                ws_tick = self._live_tick_prices.get(code)
+                if ws_tick and (time.time() - ws_tick.get('ts', 0.0)) <= 15.0 and ws_tick.get('price', 0.0) > 0:
+                    tick_close = float(ws_tick['price'])
+                elif exchange_hint == "NXT" and candle_close > 0:
                     tick_close = candle_close
                 elif not is_auto_wl and acc_price > 0:
                     tick_close = acc_price
@@ -1831,8 +1891,8 @@ class SafeHoldingsThemeGateBot:
                 else:
                     m3_str = "M/3선: 산출대기"
 
-                # 무위험 본절 락인 및 보유 수익률 가시화 (매도 발생 시에도 직전 보유 수익률이 로그에 정확히 표시되도록 스냅샷 병행 참조)
-                ref_pos = prev_pos if (order and order.action in ["TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]) else strat.position
+                # 무위험 본절 락인 및 보유 수익률 가시화 (매수 확정 전 후보 및 매도 직후에도 직전 상태가 정확히 표시되도록 스냅샷 참조)
+                ref_pos = prev_pos if (order and order.action in ["BUY_1", "TAKE_PROFIT", "STOP_LOSS", "TERMINATE_EXIT"]) else strat.position
                 bep_tag = " [🔒본절락]" if ref_pos.bep_locked else ""
                 profit_tag = ""
                 if ref_pos.avg_price > 0 and ref_pos.total_qty > 0:
@@ -1849,10 +1909,12 @@ class SafeHoldingsThemeGateBot:
                     source_badge = ""
                 rs_status = f"🔥지수초과({day_alpha:+.2f}%p)" if is_outperforming_index else f"⚪지수대비({day_alpha:+.2f}%p)"
                 mkt_tag = f"[{stock_market}·{fut_badge}·{rs_status}]"
-                if strat.position.state == StrategyState.IDLE and cooldown_rem > 0:
+                if order and order.action == "BUY_1":
+                    state_display = "IDLE➔BUY_1후보"
+                elif ref_pos.state == StrategyState.IDLE and cooldown_rem > 0:
                     state_display = f"IDLE(쿨다운 {cooldown_rem:.0f}초)"
                 else:
-                    state_display = strat.position.state.value
+                    state_display = ref_pos.state.value
                 logger.info(
                     f"📊 {source_badge}[{name}]{mkt_tag} 상태: {state_display}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f}({day_ret_pct:+.2f}%) | "
                     f"60분: {align_str} | {m3_str} | 관문선: {gate_val:,.0f} | {gijun_str}"
@@ -1984,19 +2046,8 @@ class SafeHoldingsThemeGateBot:
                 logger.error(f"❌ [{name}({code})] 사이클 처리 중 오류 발생: {stock_err}", exc_info=True)
 
         # ─────────────────────────────────────────────────────────────
-        # 동시 기준선 돌파 종목 우선순위(Priority Score) 옥석 가리기 및 최우선주 매수 집행
+        # 동시 기준선 돌파 종목 우선순위(Priority Score) 1위 선별 및 즉시 매수 집행
         # ─────────────────────────────────────────────────────────────
-        if buy_candidates:
-            if self.pool_locked and cur_t >= dtime(9, 30, 0):
-                filtered_cands = []
-                for cand in buy_candidates:
-                    if cand['code'] in self.elite_top5_pool or cand.get('is_cond_pick') or (cand['code'] in self.condition_picks):
-                        filtered_cands.append(cand)
-                    else:
-                        logger.info(f"   🚫 [Top 5 풀 외부 매수 차단] [{cand['name']}({cand['code']})] 정예 5개 외 종목 차단")
-                        self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
-                buy_candidates = filtered_cands
-
         if buy_candidates:
             # 👑 [대표님 지시]: 1종목 순환매매 (로직으로 사지 않은 기존 보유종목은 100% 완전 제외!)
             # 1. 봇이 직접 매수한 활성 종목이 이미 1개 운용 중인지 확인 (기존 계좌 잔고는 슬롯 점유에서 완전 배제!)
@@ -2013,7 +2064,8 @@ class SafeHoldingsThemeGateBot:
                     )
                     self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
             else:
-                # 2. 봇 운용 슬롯이 비어있음 (0/1): 동시 포착 후보 중 [우선순위 1위 단 1종목만 2주 매수 집행]
+                # 2. 봇 운용 슬롯이 비어있음 (0/1): 전략 타점을 통과한 후보 중 [우선순위 1위 단 1종목 즉시 2주 매수 집행]
+                # (장초반 거래량/점수 미성숙으로 인해 실제 매수 기회 자체를 차단하던 불필요한 45~50점 하드 커트라인 제거!)
                 buy_candidates.sort(key=lambda x: (x.get('cond_overlap', 0), x['priority_score']), reverse=True)
                 winner = buy_candidates[0]
                 w_code = winner['code']
@@ -2030,41 +2082,31 @@ class SafeHoldingsThemeGateBot:
                     and getattr(w_order, 'stage', '') == "FULL_POSITION"
                     and getattr(w_strat.position, 'entry_mode', '') in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT"]
                 )
+                mode_tag = f"{w_fut_label} {w_fut_badge} {'Stage1 최초 스나이핑' if is_stage1 else 'Stage2 회전 타점'}"
 
-                # 지수는 참고용 모니터링 (매수 차단 규제 없이 합리적 커트라인 적용)
-                min_required_score = 45.0 if is_stage1 else 50.0
-                mode_tag = f"{w_fut_label} {w_fut_badge} {'Stage1 시초가 스나이핑(45점+)' if is_stage1 else '장중 타점(50점+)'}"
+                streak_tag = f", 🔥세력3천만+: {w_d.get('big_order_streak')}연타(+{w_d.get('score_big_streak', 0.0):.0f}점)" if w_d.get('big_order_streak', 0) > 0 else ""
+                logger.info(
+                    f"👑 [1종목 순환매매 1위 매수 집행] [{w_name}({w_code})] [🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
+                    f"점수 1위: {w_score:.1f}점 ({mode_tag}) ➔ 2주 실전 매수 집행! "
+                    f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}%, "
+                    f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
+                    f"기준선안착: {w_d.get('gijun_diff_pct', 0.0):+.2f}%, 120틱WMA: {w_d.get('score_120t', 0.0):.0f}점{streak_tag}]"
+                )
+                self.execute_order(
+                    w_code,
+                    w_name,
+                    w_order,
+                    prev_pos=winner['prev_pos'],
+                    prev_cash=winner['prev_cash']
+                )
 
-                if w_score < min_required_score:
+                # 1위 종목 진입으로 슬롯(1/1) 점유 ➔ 2위 이하 탈락 후보들은 상태 안전 원복 후 대기 (매도 후 다음 순환 때 매수 가능)
+                for other in buy_candidates[1:]:
                     logger.info(
-                        f"   ⏳ 1위 후보 [{w_name}({w_code})] 점수 미달로 보류 (현재 {w_score:.1f}점 < 기준 {min_required_score:.1f}점 | {mode_tag})"
+                        f"   ⏸️ [{other['name']}({other['code']})] (점수: {other['priority_score']:.1f}점) - "
+                        f"1위 [{w_name}] 진입으로 슬롯(1/1) 마감 ➔ 매도 후 다음 순환매매 대기"
                     )
-                    for cand in buy_candidates:
-                        self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
-                else:
-                    streak_tag = f", 🔥세력3천만+: {w_d.get('big_order_streak')}연타(+{w_d.get('score_big_streak', 0.0):.0f}점)" if w_d.get('big_order_streak', 0) > 0 else ""
-                    logger.info(
-                        f"👑 [1종목 순환매매 1위 매수 집행] [{w_name}({w_code})] [🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
-                        f"점수 1위: {w_score:.1f}점 ({mode_tag}) ➔ 2주 실전 매수 집행! "
-                        f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}%, "
-                        f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
-                        f"기준선안착: +{w_d.get('gijun_diff_pct', 0.0):.2f}%, 120틱WMA: {w_d.get('score_120t', 0.0):.0f}점{streak_tag}]"
-                    )
-                    self.execute_order(
-                        w_code,
-                        w_name,
-                        w_order,
-                        prev_pos=winner['prev_pos'],
-                        prev_cash=winner['prev_cash']
-                    )
-
-                    # 1위 종목 진입으로 슬롯(1/1) 점유 ➔ 2위 이하 탈락 후보들은 상태 안전 원복 후 대기 (매도 후 다음 순환 때 매수 가능)
-                    for other in buy_candidates[1:]:
-                        logger.info(
-                            f"   ⏸️ [{other['name']}({other['code']})] (점수: {other['priority_score']:.1f}점) - "
-                            f"1위 [{w_name}] 진입으로 슬롯(1/1) 마감 ➔ 매도 후 다음 순환매매 대기"
-                        )
-                        self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
+                    self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
 
     def start_loop(self, interval_sec: int = 30):
         """실시간 반복 감시 시작 (키움 실시간 조건검색 포착 시 대기 시간 없이 0.1초 즉시 깨어나 스나이핑!)"""

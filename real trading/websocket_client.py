@@ -150,16 +150,24 @@ class KiwoomWebSocketClient:
 
     async def subscribe_real_tick(self, code: str):
         """
-        주식체결 실시간 데이터를 요청합니다 (SetRealReg 대체).
-        키움 REST OpenAPI 웹소켓 사양에 따라 REALREQ(또는 SYSREQ) 포맷으로 전송합니다.
+        주식체결(0B) 실시간 데이터를 요청합니다.
+        키움 REST OpenAPI 웹소켓 공식 규격(trnm=REG, type=['0B'])을 사용합니다.
         """
+        clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip()
+        if not clean_code:
+            return
         req = {
-            "trnm": "REALREQ",
-            "type": "1", # 1: 등록, 0: 해제
-            "realType": "주식체결",
-            "code": code
+            "trnm": "REG",
+            "grp_no": "3",
+            "refresh": "1",
+            "data": [
+                {
+                    "item": [clean_code],
+                    "type": ["0B"]
+                }
+            ]
         }
-        logger.info(f"실시간 주식체결 구독 요청 전송: {code}")
+        logger.info(f"⚡ [실시간 주식체결(0B) REG 구독 등록] 종목: {clean_code}")
         await self.send_message(req)
 
     async def receive_messages(self):
@@ -254,6 +262,17 @@ class KiwoomWebSocketClient:
 
                     if captured_codes:
                         logger.info(f"🔔 [조건식 '{cond_name}'(seq={seq_str}) 초기 포착] {len(captured_codes)}종목 수신: {captured_codes}")
+                        if self.on_real_tick:
+                            # 초기 조건검색 포착 종목도 즉시 실시간 체결(0B) 구독 등록 ➔ 3천만+ 세력 유입 카운팅!
+                            clean_batch = [str(c).replace("_AL", "").replace("_NX", "").lstrip("A").strip() for c in captured_codes if c]
+                            if clean_batch:
+                                reg_batch_msg = {
+                                    "trnm": "REG",
+                                    "grp_no": "3",
+                                    "refresh": "1",
+                                    "data": [{"item": clean_batch, "type": ["0B"]}]
+                                }
+                                asyncio.create_task(self.send_message(reg_batch_msg))
                     else:
                         logger.info(f"📡 [조건식 '{cond_name}'(seq={seq_str}) 실시간 대기] 현재 초기 포착 0종목 (신규 편입 시 0.1초 즉시 포착)")
 

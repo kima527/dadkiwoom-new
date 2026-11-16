@@ -228,8 +228,9 @@ class ThemeGate60mStrategy:
             is_60m_sma20_support = (close >= sma20 * 0.990)
 
         if self.position.state == StrategyState.IDLE:
-            # 🚨 [소속 시장 선물지수 폭락 서킷브레이커 (CRASH_LOCK) 및 08:45~08:49 프리마켓 마감 직전 신규진입 차단]:
-            if futures_regime == "CRASH_LOCK" or is_premarket_bridge_window:
+            # ⏰ [08:45~08:49 프리마켓 마감 직전 세션 전환 구간만 신규 진입 차단]:
+            # (지수/선물 CRASH_LOCK은 참고 모니터링 전용이며, 개별 주도주 매수를 절대 차단하지 않음!)
+            if is_premarket_bridge_window:
                 return None
 
             # 🛡️ 매도 직후 재매수 방지 쿨다운 (20초 동일 종목 체결 안정화 대기)
@@ -243,17 +244,18 @@ class ThemeGate60mStrategy:
             is_first_strategy = bool(kwargs.get('is_first_strategy', False))
             daily_gc_m3_line = float(kwargs.get('daily_gc_m3_line', 0.0) or 0.0)
 
+            # 🛡️ [UnboundLocalError 원천 차단]: Stage 1 미경유(Stage 2 회전매수 등) 시에도 참조 가능하도록 사전 초기화
+            ref_low = low_5m if low_5m > 0 else (open_5m if open_5m > 0 else day_open_val)
+            ref_open = day_open_val if day_open_val > 0 else (open_5m if open_5m > 0 else tick_close)
+
             entry_mode_tag = "120T_TEMA"
             trigger_str = ""
             can_trigger_buy = False
             t_gc_p = 0.0
 
             # ═════════════════════════════════════════════════════════════════
-            # 👑 [제1전략: 08:00~08:45 / 09:00~09:30 시초가 최초 매수 — 일봉 3-5골든 M/3 기준선 돌파 & 5분봉 앵커]
+            # 👑 [제1전략: 최초 매수 — 일봉 3-5골든 M/3 기준선 돌파 & 5분봉 앵커]
             # ═════════════════════════════════════════════════════════════════
-            # 120틱 백데이터 부재 문제 완전 극복:
-            # 장 시작 전 전일 일봉으로 100% 확정된 [일봉 기준 3-5 골든크로스 시점의 M/3 기준선]을 실시간 상향 돌파하거나,
-            # 당일 시가 및 5분봉 저가 지지 안착 & 당일 시가 위 붉은 양봉 사수 확인 시 2주 즉시 최초 매수 스나이핑!
             is_stage1_mode = (
                 is_first_strategy
                 and self.position.trade_count_today == 0
@@ -261,22 +263,16 @@ class ThemeGate60mStrategy:
             )
 
             if is_stage1_mode:
-                ref_low = low_5m if low_5m > 0 else (open_5m if open_5m > 0 else day_open_val)
-                ref_open = day_open_val if day_open_val > 0 else (open_5m if open_5m > 0 else tick_close)
-
-                # 🎯 [시초가 번개돌파(09:02:37) 및 5분봉 지지반등(09:08:22) 정밀 매수 기준]:
+                # 🎯 [일봉 3-5골든 M/3 돌파 및 첫 5분봉 저가 지지 정밀 매수 기준]:
+                # 호가잔량비(ask_bid_ratio) 0.70 이상 차단은 매수벽 두터운 급등주(0.3~0.6)까지 막으므로 게이트에서 제거 (우선순위 가산점만 반영)
                 holds_5m_low = (ref_low > 0 and tick_close >= ref_low * 0.995)
-                # 👑 [대표님 지시 확정]: 2번(당일 시가 양봉 사수) 및 3번(당일 시가 대비 +7% 과열 추격 방지) 제약 전면 삭제!
-                # (강한 갭상승 주도주나 시초 일시적 흔들기 후 급등하는 종목도 지체 없이 즉시 최초 매수 집행)
-                is_hoga_active = (ask_bid_ratio >= 0.70)
-                is_120t_clean = (upper_shadow_ratio_120t <= 0.60)
+                is_120t_clean = (upper_shadow_ratio_120t <= 0.70)
 
                 # 👑 [대표님 지정 핵심 기준선 돌파 최초 매수]:
                 # 일봉 기준 3-5 골든크로스 시점의 M/3 기준선 단가 돌파 확인 시 최우선 매수!
                 is_m3_breakout = (
                     daily_gc_m3_line > 0 
                     and tick_close >= daily_gc_m3_line * 0.998
-                    and is_hoga_active
                 )
 
                 if is_m3_breakout:
@@ -286,7 +282,7 @@ class ThemeGate60mStrategy:
                     trigger_str = (
                         f"👑 [일봉 3-5골든 M/3 기준선 돌파] 확정기준선({daily_gc_m3_line:,.0f}원, {diff_m3_pct:+.2f}%) 상향돌파 2주 즉시 최초 매수"
                     )
-                elif holds_5m_low and is_hoga_active and is_120t_clean:
+                elif holds_5m_low and is_120t_clean:
                     can_trigger_buy = True
                     entry_mode_tag = "STAGE1_5M_ANCHOR"
                     trigger_str = (
@@ -300,19 +296,14 @@ class ThemeGate60mStrategy:
             if not can_trigger_buy:
                 # 🏆 [대표님 지시]: 지수/RS Alpha 규제 전면 철폐 — 지수는 참고용이며 매수 진입을 차단하지 않음
                 if not daily_bull:
-                    return None  # 일봉이 하락 추세(5<20)일 때는 신규 1차 매수 진입 차단
+                    return None  # 일봉이 하락 추세(5<20)일 때는 신규 매수 진입 차단
 
-                # 🛡️ [매수 필수 방어벽]: M/3 실시간 3일선 상단 지지 확인
-                if day3_m_line > 0 and tick_close < day3_m_line:
+                # 🛡️ [매수 필수 방어벽]: M/3 실시간 3일선 상단 지지 확인 (단, -0.3% 이내 근접/안착 허용)
+                if day3_m_line > 0 and tick_close < day3_m_line * 0.997:
                     return None
 
-                # 🛡️ [시가 훼손 방어벽]: 당일 시가 아래로 밀린 파란 음봉 매수 차단
-                open_p = float(row.get('open', tick_close))
-                if open_p > 0 and tick_close < open_p:
-                    return None
-
-                # 👑 [대표님 지시 확정]: 재매수 시 불필요한 '60분봉 윗꼬리 45% 차단' 및 '기준선 +4.5% 과열 추격차단' 규제 전면 삭제!
-                # (1차 상승 후 건강한 눌림목 및 강한 주도주의 2차 파동 재매수 기회를 100% 개방)
+                # 🛡️ [60분봉 시가 훼손 버그 제거]: 기존 row.get('open')(매 정시 새 60분봉 시가) 비교로 인해
+                # 정시 직후 건강한 120틱 눌림목 반등이 전부 차단되던 치명적 버그 제거!
 
                 # ⚡ [120틱 WMA/TEMA 순차돌파 & 실시간 현재가 반영 검증]
                 is_120t_breakout = True
@@ -448,7 +439,7 @@ class ThemeGate60mStrategy:
 
             # 🌟 [대표님 지시]: 저점(테마 5-20 관문선)에서 계속 매수하여 100% 풀포지션 채우기!
             #    느린 SMA 골든크로스를 기다리지 않고, 저점선 지지 확인 시 잔여 예수금으로 즉시 100% 풀매수 완성!
-            if has_120t_wave and is_near_gate_floor and self.cash > 0 and futures_regime != "CRASH_LOCK":
+            if has_120t_wave and is_near_gate_floor and self.cash > 0:
                 is_breakout = True
                 breakout_target = active_gate
                 breakout_name = f"테마 5-20 관문선({active_gate:,.0f}원) 저점 추가 매수 100% 완성"
@@ -481,8 +472,7 @@ class ThemeGate60mStrategy:
                     breakout_target = active_gijun
                     breakout_name = "1번째 분홍 기준선(M선) 돌파"
 
-            # 🚨 소속 시장 선물지수가 폭락 투매 서킷브레이커(CRASH_LOCK) 상태일 때는 2차 불타기(BUY_2) 보류!
-            if is_breakout and futures_regime != "CRASH_LOCK":
+            if is_breakout:
                 buy_price = tick_close
                 if getattr(self, 'fixed_qty', 0) > 0:
                     qty = self.fixed_qty  # 🌟 [대표님 지시]: 2주 고정 실전 매매
