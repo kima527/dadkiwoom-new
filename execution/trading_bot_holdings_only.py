@@ -367,10 +367,20 @@ class SafeHoldingsThemeGateBot:
         if self.is_real and self.enable_ws:
             self._start_condition_ws_daemon()
 
+    @staticmethod
+    def _normalize_stock_code(code: str) -> str:
+        """종목코드 정규화 (_AL/_NX 및 선행 'A' 1글자만 제거하여 6자리 영문/숫자 코드 보존)"""
+        clean_code = str(code or "").replace("_AL", "").replace("_NX", "").strip()
+        if clean_code.startswith("A") and len(clean_code) == 7:
+            clean_code = clean_code[1:]
+        if clean_code.isdigit() and len(clean_code) < 6:
+            clean_code = clean_code.zfill(6)
+        return clean_code
+
     def _on_condition_insert(self, code: str, cond_name: str = ""):
         """키움 실시간 조건검색(Traiding, traiding, Traiding1) 종목 편입 콜백"""
-        clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
-        if not clean_code.isdigit() or len(clean_code) != 6:
+        clean_code = self._normalize_stock_code(code)
+        if not clean_code.isalnum() or len(clean_code) != 6 or clean_code == "000000":
             return
 
         effective_cond = cond_name.strip() if cond_name and cond_name.strip() else "Traiding"
@@ -409,7 +419,7 @@ class SafeHoldingsThemeGateBot:
 
     def _on_condition_delete(self, code: str, cond_name: str = ""):
         """키움 실시간 조건검색 종목 이탈 콜백: 해당 조건식만 중복 집계에서 제외 (보유/파동 종목 보호를 위해 감시 목록 자체는 메인 루프에서 상대강도로 관리)"""
-        clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip().zfill(6)
+        clean_code = self._normalize_stock_code(code)
         effective_cond = cond_name.strip() if cond_name else ""
         with self.condition_lock:
             pick = self.condition_picks.get(clean_code)
@@ -515,11 +525,9 @@ class SafeHoldingsThemeGateBot:
         👑 [대표님 비기]: 실시간 주식체결(0B) 패킷 수신 콜백
         ➔ 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 실시간 카운팅!
         """
-        raw_code = str(tick_data.get('code', '')).replace('_AL', '').replace('_NX', '').lstrip('A').strip()
-        if not raw_code or not raw_code.isdigit():
-            return
-        code = raw_code.zfill(6)
-        if code == "000000":
+        raw_code = str(tick_data.get('code', '')).strip()
+        code = self._normalize_stock_code(raw_code)
+        if not code or not code.isalnum() or len(code) != 6 or code == "000000":
             return
         price = float(tick_data.get('price', 0.0) or 0.0)
         qty = int(tick_data.get('qty', 0) or 0)
@@ -566,8 +574,8 @@ class SafeHoldingsThemeGateBot:
 
         self.ws_thread = threading.Thread(target=_ws_worker, name="KiwoomConditionWSDaemon", daemon=True)
         self.ws_thread.start()
-        # 모든 목표 조건식(CNSRREQ) 초기 포착 응답이 수신될 때까지 최대 6.0초 대기
-        self.condition_init_event.wait(timeout=6.0)
+        # 모든 목표 조건식(CNSRREQ) 초기 포착 응답이 수신될 때까지 최대 8.0초 대기
+        self.condition_init_event.wait(timeout=8.0)
         self.condition_wakeup_event.clear()
 
     def get_stock_name(self, code: str) -> str:

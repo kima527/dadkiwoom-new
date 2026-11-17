@@ -43,10 +43,102 @@ class KiwoomWebSocketClient:
         self.target_condition_indices = set() # {cond_sn_str, ...}
         self.received_cnsrreq_seqs = set()    # 초기 CNSRREQ 응답 수신 완료된 일련번호 집합
         self.init_sync_event = None           # threading.Event (초기 조건검색 전수 수신 완료 시그널)
+        self.default_stex_tp = "A"            # 'A': 통합(KRX+NXT 프리/정규/애프터 전 세션 대응), 'K': KRX 전용
+        self._inflight_cnsrreq_seq = None
+        self._inflight_cnsrreq_event = None
+        self._inflight_cnsrreq_resp = None
+        self._register_task = None
         
         self.on_insert = on_insert
         self.on_delete = on_delete
         self.on_real_tick = on_real_tick
+
+    @staticmethod
+    def _clean_stock_code(raw_code: str) -> str:
+        """종목코드 정규화 (_AL/_NX 및 선행 'A' 1글자만 제거하여 6자리 영문/숫자 코드 보존)"""
+        code = str(raw_code or "").replace("_AL", "").replace("_NX", "").strip()
+        if code.startswith("A") and len(code) == 7:
+            code = code[1:]
+        if code.isdigit() and len(code) < 6:
+            code = code.zfill(6)
+        return code
+
+    async def _invoke_callback(self, cb, code: str, cond_name: str = ""):
+        """동기/비동기 조건검색 콜백을 인자 호환성을 유지하며 안전하게 호출합니다."""
+        try:
+            if asyncio.iscoroutinefunction(cb):
+                asyncio.create_task(cb(code, cond_name))
+            else:
+                cb(code, cond_name)
+        except TypeError:
+            if asyncio.iscoroutinefunction(cb):
+                asyncio.create_task(cb(code))
+            else:
+                cb(code)
+
+    async def _register_conditions_seq(self):
+        """허용 요청건수 제한(초당 5건, 105110)을 피하기 위해 순차 대기하며 조건검색을 등록합니다."""
+        try:
+            items = list(self.target_condition_map.items())
+            for idx, (cond_sn, cond_name) in enumerate(items):
+                if not self.connected or not self.keep_running:
+                    break
+                seq_str = str(cond_sn)
+                stex_tp = self.default_stex_tp
+                cont_yn = "N"
+                next_key = ""
+
+                for _ in range(8):
+                    req = {
+                        "trnm": "CNSRREQ",
+                        "seq": seq_str,
+                        "search_type": "1",
+                        "stex_tp": stex_tp,
+                        "cont_yn": cont_yn,
+                        "next_key": next_key,
+                    }
+                    self._inflight_cnsrreq_seq = seq_str
+                    self._inflight_cnsrreq_resp = None
+                    self._inflight_cnsrreq_event = asyncio.Event()
+
+                    if cont_yn == "N":
+                        logger.info(f"📡 실시간 조건검색 등록 요청 전송: [{cond_name}] (seq={seq_str}, stex_tp={stex_tp})")
+                    await self.send_message(req)
+
+                    try:
+                        await asyncio.wait_for(self._inflight_cnsrreq_event.wait(), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"⏰ [조건식 '{cond_name}'(seq={seq_str})] CNSRREQ 응답 타임아웃")
+                        break
+
+                    resp = self._inflight_cnsrreq_resp or {}
+                    rc = resp.get("return_code")
+                    msg = resp.get("return_msg")
+
+                    if rc in (0, "0", None):
+                        if str(resp.get("cont_yn", "")).upper() == "Y" and str(resp.get("next_key", "")).strip():
+                            cont_yn = "Y"
+                            next_key = str(resp.get("next_key", "")).strip()
+                            await asyncio.sleep(0.35)
+                            continue
+                        break
+                    if str(rc) == "900001" and stex_tp != "K":
+                        logger.warning(f"⚠️ [조건식 '{cond_name}'(seq={seq_str})] stex_tp={stex_tp} 미지원({msg}) ➔ KRX('K')로 폴백 재시도")
+                        stex_tp = "K"
+                        await asyncio.sleep(0.45)
+                        continue
+                    if str(rc) == "105110":
+                        logger.warning(f"⏳ [조건식 '{cond_name}'(seq={seq_str})] 요청 건수 초과(105110) ➔ 1.2초 후 재시도")
+                        await asyncio.sleep(1.2)
+                        continue
+                    logger.error(f"❌ [조건식 '{cond_name}'(seq={seq_str}) 등록 실패] return_code={rc} | return_msg={msg}")
+                    break
+
+                if idx < len(items) - 1:
+                    await asyncio.sleep(0.45)
+        finally:
+            if self.init_sync_event and not self.init_sync_event.is_set():
+                self.init_sync_event.set()
 
     async def refresh_token_preflight(self):
         """08:00 프리마켓 가동 전 강제 토큰 갱신 (Token Pre-flight Refresh)"""
@@ -224,16 +316,9 @@ class KiwoomWebSocketClient:
                                 
                     if self.target_condition_map:
                         logger.info(f"✅ 총 {len(self.target_condition_map)}개 목표 조건식 매칭 완료: {list(self.target_condition_map.values())}")
-                        for cond_sn, cond_name in self.target_condition_map.items():
-                            req = {
-                                "trnm": "CNSRREQ",
-                                "seq": str(cond_sn),
-                                "search_type": "1",
-                                "stex_tp": "K"
-                            }
-                            logger.info(f"📡 실시간 조건검색 등록 요청 전송: [{cond_name}] (seq={cond_sn})")
-                            await self.send_message(req)
-                            await asyncio.sleep(0.05)
+                        if self._register_task and not self._register_task.done():
+                            self._register_task.cancel()
+                        self._register_task = asyncio.create_task(self._register_conditions_seq())
                     else:
                         logger.error(f"❌ 조건식 목록에서 목표 조건식({self.target_condition_names})을 찾을 수 없습니다! 전체 목록: {cond_list}")
                         if self.init_sync_event:
@@ -241,43 +326,46 @@ class KiwoomWebSocketClient:
                 
                 elif trnm == 'CNSRREQ':
                     # 초기 조건검색 포착 종목 리스트
-                    seq_str = str(response.get('seq', '')).strip()
+                    rc = response.get('return_code')
+                    ret_msg = response.get('return_msg')
+                    seq_str = str(response.get('seq') or self._inflight_cnsrreq_seq or '').strip()
                     cond_name = self.target_condition_map.get(seq_str, f"seq:{seq_str}")
+
+                    # 순차 등록 코루틴에 응답 전달
+                    if rc not in (0, '0', None):
+                        logger.warning(f"⚠️ [CNSRREQ 오류 응답] [{cond_name}](seq={seq_str}) return_code={rc} | return_msg={ret_msg}")
+                        if self._inflight_cnsrreq_event and not self._inflight_cnsrreq_event.is_set():
+                            self._inflight_cnsrreq_resp = response
+                            self._inflight_cnsrreq_event.set()
+                        continue
+
                     data_list = response.get('data') or []
                     captured_codes = []
                     for item in data_list:
-                        code = item.get('jmcode', '').replace('A', '').strip()
-                        if code:
+                        code = self._clean_stock_code(item.get('jmcode', ''))
+                        if code and code != "000000":
                             captured_codes.append(code)
-                            try:
-                                if asyncio.iscoroutinefunction(self.on_insert):
-                                    asyncio.create_task(self.on_insert(code, cond_name))
-                                else:
-                                    self.on_insert(code, cond_name)
-                            except TypeError:
-                                if asyncio.iscoroutinefunction(self.on_insert):
-                                    asyncio.create_task(self.on_insert(code))
-                                else:
-                                    self.on_insert(code)
+                            await self._invoke_callback(self.on_insert, code, cond_name)
 
                     if captured_codes:
                         logger.info(f"🔔 [조건식 '{cond_name}'(seq={seq_str}) 초기 포착] {len(captured_codes)}종목 수신: {captured_codes}")
                         if self.on_real_tick:
                             # 초기 조건검색 포착 종목도 즉시 실시간 체결(0B) 구독 등록 ➔ 3천만+ 세력 유입 카운팅!
-                            clean_batch = [str(c).replace("_AL", "").replace("_NX", "").lstrip("A").strip() for c in captured_codes if c]
-                            if clean_batch:
-                                reg_batch_msg = {
-                                    "trnm": "REG",
-                                    "grp_no": "3",
-                                    "refresh": "1",
-                                    "data": [{"item": clean_batch, "type": ["0B"]}]
-                                }
-                                asyncio.create_task(self.send_message(reg_batch_msg))
+                            reg_batch_msg = {
+                                "trnm": "REG",
+                                "grp_no": "3",
+                                "refresh": "1",
+                                "data": [{"item": captured_codes, "type": ["0B"]}]
+                            }
+                            asyncio.create_task(self.send_message(reg_batch_msg))
                     else:
                         logger.info(f"📡 [조건식 '{cond_name}'(seq={seq_str}) 실시간 대기] 현재 초기 포착 0종목 (신규 편입 시 0.1초 즉시 포착)")
 
-                    if seq_str:
+                    if seq_str and str(response.get('cont_yn', '')).upper() != 'Y':
                         self.received_cnsrreq_seqs.add(seq_str)
+                    if self._inflight_cnsrreq_event and not self._inflight_cnsrreq_event.is_set():
+                        self._inflight_cnsrreq_resp = response
+                        self._inflight_cnsrreq_event.set()
                     if self.init_sync_event and len(self.received_cnsrreq_seqs) >= len(self.target_condition_indices):
                         self.init_sync_event.set()
                             
@@ -289,44 +377,26 @@ class KiwoomWebSocketClient:
                         values = data_item.get('values', {})
                         
                         if name == '조건검색':
-                            code = values.get('9001', '').replace('A', '').strip()
+                            code = self._clean_stock_code(values.get('9001', ''))
                             evt_tp = values.get('843', '') # I: 편입, D: 이탈
-                            cond_idx = str(values.get('841', '')).strip()
+                            raw_841 = str(values.get('841', '')).strip()
+                            cond_idx = raw_841.split()[0] if raw_841 else ''
                             
-                            if cond_idx in self.target_condition_indices:
+                            if code and code != "000000" and cond_idx in self.target_condition_indices:
                                 cond_name = self.target_condition_map.get(cond_idx, f"seq:{cond_idx}")
                                 logger.info(f"🔔 [{cond_name}] 실시간 조건검색 신호: 종목코드={code}, 이벤트={evt_tp}")
                                 if evt_tp == 'I':
-                                    try:
-                                        if asyncio.iscoroutinefunction(self.on_insert):
-                                            asyncio.create_task(self.on_insert(code, cond_name))
-                                        else:
-                                            self.on_insert(code, cond_name)
-                                    except TypeError:
-                                        if asyncio.iscoroutinefunction(self.on_insert):
-                                            asyncio.create_task(self.on_insert(code))
-                                        else:
-                                            self.on_insert(code)
-                                    # 실시간 체결 콜백이 등록되어 있을 때만 체결 데이터 구독
+                                    await self._invoke_callback(self.on_insert, code, cond_name)
                                     if self.on_real_tick:
                                         asyncio.create_task(self.subscribe_real_tick(code))
                                         
                                 elif evt_tp == 'D':
-                                    try:
-                                        if asyncio.iscoroutinefunction(self.on_delete):
-                                            asyncio.create_task(self.on_delete(code, cond_name))
-                                        else:
-                                            self.on_delete(code, cond_name)
-                                    except TypeError:
-                                        if asyncio.iscoroutinefunction(self.on_delete):
-                                            asyncio.create_task(self.on_delete(code))
-                                        else:
-                                            self.on_delete(code)
+                                    await self._invoke_callback(self.on_delete, code, cond_name)
                                         
                         elif name == '주식체결':
                             raw_code = str(values.get('9001') or data_item.get('item') or '')
-                            code = raw_code.replace('_AL', '').replace('_NX', '').replace('A', '').strip() # 종목코드
-                            if not code or not code.isdigit():
+                            code = self._clean_stock_code(raw_code) # 종목코드
+                            if not code or not code.isalnum() or code == "000000":
                                 continue
                             # FID 10: 현재가(부호: 매수/매도), FID 15: 순간체결량, FID 13: 누적거래량, FID 228: 체결강도
                             try:
@@ -358,11 +428,16 @@ class KiwoomWebSocketClient:
                                 logger.error(f"주식체결 파싱 에러: {e}")
 
             except websockets.ConnectionClosed:
-                logger.error("웹소켓 연결이 끊어졌습니다. 3초 후 재연결을 시도합니다.")
                 self.connected = False
+                if not self.keep_running:
+                    break
+                logger.error("웹소켓 연결이 끊어졌습니다. 3초 후 재연결을 시도합니다.")
                 await asyncio.sleep(3)
-                await self.connect()
+                if self.keep_running:
+                    await self.connect()
             except Exception as e:
+                if not self.keep_running:
+                    break
                 logger.error(f"receive_messages 에러: {e}")
                 await asyncio.sleep(1)
 
@@ -372,6 +447,8 @@ class KiwoomWebSocketClient:
 
     async def disconnect(self):
         self.keep_running = False
+        if self._register_task and not self._register_task.done():
+            self._register_task.cancel()
         if self.connected and self.websocket:
             await self.websocket.close()
             self.connected = False
