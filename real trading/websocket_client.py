@@ -324,7 +324,10 @@ class KiwoomWebSocketClient:
                                             self.on_delete(code)
                                         
                         elif name == '주식체결':
-                            code = values.get('9001', '').replace('A', '') # 종목코드
+                            raw_code = str(values.get('9001') or data_item.get('item') or '')
+                            code = raw_code.replace('_AL', '').replace('_NX', '').replace('A', '').strip() # 종목코드
+                            if not code or not code.isdigit():
+                                continue
                             # FID 10: 현재가(부호: 매수/매도), FID 15: 순간체결량, FID 13: 누적거래량, FID 228: 체결강도
                             try:
                                 raw_price = float(values.get('10', 0))

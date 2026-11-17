@@ -18,5 +18,5 @@ echo [7. 2차]  ⚡ [제2전략] 1차 매도 후 회전: 120틱 60-120 크로스
 echo           🛑 테마 5-20 관문선 대비 -0.7%% 이탈 즉시 전량 칼손절 + 🏆 기준선 어깨 익절
 echo ===============================================================================
 echo.
-python -X utf8 "execution\trading_bot_holdings_only.py" --condition "Traiding,traiding,Traiding1,trading1" --fixed-qty 2 --auto-scan
+python -X utf8 "execution\trading_bot_holdings_only.py" --condition "Traiding,traiding,Traiding1,trading1" --fixed-qty 2
 pause

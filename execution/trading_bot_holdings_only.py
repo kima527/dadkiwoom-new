@@ -670,8 +670,11 @@ class SafeHoldingsThemeGateBot:
         👑 [대표님 비기]: 실시간 주식체결(0B) 패킷 수신 콜백
         ➔ 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 실시간 카운팅!
         """
-        code = str(tick_data.get('code', '')).replace('_AL', '').replace('_NX', '').lstrip('A').strip().zfill(6)
-        if not code or len(code) != 6:
+        raw_code = str(tick_data.get('code', '')).replace('_AL', '').replace('_NX', '').lstrip('A').strip()
+        if not raw_code or not raw_code.isdigit():
+            return
+        code = raw_code.zfill(6)
+        if code == "000000":
             return
         price = float(tick_data.get('price', 0.0) or 0.0)
         qty = int(tick_data.get('qty', 0) or 0)
@@ -1972,11 +1975,22 @@ class SafeHoldingsThemeGateBot:
                             continue
 
                         if is_opening_whipsaw_window and not self.dry_run:
-                            whipsaw_label = "08:00~08:00:45 프리마켓 시초 45초 호가 안정화" if exchange_hint == "NXT" else "09:00~09:00:45 정규장 시초 45초 호가 안정화"
-                            resume_time_str = "08:00:45" if exchange_hint == "NXT" else "09:00:45"
+                            whipsaw_label = "08:00~08:00:15 프리마켓 시초 15초 호가 안정화" if exchange_hint == "NXT" else "09:00~09:00:15 정규장 시초 15초 호가 안정화"
+                            resume_time_str = "08:00:15" if exchange_hint == "NXT" else "09:00:15"
                             logger.info(
                                 f"   🛡️ [{whipsaw_label}] [{name}({code})] 시초 동시호가 체결 안정화 대기 중 "
                                 f"➔ {resume_time_str} 이후 양봉·지지 유지 확인 시 즉시 진입 (상태 안전 복원)"
+                            )
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
+
+                        # 🔔 [실시간 조건검색 전용 게이트]: 조건검색 모드 가동 시 조건검색식(Traiding/traiding1/Traiding1) 수신 종목만 신규 매수 허용
+                        # (1주 계좌 관종 마커나 정적 스캔 종목이 조건식 대장주보다 먼저 슬롯(1/1)을 가로채는 현상 원천 차단!)
+                        require_cond_pick = bool(self.condition_name and self.condition_name.strip() and self.enable_ws)
+                        if require_cond_pick and not is_cond_pick and strat.position.trade_count_today == 0:
+                            logger.info(
+                                f"   🚫 [조건검색식 미수신 종목 매수 차단] [{name}({code})] 타점 충족이나 "
+                                f"실시간 조건검색({self.condition_name}) 미포착 종목 ➔ 조건검색 대장주 전용 원칙에 따라 매수 보류"
                             )
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
