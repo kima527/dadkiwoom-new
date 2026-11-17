@@ -201,12 +201,12 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     if 'close' not in df.columns:
         return pd.DataFrame()
         
-    df['close'] = pd.to_numeric(df['close'], errors='coerce').ffill().bfill()
+    df['close'] = pd.to_numeric(df['close'], errors='coerce').ffill().bfill().astype(float)
     for col in ['open', 'high', 'low']:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').ffill().bfill()
+            df[col] = pd.to_numeric(df[col], errors='coerce').ffill().bfill().astype(float)
         else:
-            df[col] = df['close']
+            df[col] = df['close'].astype(float)
 
     # 실시간 현재가(current_price)가 전달된 경우 마지막 120틱 봉에 즉시 반영
     if current_price is not None and float(current_price) > 0 and len(df) > 0:
@@ -310,6 +310,34 @@ def calculate_day3_m_line(df_daily: Optional[pd.DataFrame], current_price: float
     return day3_m_line, m_val, pred1, pred2
 
 
+def _prepare_daily_close_series(df_daily: Optional[pd.DataFrame], current_price: Optional[float] = None) -> Optional[pd.Series]:
+    """일봉 종가 시리즈를 float64로 정규화하고 당일 실시간 현재가를 반영합니다."""
+    if df_daily is None or len(df_daily) < 5:
+        return None
+
+    df_d = df_daily.copy()
+    col_map = {col: str(col).lower() for col in df_d.columns if str(col).lower() in ('close', 'date')}
+    df_d.rename(columns=col_map, inplace=True)
+    if 'close' not in df_d.columns:
+        return None
+
+    close_s = pd.to_numeric(df_d['close'], errors='coerce').ffill().bfill().astype(float).reset_index(drop=True)
+    if current_price is not None and float(current_price) > 0 and len(close_s) > 0:
+        cp = float(current_price)
+        today_str = datetime.now().strftime('%Y%m%d')
+        if 'date' in df_d.columns:
+            last_dt = str(df_d['date'].iloc[-1]).replace('-', '').replace('/', '').strip()[:8]
+        else:
+            last_dt = str(df_d.index[-1]).replace('-', '').replace('/', '').strip()[:8]
+
+        if last_dt == today_str:
+            close_s.iloc[-1] = cp
+        else:
+            close_s = pd.concat([close_s, pd.Series([cp], dtype=float)], ignore_index=True)
+
+    return close_s
+
+
 def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame], current_price: Optional[float] = None) -> float:
     """
     👑 [대표님 지정 공식]: 일봉 기준 3-5 이동평균선 골든크로스 시점의 M/3 기준선 가격
@@ -323,32 +351,8 @@ def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame], current_p
     - 이미 3>5 정배열 상태인 종목: 과거 가장 최근 CrossUp(MA3, MA5) 시점의 M/3 수평 기준선이 ffill()로 유지됨.
     - 당일 실시간 3<=5 -> 3>5 돌파 종목: current_price를 당일 종가로 실시간 반영하여 즉각 기준선 갱신!
     """
-    if df_daily is None or len(df_daily) < 5:
-        return 0.0
-
-    df_d = df_daily.copy()
-    col_map = {col: str(col).lower() for col in df_d.columns if str(col).lower() in ('open', 'high', 'low', 'close', 'date')}
-    df_d.rename(columns=col_map, inplace=True)
-    if 'close' not in df_d.columns:
-        return 0.0
-
-    close_s = pd.to_numeric(df_d['close'], errors='coerce').ffill().bfill().reset_index(drop=True)
-
-    # 실시간 현재가(current_price)가 전달되면 금일 일봉 종가에 즉시 반영 (08:00 프리마켓 포함)
-    if current_price is not None and float(current_price) > 0 and len(close_s) > 0:
-        cp = float(current_price)
-        today_str = datetime.now().strftime('%Y%m%d')
-        if 'date' in df_d.columns:
-            last_dt = str(df_d['date'].iloc[-1]).replace('-', '').replace('/', '').strip()[:8]
-        else:
-            last_dt = str(df_d.index[-1]).replace('-', '').replace('/', '').strip()[:8]
-
-        if last_dt == today_str:
-            close_s.iloc[-1] = cp
-        else:
-            close_s = pd.concat([close_s, pd.Series([cp])], ignore_index=True)
-
-    if len(close_s) < 6:
+    close_s = _prepare_daily_close_series(df_daily, current_price)
+    if close_s is None or len(close_s) < 6:
         return 0.0
 
     ma3 = close_s.rolling(3).mean()
@@ -364,8 +368,35 @@ def calculate_daily_ma3_5_gc_m3_line(df_daily: Optional[pd.DataFrame], current_p
     if not valid_vals.empty and float(valid_vals.iloc[-1]) > 0:
         return float(valid_vals.iloc[-1])
 
-    # 3-5 GC가 아직 감지 안 된 경우(전체 구간 3>5 정배열 등) fallback M/3
+    # 3-5 GC가 아직 감지 안 된 경우 fallback M/3
     return float(m3_val.dropna().iloc[-1]) if not m3_val.dropna().empty else 0.0
+
+
+def check_daily_ma3_5_eligible(df_daily: Optional[pd.DataFrame], current_price: Optional[float] = None) -> Tuple[bool, str]:
+    """
+    일봉 기준 3-5 이동평균선 골든크로스(CrossUp(MA3, MA5)) OR 3 > 5 정배열 여부 판정.
+    (실시간 현재가를 당일 일봉 종가에 반영하여 장중 돌파도 즉시 인식)
+    """
+    close_s = _prepare_daily_close_series(df_daily, current_price)
+    if close_s is None or len(close_s) < 5:
+        return False, "일봉데이터부족"
+
+    ma3 = close_s.rolling(3).mean()
+    ma5 = close_s.rolling(5).mean()
+    ma3_cur = float(ma3.iloc[-1])
+    ma5_cur = float(ma5.iloc[-1])
+    ma3_prev = float(ma3.iloc[-2]) if len(ma3) >= 2 else np.nan
+    ma5_prev = float(ma5.iloc[-2]) if len(ma5) >= 2 else np.nan
+
+    if np.isnan(ma3_cur) or np.isnan(ma5_cur):
+        return False, "MA3/5산출중"
+
+    is_gc = (not np.isnan(ma3_prev) and not np.isnan(ma5_prev) and ma3_prev <= ma5_prev and ma3_cur > ma5_cur)
+    if is_gc:
+        return True, "일봉 3-5 골든크로스"
+    if ma3_cur > ma5_cur:
+        return True, "일봉 3>5 정배열"
+    return False, f"일봉 3<5({ma3_cur:,.0f}<{ma5_cur:,.0f})"
 
 
 def calculate_pred_volume_ratio(df_daily: Optional[pd.DataFrame], curr_day_vol: float) -> Tuple[float, float]:

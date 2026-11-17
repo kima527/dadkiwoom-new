@@ -44,10 +44,15 @@ class RealAPIAdapter:
             sys.exit(1)
 
     def extract_order_no(self, result):
-        if not result: return None
+        if not result:
+            logger.error("❌ [키움 주문 응답 없음] result가 비어 있습니다.")
+            return None
         for k, v in result.items():
             if 'ord_no' in k.lower() and str(v).strip():
                 return str(v).strip()
+        ret_code = result.get('return_code', '')
+        ret_msg = result.get('return_msg', '')
+        logger.error(f"❌ [키움 주문 거절 상세] return_code={ret_code} | return_msg={ret_msg} | 응답={result}")
         return None
 
     def get_cash_balance(self) -> float:
