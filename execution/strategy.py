@@ -71,6 +71,10 @@ class PositionTracker:
     open_5m: float = 0.0                # 첫 5분봉 시가 (제1전략 지지선 기준)
     trade_count_today: int = 0          # 당일 매매 완료 횟수 (제1전략 ➔ 제2전략 회전 전환용)
     tema60_bull_armed: bool = False     # 매수 진입 이후 120틱 테마60 > 테마120 정배열 안착 확인 여부 (사자마자 즉시 매도 원천 방지)
+    watch_initialized: bool = False     # 120틱 관찰 시작 기록 여부 (포착 즉시 매수 차단용)
+    watch_start_bar_key: str = ""       # 관찰 시작 시점 120틱 마지막 봉 식별자
+    saw_decline_phase: bool = False     # 관찰 이후 120틱 하락(파란색 음운: TEMA60 < TEMA120) 경유 확인 여부
+    peak_price_since_watch: float = 0.0 # IDLE 관찰 기간 최고가
 
 class ThemeGate60mStrategy:
     """
@@ -88,6 +92,93 @@ class ThemeGate60mStrategy:
         self.last_sell_time: float = 0.0
         self.position = PositionTracker()
         self.trade_history: List[TradeOrder] = []
+
+    def _update_idle_decline_phase(
+        self,
+        df_120t: Optional[pd.DataFrame],
+        df_120t_calc: pd.DataFrame,
+        tick_close: float
+    ) -> None:
+        """
+        조건검색 포착 즉시 매수('뜨자마자 매수')를 방지하고,
+        '하락(파란색 음운: TEMA60 < TEMA120) 이후 120틱 60-120 골든크로스' 발생 여부 추적.
+        """
+        if df_120t_calc is None or df_120t_calc.empty:
+            return
+
+        ts_list = None
+        if df_120t is not None and len(df_120t) == len(df_120t_calc):
+            if 'time' in df_120t.columns:
+                ts_list = df_120t['time'].astype(str).str[:19].tolist()
+            elif isinstance(df_120t.index, pd.DatetimeIndex):
+                ts_list = df_120t.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
+
+        if ts_list:
+            last_ts = ts_list[-1]
+            same_last_cnt = sum(1 for t in ts_list if t == last_ts)
+            cur_key = f"TS|{last_ts}|{same_last_cnt}"
+        else:
+            cur_key = f"IDX|{len(df_120t_calc)}"
+
+        last_row = df_120t_calc.iloc[-1]
+        cur_yellow = bool(last_row.get('is_yellow_cloud', False))
+        t60_val = float(last_row.get('tema60', np.nan))
+        t120_val = float(last_row.get('tema120', np.nan))
+        cur_clear_blue = (not cur_yellow) and (
+            np.isnan(t60_val) or np.isnan(t120_val) or t120_val <= 0 or t60_val < t120_val * 0.9998
+        )
+
+        if not self.position.watch_initialized:
+            self.position.watch_initialized = True
+            self.position.watch_start_bar_key = cur_key
+            self.position.peak_price_since_watch = tick_close
+            # 포착 시점에 이미 파란색 음운(60<120 하락 구간) 중이면 하락 상태 확인 완료 → 향후 60-120 GC 대기
+            # 반면 이미 노란색 양운(60>=120 급등 중)으로 포착됐다면 False로 시작 → 반드시 하락(음운) 경유 후 재돌파 대기
+            self.position.saw_decline_phase = bool(cur_clear_blue)
+            return
+
+        if tick_close > self.position.peak_price_since_watch:
+            self.position.peak_price_since_watch = tick_close
+
+        if cur_clear_blue:
+            self.position.saw_decline_phase = True
+            return
+
+        if self.position.saw_decline_phase:
+            return
+
+        # 30초 폴링 사이클 사이에 잠깐 파란색 음운으로 하락했다가 반등한 경우까지 타임스탬프 기준으로 누락 없이 포착
+        start_key = str(self.position.watch_start_bar_key or "")
+        if ts_list and start_key.startswith("TS|"):
+            parts = start_key.split("|")
+            if len(parts) == 3:
+                start_ts = parts[1]
+                start_cnt = int(parts[2])
+                seen_same = 0
+                after_indices = []
+                for idx_pos, t_str in enumerate(ts_list):
+                    if t_str > start_ts:
+                        after_indices.append(idx_pos)
+                    elif t_str == start_ts:
+                        seen_same += 1
+                        if seen_same > start_cnt:
+                            after_indices.append(idx_pos)
+                if after_indices:
+                    post_df = df_120t_calc.iloc[after_indices]
+                    blue_mask = ~post_df['is_yellow_cloud'].astype(bool)
+                    deep_blue = (post_df['tema60'] < post_df['tema120'] * 0.9995)
+                    if int(blue_mask.sum()) >= 2 or bool((blue_mask & deep_blue).any()):
+                        self.position.saw_decline_phase = True
+        elif start_key.startswith("IDX|"):
+            try:
+                start_len = int(start_key.split("|")[1])
+                if len(df_120t_calc) > start_len:
+                    post_df = df_120t_calc.iloc[-(len(df_120t_calc) - start_len):]
+                    blue_mask = ~post_df['is_yellow_cloud'].astype(bool)
+                    if bool(blue_mask.any()):
+                        self.position.saw_decline_phase = True
+            except Exception:
+                pass
         
     def evaluate_bar(
         self, 
@@ -165,6 +256,7 @@ class ThemeGate60mStrategy:
             is_daily_3_5_ok, daily_3_5_label = check_daily_ma3_5_eligible(df_daily, tick_close)
 
         has_120t_wave = False
+        df_120t_calc = None
         gate_120t = np.nan
         gate_high_120t = np.nan
         gijun_120t = np.nan
@@ -229,6 +321,10 @@ class ThemeGate60mStrategy:
         # 1. IDLE 상태: 1차 매수 (일봉 자격 / 교체 상승률<=20% 확인 후 120틱 60-120 GC + 관문선 진입)
         # ─────────────────────────────────────────────────────────────
         if self.position.state == StrategyState.IDLE:
+            # 🔍 조건검색 포착 즉시('뜨자마자') 매수 방지용 120틱 하락(파란색 음운) 추적
+            if has_120t_wave and df_120t_calc is not None:
+                self._update_idle_decline_phase(df_120t, df_120t_calc, tick_close)
+
             # ⏰ [14:30 이후 신규 매수 종료]
             if not allow_new_buys:
                 return None
@@ -255,20 +351,20 @@ class ThemeGate60mStrategy:
                     return None
                 qual_tag = f"[순환교체(등락률 {day_ret_pct:+.2f}%<=20%)] "
 
-            # ⚡ [2단계: 실제 매수 집행 = Option A]
-            #   - 타점 A-1: 120틱 테마 60-120 골든크로스 초입(파란색→노란색 전환 0~8봉) 즉시 1차 매수 (관문 +0.5% 이격 제한 해제)
-            #   - 타점 A-2: 노란 양운(60>=120) 유지 상태에서 흰색 테마급등관문선(-) 또는 +0.5% 이내 지지·돌파 1차 매수
-            if not has_120t_wave or is_tema60_120_dead:
+            # ⚡ [2단계: 실제 매수 집행 = 뜨자마자 즉시 매수 금지 + 하락후 120틱 60-120 골든크로스 발생 시에만 진입]
+            if not has_120t_wave or is_tema60_120_dead or not is_yellow_cloud_120t:
                 return None
 
-            has_tema60_120_gc = recent_tema60_120_gc or is_yellow_cloud_120t
-            if not has_tema60_120_gc:
+            require_post_decline_gc = bool(kwargs.get('require_post_decline_gc', True))
+            if require_post_decline_gc and not self.position.saw_decline_phase:
+                return None
+
+            is_fresh_gc = (not np.isnan(bars_since_gc) and bars_since_gc <= 8)
+            if not is_fresh_gc:
                 return None
 
             has_valid_gate = (not np.isnan(active_gate) and active_gate > 0)
             is_within_gate_120t = has_valid_gate and (tick_close <= active_gate * 1.005)
-
-            is_fresh_gc = (not np.isnan(bars_since_gc) and bars_since_gc <= 8) or recent_tema60_120_gc
             gc_ref_price = tema60_120_gc_price if (not np.isnan(tema60_120_gc_price) and tema60_120_gc_price > 0) else tick_close
             is_short_momentum_ok = (np.isnan(t5) or np.isnan(t20) or t5 >= t20 * 0.998)
             is_gc_onset_entry = (
@@ -281,7 +377,7 @@ class ThemeGate60mStrategy:
                 and (upper_shadow_ratio_120t <= 0.65)
             )
 
-            is_gate_entry = is_gc_onset_entry or (is_within_gate_120t and day_ret_pct <= 22.0)
+            is_gate_entry = is_gc_onset_entry
 
             if is_gate_entry:
                 buy_price = tick_close
