@@ -538,8 +538,9 @@ class SafeHoldingsThemeGateBot:
         if price > 0:
             self._live_tick_prices[code] = {'price': price, 'ts': time.time()}
 
+        is_big_buy_hit = (amt >= self.big_order_tracker.threshold_won) and is_buy
         streak = self.big_order_tracker.on_tick(code, price, qty, is_buy_tick=is_buy, chegyul_gangdo=gangdo)
-        if streak >= 2:
+        if is_big_buy_hit and streak >= 2:
             name = self.get_stock_name(code)
             logger.info(
                 f"🔥 [세력 3,000만+ 연속 체결 {streak}연타 포착!] [{name}({code})] "
@@ -912,11 +913,15 @@ class SafeHoldingsThemeGateBot:
                     if df_120t is not None and not df_120t.empty and len(df_120t) >= 10:
                         return df_120t
                 elif hasattr(self.api, 'real_client') and hasattr(self.api.real_client, 'get_tick_data'):
-                    raw = self.api.real_client.get_tick_data(code, tick_unit="120", limit=300)
+                    raw = self.api.real_client.get_tick_data(code, tick_unit="120", limit=1200)
                     if raw:
                         df_raw = pd.DataFrame(raw)
                         df_raw.columns = [c.lower() for c in df_raw.columns]
-                        return df_raw.iloc[::-1].reset_index(drop=True)
+                        if 'time' in df_raw.columns:
+                            t_parsed = pd.to_datetime(df_raw['time'], errors='coerce')
+                            if not t_parsed.is_monotonic_increasing and t_parsed.is_monotonic_decreasing:
+                                df_raw = df_raw.iloc[::-1]
+                        return df_raw.reset_index(drop=True)
             except Exception as e:
                 logger.debug(f"120틱 데이터 조회 에러 ({code}): {e}")
         return pd.DataFrame()
@@ -1501,8 +1506,8 @@ class SafeHoldingsThemeGateBot:
                 last_120 = df_120t_calc.iloc[-1]
                 is_yellow_cloud = bool(last_120.get('is_yellow_cloud', False))
                 is_sma_bull = bool(last_120.get('is_sma40_60_bull', False))
-                tema_gc_recent = bool(df_120t_calc['is_tema60_120_gc'].tail(5).any()) if 'is_tema60_120_gc' in df_120t_calc else False
-                sma_gc_recent = bool(df_120t_calc['is_sma40_60_gc'].tail(5).any()) if 'is_sma40_60_gc' in df_120t_calc else False
+                tema_gc_recent = bool(df_120t_calc['is_tema60_120_gc'].tail(8).any()) if 'is_tema60_120_gc' in df_120t_calc else False
+                sma_gc_recent = bool(df_120t_calc['is_sma40_60_gc'].tail(8).any()) if 'is_sma40_60_gc' in df_120t_calc else False
 
                 if (tema_gc_recent or is_yellow_cloud) and (sma_gc_recent or is_sma_bull):
                     score_120t = 10.0  # 듀얼 크로스 완성/동시 돌파 (최고점)
@@ -1882,7 +1887,9 @@ class SafeHoldingsThemeGateBot:
                             l120 = df120_view.iloc[-1]
                             g120 = float(l120.get('theme_gate', np.nan))
                             yc120 = bool(l120.get('is_yellow_cloud', False))
-                            cloud_tag = "양운(60>=120)" if yc120 else "음운(60<120)"
+                            bs_gc = float(l120.get('bars_since_tema60_120_gc', np.nan))
+                            gc_badge = f"[GC초입 {int(bs_gc)}봉]" if (yc120 and not np.isnan(bs_gc) and bs_gc <= 8) else ""
+                            cloud_tag = f"양운(60>=120){gc_badge}" if yc120 else "음운(60<120)"
                             if not np.isnan(g120) and g120 > 0:
                                 g120_diff = ((tick_close - g120) / g120) * 100.0
                                 gate_120_str = f"{cloud_tag} 관문 {g120:,.0f}({g120_diff:+.2f}%)"

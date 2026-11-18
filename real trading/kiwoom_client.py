@@ -2,6 +2,7 @@ import sys
 import io
 import os
 import time
+import threading
 import logging
 from datetime import datetime
 
@@ -75,6 +76,8 @@ class KiwoomRealClient:
         self.order_api = Order(base_url=self.base_url, token_manager=self.token_manager)
         self.rank_api = RankInfo(base_url=self.base_url, token_manager=self.token_manager)
         self.stock_info_api = StockInfo(base_url=self.base_url, token_manager=self.token_manager)
+        self._tick_cache_lock = threading.Lock()
+        self._tick_cache = {}
 
         # 💡 [Patch] kiwoom_rest_api 라이브러리가 acnt_no를 누락하는 문제를 해결하기 위해
         # 계좌 관련 및 주문 API의 _execute_request에 config.KIWOOM_ACCOUNT_NUM을 강제 주입
@@ -531,61 +534,263 @@ class KiwoomRealClient:
         """주식 종목의 30분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="30", last_n_days=last_n_days)
 
+    def _extract_tick_cont_headers(self, result: dict) -> tuple:
+        """kiwoom_rest_api 응답 dict 또는 API 인스턴스에서 연속조회(cont-yn, next-key) 추출"""
+        cont_yn = "N"
+        next_key = ""
+        sources = []
+        if isinstance(result, dict):
+            sources.append(result)
+            for key in ("headers", "_headers", "response_headers"):
+                if isinstance(result.get(key), dict):
+                    sources.append(result.get(key))
+        for attr in ("last_response_headers", "response_headers", "last_headers"):
+            hdr = getattr(self.chart_api, attr, None)
+            if isinstance(hdr, dict):
+                sources.append(hdr)
+        last_resp = getattr(self.chart_api, "last_response", None)
+        if last_resp is not None and hasattr(last_resp, "headers"):
+            sources.append(dict(last_resp.headers))
+
+        for src in sources:
+            c = str(src.get("cont-yn") or src.get("cont_yn") or "").strip().upper()
+            n = str(src.get("next-key") or src.get("next_key") or "").strip()
+            if c in ("Y", "N") and (n or c == "Y"):
+                cont_yn = c
+                next_key = n
+                break
+        return cont_yn, next_key
+
+    def _get_bearer_token(self) -> str:
+        """TokenManager에서 Bearer 토큰 문자열 안전 추출"""
+        tm = getattr(self, "token_manager", None)
+        if tm is None:
+            return ""
+        for attr in ("get_token", "get_access_token", "access_token", "token", "_token"):
+            val = getattr(tm, attr, None)
+            try:
+                tok = val() if callable(val) else val
+                if isinstance(tok, str) and tok.strip():
+                    return tok.strip()
+            except Exception:
+                continue
+        return ""
+
+    def _fetch_tick_page_http(self, data_code: str, tick_unit: str, cont_yn: str = "N", next_key: str = "") -> tuple:
+        """ka10079 연속조회 HTTP 헤더(cont-yn, next-key) 직접 확보용 보조 호출"""
+        tok = self._get_bearer_token()
+        if not tok:
+            return {}, "N", ""
+        try:
+            import httpx
+            _enforce_kiwoom_rate_limit(is_account=False)
+            resource_url = getattr(self.chart_api, "resource_url", "/api/dostk/chart")
+            if not str(resource_url).startswith("/"):
+                resource_url = "/" + str(resource_url)
+            url = f"{self.base_url}{resource_url}"
+            req_headers = {
+                "Content-Type": "application/json;charset=UTF-8",
+                "authorization": f"Bearer {tok}",
+                "cont-yn": cont_yn,
+                "next-key": next_key,
+                "api-id": "ka10079",
+            }
+            payload = {
+                "stk_cd": data_code,
+                "tic_scope": str(tick_unit),
+                "upd_stkpc_tp": "1",
+            }
+            resp = httpx.post(url, headers=req_headers, json=payload, timeout=10.0)
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            res_cont = str(resp.headers.get("cont-yn", "N")).strip().upper()
+            res_next = str(resp.headers.get("next-key", "")).strip()
+            return data, res_cont, res_next
+        except Exception as http_err:
+            logger.debug(f"ka10079 direct HTTP continuation failed ({data_code}): {http_err}")
+            return {}, "N", ""
+
+    @staticmethod
+    def _parse_raw_tick_candles(raw_candles: list) -> list:
+        """
+        키움 최신순(raw_candles[0]=최신) 틱 차트 응답을 과거→현재 오름차순으로 정렬.
+        동일 초(HHMMSS) 내 복수 120틱 봉은 raw 역인덱스(-idx)로 원래 생성 순서를 100% 보존합니다.
+        """
+        parsed_with_idx = []
+        for raw_idx, item in enumerate(raw_candles):
+            raw_time = str(item.get("cntr_tm", item.get("dt", ""))).strip()
+            if len(raw_time) < 14:
+                continue
+            dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
+            try:
+                close_prc = abs(float(item.get("cur_prc", 0.0)))
+                open_prc = abs(float(item.get("open_pric", 0.0)))
+                high_prc = abs(float(item.get("high_pric", 0.0)))
+                low_prc = abs(float(item.get("low_pric", 0.0)))
+                volume = int(item.get("trde_qty", 0))
+            except (ValueError, TypeError):
+                continue
+
+            parsed_with_idx.append({
+                "time": dt_str,
+                "open": open_prc,
+                "high": high_prc,
+                "low": low_prc,
+                "close": close_prc,
+                "volume": volume,
+                "_raw_idx": raw_idx,
+            })
+
+        parsed_with_idx.sort(key=lambda x: (x["time"], -x["_raw_idx"]))
+        for candle in parsed_with_idx:
+            candle.pop("_raw_idx", None)
+        return parsed_with_idx
+
+    @staticmethod
+    def _merge_tick_cache(cached_bars: list, fresh_bars: list, max_keep: int = 2000) -> list:
+        """기존 장기 캐시 120틱 봉과 최신 1페이지 120틱 봉을 동일 초 중복·순서 뒤바뀜 없이 무결점 병합"""
+        if not cached_bars:
+            return list(fresh_bars[-max_keep:])
+        if not fresh_bars:
+            return list(cached_bars[-max_keep:])
+
+        t0 = fresh_bars[0]["time"]
+        t_clean = None
+        for b in fresh_bars:
+            if b["time"] > t0:
+                t_clean = b["time"]
+                break
+
+        if t_clean is not None and cached_bars[-1]["time"] >= t_clean:
+            prefix = [b for b in cached_bars if b["time"] < t_clean]
+            suffix = [b for b in fresh_bars if b["time"] >= t_clean]
+            merged = prefix + suffix
+            return merged[-max_keep:]
+
+        # 전체 구간이 동일 초이거나 캐시와 연속 구간이 겹치지 않으면 최신 조회분 우선 사용
+        return list(fresh_bars[-max_keep:])
+
     def get_tick_data(self, stock_code: str, tick_unit: str = "120", limit: int = 100) -> list:
         """
-        주식 종목의 틱 차트 데이터를 조회합니다. (TR: opt10079 호환 REST API 엔드포인트 사용)
+        주식 종목의 틱 차트 데이터를 조회합니다. (TR: ka10079 연속조회 및 장기 메모리 캐시 지원)
         :param stock_code: 종목코드 (6자리)
         :param tick_unit: 틱 단위 (기본: "120")
-        :param limit: 가져올 최대 틱 데이터 수 (기본 100)
+        :param limit: 가져올 최대 틱 데이터 수 (기본 100, TEMA120 수렴용 1200 권장)
         :return: 과거순(오름차순) 정렬된 틱 데이터 딕셔너리 리스트
         """
         data_code = self._get_data_code(stock_code)
-        logger.info(f"Fetching {tick_unit}-tick data for stock code {data_code}...")
+        tick_key = str(tick_unit)
+        cache_key = (data_code, tick_key)
+        target_limit = max(1, int(limit))
+        now_ts = time.time()
+
+        with self._tick_cache_lock:
+            cached_entry = self._tick_cache.get(cache_key)
+            cached_bars = list(cached_entry["candles"]) if cached_entry else []
+            cache_age = (now_ts - cached_entry["last_ts"]) if cached_entry else 9999.0
+            cached_target = cached_entry.get("target_limit", 0) if cached_entry else 0
+
+        # 1.5초 이내 동일 종목·유닛 재조회는 즉시 캐시 반환
+        if cached_bars and cache_age <= 1.5 and (len(cached_bars) >= target_limit or cached_target >= target_limit):
+            return [dict(c) for c in cached_bars[-target_limit:]]
+
+        warm_threshold = max(400, int(target_limit * 0.7))
+        has_warm_cache = (len(cached_bars) >= warm_threshold)
+        max_pages = 1 if has_warm_cache else max(1, min(4, (target_limit + 499) // 500))
+
+        logger.info(f"Fetching {tick_unit}-tick data for stock code {data_code} (target={target_limit}, pages<= {max_pages})...")
         try:
-            result = self.chart_api.stock_tick_chart_request_ka10079(
-                stk_cd=data_code,
-                tic_scope=tick_unit,
-                upd_stkpc_tp="1"
-            )
-            
-            if not result:
-                return []
-                
-            raw_candles = result.get("stk_tic_chart_qry") or result.get("stk_dt_pole_chart_qry") or []
-            if not raw_candles:
-                return []
-                
-            parsed_candles = []
-            for item in raw_candles[:limit]:
-                raw_time = item.get("cntr_tm", item.get("dt", "")).strip()
-                if len(raw_time) < 14:
-                    continue
-                # dt 형식: YYYYMMDDHHMMSS
-                dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
-                
-                try:
-                    close_prc = abs(float(item.get("cur_prc", 0.0)))
-                    open_prc = abs(float(item.get("open_pric", 0.0)))
-                    high_prc = abs(float(item.get("high_pric", 0.0)))
-                    low_prc = abs(float(item.get("low_pric", 0.0)))
-                    volume = int(item.get("trde_qty", 0))
-                except (ValueError, TypeError):
-                    continue
-                    
-                parsed_candles.append({
-                    "time": dt_str,
-                    "open": open_prc,
-                    "high": high_prc,
-                    "low": low_prc,
-                    "close": close_prc,
-                    "volume": volume
-                })
-                
-            parsed_candles.sort(key=lambda x: x["time"])
-            return parsed_candles
+            all_raw = []
+            cont_yn = "N"
+            next_key = ""
+
+            for page_idx in range(max_pages):
+                use_direct_http = bool(getattr(self, "_tick_prefer_direct_http", False) and max_pages > 1)
+                if use_direct_http:
+                    result, res_cont, res_next = self._fetch_tick_page_http(
+                        data_code, tick_key, cont_yn=cont_yn, next_key=next_key
+                    )
+                    if not result:
+                        result = self.chart_api.stock_tick_chart_request_ka10079(
+                            stk_cd=data_code,
+                            tic_scope=tick_key,
+                            upd_stkpc_tp="1",
+                            cont_yn=cont_yn,
+                            next_key=next_key,
+                        )
+                        res_cont, res_next = self._extract_tick_cont_headers(result)
+                else:
+                    result = self.chart_api.stock_tick_chart_request_ka10079(
+                        stk_cd=data_code,
+                        tic_scope=tick_key,
+                        upd_stkpc_tp="1",
+                        cont_yn=cont_yn,
+                        next_key=next_key,
+                    )
+                    res_cont, res_next = self._extract_tick_cont_headers(result)
+
+                    # chart_api가 HTTP 연속키 헤더를 숨긴 경우 1회 직접 HTTP로 전환해 page1부터 연속조회 수행
+                    if (
+                        page_idx == 0
+                        and max_pages > 1
+                        and res_cont != "Y"
+                        and isinstance(result, dict)
+                    ):
+                        first_raw = result.get("stk_tic_chart_qry") or result.get("stk_dt_pole_chart_qry") or []
+                        if 0 < len(first_raw) < target_limit and self._get_bearer_token():
+                            http_res, h_cont, h_next = self._fetch_tick_page_http(
+                                data_code, tick_key, cont_yn="N", next_key=""
+                            )
+                            if http_res:
+                                self._tick_prefer_direct_http = True
+                                result, res_cont, res_next = http_res, h_cont, h_next
+
+                if not result:
+                    break
+
+                raw_candles = result.get("stk_tic_chart_qry") or result.get("stk_dt_pole_chart_qry") or []
+                if not raw_candles:
+                    break
+
+                # 페이지 경계 1봉 중복 제거
+                if all_raw and raw_candles:
+                    prev_last = all_raw[-1]
+                    curr_first = raw_candles[0]
+                    if (
+                        prev_last.get("cntr_tm") == curr_first.get("cntr_tm")
+                        and prev_last.get("cur_prc") == curr_first.get("cur_prc")
+                        and prev_last.get("trde_qty") == curr_first.get("trde_qty")
+                    ):
+                        raw_candles = raw_candles[1:]
+
+                all_raw.extend(raw_candles)
+                if len(all_raw) >= target_limit:
+                    break
+                if res_cont != "Y" or not res_next:
+                    break
+                cont_yn = "Y"
+                next_key = res_next
+
+            if not all_raw:
+                return [dict(c) for c in cached_bars[-target_limit:]] if cached_bars else []
+
+            fresh_sorted = self._parse_raw_tick_candles(all_raw)
+            if has_warm_cache:
+                merged = self._merge_tick_cache(cached_bars, fresh_sorted, max_keep=max(2000, target_limit))
+            else:
+                merged = fresh_sorted[-max(2000, target_limit):]
+
+            with self._tick_cache_lock:
+                self._tick_cache[cache_key] = {
+                    "candles": merged,
+                    "last_ts": time.time(),
+                    "target_limit": max(cached_target, target_limit),
+                }
+
+            return [dict(c) for c in merged[-target_limit:]]
         except Exception as e:
             logger.error(f"Error fetching tick data for {stock_code}: {e}")
-            return []
+            return [dict(c) for c in cached_bars[-target_limit:]] if cached_bars else []
 
 
     def get_daily_candles(self, stock_code: str, last_n_days: int = 200) -> list:

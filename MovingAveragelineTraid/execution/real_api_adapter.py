@@ -158,7 +158,7 @@ class RealAPIAdapter:
             return pd.DataFrame()
 
     def _convert_raw_candles_to_df(self, raw_candles: list, stock_code: str, label: str) -> pd.DataFrame:
-        """분봉 데이터(dict 리스트)를 DataFrame으로 변환하는 공통 메서드"""
+        """분봉·틱·일봉 데이터(dict 리스트)를 과거→현재 오름차순 DataFrame으로 변환하는 공통 메서드"""
         try:
             if not raw_candles:
                 return pd.DataFrame()
@@ -166,13 +166,28 @@ class RealAPIAdapter:
             df = pd.DataFrame(raw_candles)
             df.columns = [col.lower() for col in df.columns]
 
-            # 최신순(미래->과거) → 과거->현재 순으로 뒤집기
-            df = df.iloc[::-1].reset_index(drop=True)
-
             if 'time' in df.columns:
                 df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                df = df.dropna(subset=['time']).reset_index(drop=True)
+                if df.empty:
+                    return pd.DataFrame()
+
+                # 이미 과거→현재 오름차순이면 절대 뒤집거나 재정렬하지 않음 (동일 초 120틱 순서 100% 보존)
+                if not df['time'].is_monotonic_increasing:
+                    if df['time'].is_monotonic_decreasing:
+                        df = df.iloc[::-1].reset_index(drop=True)
+                    else:
+                        df = df.sort_values('time', kind='mergesort').reset_index(drop=True)
                 df.set_index('time', inplace=True)
-                df.sort_index(inplace=True)
+            elif 'date' in df.columns:
+                d_parsed = pd.to_datetime(df['date'], errors='coerce')
+                if d_parsed.notna().all() and not d_parsed.is_monotonic_increasing:
+                    if d_parsed.is_monotonic_decreasing:
+                        df = df.iloc[::-1].reset_index(drop=True)
+                    else:
+                        df = df.assign(_d_sort=d_parsed).sort_values('_d_sort', kind='mergesort').drop(columns=['_d_sort']).reset_index(drop=True)
+            else:
+                df = df.iloc[::-1].reset_index(drop=True)
 
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 if col in df.columns:
@@ -308,10 +323,10 @@ class RealAPIAdapter:
         return 0.0
 
     def get_120t_candles(self, stock_code: str) -> pd.DataFrame:
-        """실전 120틱 데이터를 가져와서 Pandas DataFrame으로 변환"""
+        """실전 120틱 데이터를 가져와서 Pandas DataFrame으로 변환 (TEMA120 장기 수렴용 1200봉 확보)"""
         try:
-            # 120틱 데이터는 봉 개수가 많이 필요하므로 limit를 넉넉히(500) 요청합니다.
-            raw_candles = self.real_client.get_tick_data(stock_code, tick_unit="120", limit=500)
+            # TEMA(120) 3중 EMA 정합성을 위해 연속조회 포함 1200봉 요청
+            raw_candles = self.real_client.get_tick_data(stock_code, tick_unit="120", limit=1200)
             return self._convert_raw_candles_to_df(raw_candles, stock_code, "120틱")
         except Exception as e:
             logger.error(f"120틱 데이터 조회 에러 ({stock_code}): {e}")
