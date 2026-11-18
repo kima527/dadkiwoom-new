@@ -1179,6 +1179,194 @@ class SafeHoldingsThemeGateBot:
                 return code
         return None
 
+    @staticmethod
+    def _extract_today_rows(df: Optional[pd.DataFrame], today_str: str) -> pd.DataFrame:
+        """일중 분봉/120틱 DataFrame에서 당일(today_str: YYYYMMDD) 행만 안전하게 추출합니다."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        try:
+            if isinstance(df.index, pd.DatetimeIndex):
+                mask = df.index.strftime('%Y%m%d') == today_str
+                return df.loc[mask]
+            for col in ('date', 'time', 'dt', 'cntr_tm'):
+                if col in df.columns:
+                    norm = (
+                        df[col].astype(str)
+                        .str.replace('-', '', regex=False)
+                        .str.replace('/', '', regex=False)
+                        .str.strip()
+                        .str[:8]
+                    )
+                    return df.loc[norm == today_str]
+            if not isinstance(df.index, pd.RangeIndex):
+                idx_norm = (
+                    df.index.astype(str)
+                    .str.replace('-', '', regex=False)
+                    .str.replace('/', '', regex=False)
+                    .str.strip()
+                    .str[:8]
+                )
+                return df.loc[idx_norm == today_str]
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    def _compute_liquidity_metrics(
+        self,
+        tick_close: float,
+        df_daily: Optional[pd.DataFrame] = None,
+        df_60m: Optional[pd.DataFrame] = None,
+        df_120t: Optional[pd.DataFrame] = None,
+        today_str: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """당일 거래량/거래대금(억원), 전일 거래대금(억원), 당일 120틱 형성 봉수를 산출합니다. (NXT 0원 일봉 보정 포함)"""
+        today_str = (today_str or datetime.now().strftime('%Y%m%d')).replace('-', '').replace('/', '').strip()[:8]
+
+        def _safe_float(val: Any, default: float = 0.0) -> float:
+            try:
+                f = float(val)
+                return f if np.isfinite(f) else default
+            except (TypeError, ValueError):
+                return default
+
+        def _row_date_str(row: pd.Series, idx_val: Any = None) -> str:
+            raw = row.get('date', '') if hasattr(row, 'get') else ''
+            s = str(raw).replace('-', '').replace('/', '').strip()[:8]
+            if not s and idx_val is not None:
+                s = str(idx_val).replace('-', '').replace('/', '').strip()[:8]
+            return s
+
+        vol_daily_today = 0.0
+        val_daily_today = 0.0
+        prev_day_vol = 0.0
+        prev_day_val_eok = 0.0
+        day_open_p = 0.0
+        has_today_daily = False
+
+        if df_daily is not None and not df_daily.empty:
+            last_daily = df_daily.iloc[-1]
+            last_daily_dt = _row_date_str(last_daily, df_daily.index[-1])
+            has_today_daily = (last_daily_dt == today_str)
+
+            if has_today_daily:
+                vol_daily_today = _safe_float(last_daily.get('volume', 0.0))
+                raw_tv = _safe_float(last_daily.get('trading_value', 0.0))
+                if raw_tv > 0:
+                    val_daily_today = raw_tv
+                elif vol_daily_today > 0:
+                    val_daily_today = vol_daily_today * _safe_float(last_daily.get('close', tick_close), tick_close)
+                day_open_p = _safe_float(last_daily.get('open', 0.0))
+                prev_row = df_daily.iloc[-2] if len(df_daily) >= 2 else None
+            else:
+                prev_row = last_daily
+
+            if prev_row is not None:
+                prev_close = _safe_float(prev_row.get('close', 0.0))
+                prev_day_vol = _safe_float(prev_row.get('volume', 0.0))
+                raw_prev_tv = _safe_float(prev_row.get('trading_value', 0.0))
+                if raw_prev_tv > 0:
+                    prev_day_val_eok = raw_prev_tv / 100_000_000.0
+                elif prev_close > 0 and prev_day_vol > 0:
+                    prev_day_val_eok = (prev_day_vol * prev_close) / 100_000_000.0
+
+        def _sum_intraday(df: Optional[pd.DataFrame]) -> Tuple[float, float, int, float]:
+            today_df = self._extract_today_rows(df, today_str)
+            if today_df.empty:
+                return 0.0, 0.0, 0, 0.0
+            vols = pd.to_numeric(today_df['volume'], errors='coerce').fillna(0.0) if 'volume' in today_df else pd.Series(0.0, index=today_df.index)
+            closes = pd.to_numeric(today_df['close'], errors='coerce').fillna(_safe_float(tick_close)) if 'close' in today_df else pd.Series(_safe_float(tick_close), index=today_df.index)
+            first_open = _safe_float(today_df.iloc[0].get('open', 0.0)) if 'open' in today_df else 0.0
+            return float(vols.sum()), float((vols * closes).sum()), int(len(today_df)), first_open
+
+        vol_60m_today, val_60m_today, bars_60m_today, open_60m_today = _sum_intraday(df_60m)
+        vol_120t_today, val_120t_today, t120_today_bars, _ = _sum_intraday(df_120t)
+
+        if day_open_p <= 0 and open_60m_today > 0:
+            day_open_p = open_60m_today
+
+        # NXT 프리마켓(08:00~08:50)에는 일봉 volume이 0이므로 60분봉/120틱 당일 합산치로 자동 보정
+        today_vol = max(vol_daily_today, vol_60m_today, vol_120t_today)
+        today_val_won = max(val_daily_today, val_60m_today, val_120t_today)
+        if today_val_won <= 0 and today_vol > 0:
+            today_val_won = today_vol * float(tick_close or 0.0)
+        today_val_eok = today_val_won / 100_000_000.0
+
+        return {
+            'today_str': today_str,
+            'has_today_daily': has_today_daily,
+            'day_open_p': day_open_p,
+            'today_vol': today_vol,
+            'today_val_eok': today_val_eok,
+            'prev_day_vol': prev_day_vol,
+            'prev_day_val_eok': prev_day_val_eok,
+            'bars_60m_today': bars_60m_today,
+            't120_today_bars': t120_today_bars,
+        }
+
+    def evaluate_liquidity_activity(
+        self,
+        tick_close: float,
+        df_daily: Optional[pd.DataFrame] = None,
+        df_60m: Optional[pd.DataFrame] = None,
+        df_120t: Optional[pd.DataFrame] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+        now_t: Optional[dtime] = None,
+        today_str: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """
+        💧 [실시간 유동성·거래대금 및 120틱 체결 활성도 게이트]
+        당일 실제 체결량·거래대금이 미미해 120틱 지표가 전일 봉에 멈춰있는 초저유동성 종목이
+        1/1 회전 슬롯을 선점하여 조건중복 대장주 진입을 막는 현상을 차단합니다.
+        """
+        m = metrics or self._compute_liquidity_metrics(
+            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, today_str=today_str
+        )
+        cur_t = now_t or datetime.now().time()
+        today_val_eok = float(m['today_val_eok'])
+        prev_val_eok = float(m['prev_day_val_eok'])
+        t120_bars = int(m['t120_today_bars'])
+
+        is_premarket = cur_t < dtime(9, 0, 0)
+        is_early_nxt = dtime(8, 0, 0) <= cur_t < dtime(8, 3, 0)
+        is_early_krx = dtime(9, 0, 0) <= cur_t < dtime(9, 3, 0)
+
+        min_t120_active = 3
+        min_today_val_active = 3.0 if is_premarket else 10.0
+
+        # 장초반 3분 내더라도 이미 활성 세션 유동성(거래대금·120틱 봉수)을 돌파한 주도주는 즉시 허용
+        if (
+            t120_bars >= min_t120_active
+            and today_val_eok >= min_today_val_active
+            and (prev_val_eok >= 10.0 or today_val_eok >= 10.0)
+        ):
+            return True, f"당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / 120t {t120_bars}봉"
+
+        if is_early_nxt or is_early_krx:
+            min_val_early = 0.5 if is_early_nxt else 2.0
+            min_prev_early = 50.0
+            reasons = []
+            if t120_bars < 1:
+                reasons.append(f"당일 120틱 {t120_bars}봉 < 1봉")
+            if today_val_eok < min_val_early:
+                reasons.append(f"금일거래대금 {today_val_eok:.2f}억 < {min_val_early:.1f}억")
+            if prev_val_eok < min_prev_early:
+                reasons.append(f"장초반 전일거래대금 {prev_val_eok:.1f}억 < {min_prev_early:.0f}억")
+            if reasons:
+                return False, " | ".join(reasons)
+            return True, f"장초반 유동성 충족 (당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / 120t {t120_bars}봉)"
+
+        reasons = []
+        if t120_bars < min_t120_active:
+            reasons.append(f"당일 120틱 형성 {t120_bars}봉 < {min_t120_active}봉(체결 부재)")
+        if today_val_eok < min_today_val_active:
+            reasons.append(f"금일거래대금 {today_val_eok:.2f}억 < {min_today_val_active:.0f}억")
+        if prev_val_eok < 10.0 and today_val_eok < 10.0:
+            reasons.append(f"전일({prev_val_eok:.1f}억)·금일({today_val_eok:.2f}억) 모두 10억 미만 초소형주")
+
+        if reasons:
+            return False, " | ".join(reasons)
+        return True, f"당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / 120t {t120_bars}봉"
+
     def calculate_priority_score(
         self,
         code: str,
@@ -1191,30 +1379,17 @@ class SafeHoldingsThemeGateBot:
         df_daily: Optional[pd.DataFrame] = None,
         vol_ratio_prev: Optional[float] = None,
         session_target_vol: Optional[float] = None,
-        df_120t: Optional[pd.DataFrame] = None
+        df_120t: Optional[pd.DataFrame] = None,
+        today_str: Optional[str] = None
     ) -> Tuple[float, Dict[str, Any]]:
         """
-        ⚡ [세션별 차등 번개 돌파 스나이핑 1위 선정 체계 - 100.0점 만점 정규화]
-        1. 🥇 세션별 전일 거래량 돌파 속도 및 잠식률 (40점 만점, 최우선 엔진!)
-           - 🎯 세션별 기준치: [NXT 프리마켓: 1.5%] / [KRX 정규장: 3.0%] / [NXT 애프터마켓: 1.0%]
-           - 목표치 대비 달성률(attainment_ratio = vol_ratio_prev / target_vol):
-             * 달성률 >= 1.5배 (정규장 4.5%+, 프리 2.25%+, 애프터 1.5%+): 40점 만점!
-             * 달성률 >= 1.0배 (정규장 3.0%+, 프리 1.5%+, 애프터 1.0%+): 35점 (목표 돌파 완료)
-             * 달성률 >= 0.7배: 25점
-             * 달성률 >= 0.4배: 15점
-             * 달성률 < 0.4배: 5점
-        2. 🥈 시가 무훼손 양봉 순도 (20점 만점)
-           - 당일 시가(Open)를 단 1호가도 깨지 않고 지키는 강력한 붉은 양봉
-           - 시가 위 양봉 유지 (tick_close >= c_open) + 윗꼬리 25% 이하: 20점 만점
-           - 양봉 유지 + 윗꼬리 40% 이하: 15점
-           - 음봉 (tick_close < c_open): 0점 (시가 훼손 감점)
+        ⚡ [세션별 차등 번개 돌파 + 실제 거래대금 검증 1위 선정 체계 - 100.0점 정규화]
+        1. 🥇 세션별 전일 거래량 돌파 속도 및 실제 거래대금 상한 검증 (40점 만점)
+           - 금일 거래대금 3억 미만은 % 착시 방지를 위해 속도점수 0점, 10억 미만 15점 상한, 30억 미만 28점 상한
+        2. 🥈 시가 무훼손 양봉 순도 (20점 만점, 3억 미만 보합/1호가 캔들은 0점)
         3. 🥉 기준선(M선) 안착 이격도 (20점 만점)
-           - 시가 갭돌파든 장중 돌파든 기준선 위 +0.3% ~ +3.5% 최적 안착: 20점 만점
-           - 기준선 위 +3.5% ~ +7.0%: 15점
-           - 기준선 위 0.0% ~ +0.3%: 10점
-           - 기준선 대비 +12% 이상 과열: 4점 (추격 매수 방지)
-        4. ⚡ 120틱 WMA 20-40-60 순차돌파 가속도 (10점 만점)
-        5. 🔥 시초가 모멘텀 락온 (+1.5% 돌파, 10점 만점)
+        4. ⚡ 120틱 듀얼 골든크로스 (10점 만점)
+        5. 🔥 시초가 모멘텀 (+1.5%, 10점 만점) + 유동성 규모 가산점 (+0~+10점)
         """
         # 세션별 차등 목표 거래량 기준 설정 (프리 1.5%, 정규장 3.0%, 애프터 1.0%)
         if session_target_vol is not None and session_target_vol > 0:
@@ -1223,22 +1398,20 @@ class SafeHoldingsThemeGateBot:
         else:
             target_vol, target_name = get_session_volume_target()
 
-        # 1. 전일 거래량 돌파 속도 점수 (40점 만점)
-        today_str = datetime.now().strftime('%Y%m%d')
-        today_dash = datetime.now().strftime('%Y-%m-%d')
+        liq = self._compute_liquidity_metrics(
+            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, today_str=today_str
+        )
+        today_str = liq['today_str']
+        day_val_eok = liq['today_val_eok']
+        prev_day_val_eok = liq['prev_day_val_eok']
+        t120_today_bars = liq['t120_today_bars']
+
+        # 1. 전일 거래량 돌파 속도 점수 (40점 만점, 실제 거래대금 기반 상한 적용)
         last_daily_dt = str(last_daily.get('date', '')).replace('-', '').replace('/', '').strip()[:8]
         if vol_ratio_prev is None:
-            if last_daily_dt == today_str:
-                curr_vol = float(last_daily.get('volume', 0.0) or 0.0)
-            elif df_60m is not None and not df_60m.empty and isinstance(df_60m.index, pd.DatetimeIndex):
-                curr_vol = float(df_60m[df_60m.index.strftime('%Y-%m-%d') == today_dash]['volume'].sum())
-            else:
-                curr_vol = 0.0
-            if curr_vol <= 0 and last_daily_dt == today_str:
-                curr_vol = float(last_60m.get('volume', 0.0) or 0.0)
-            vol_ratio_prev, pre_day_vol = calculate_pred_volume_ratio(df_daily, curr_vol)
+            vol_ratio_prev, pre_day_vol = calculate_pred_volume_ratio(df_daily, liq['today_vol'])
         else:
-            pre_day_vol = 0.0
+            pre_day_vol = liq['prev_day_vol']
 
         attainment_ratio = (vol_ratio_prev / target_vol) if target_vol > 0 else 1.0
 
@@ -1253,8 +1426,16 @@ class SafeHoldingsThemeGateBot:
         else:
             score_speed = 5.0
 
+        # 극소 거래량 종목의 전일대비 % 착시 원천 차단
+        if day_val_eok < 3.0:
+            score_speed = 0.0
+        elif day_val_eok < 10.0:
+            score_speed = min(score_speed, 15.0)
+        elif day_val_eok < 30.0:
+            score_speed = min(score_speed, 28.0)
+
         # 2. 당일 시가·60분봉 양봉 순도 및 실시간 3일선(M/3) 안착 점수 (20점 만점)
-        day_open_p = float(last_daily.get('open', 0.0) or 0.0) if last_daily_dt == today_str else 0.0
+        day_open_p = liq['day_open_p']
         c_open = float(last_60m.get('open', tick_close))
         c_high = float(last_60m.get('high', tick_close))
         c_low = float(last_60m.get('low', tick_close))
@@ -1266,7 +1447,9 @@ class SafeHoldingsThemeGateBot:
         upper_shadow_ratio = upper_shadow / c_range
 
         is_day_yang = (day_open_p > 0 and tick_close >= day_open_p)
-        if is_day_yang and tick_close >= c_open and upper_shadow_ratio <= 0.25 and body_ratio >= 0.40:
+        if day_val_eok < 3.0 and c_body <= 0:
+            score_shape = 0.0
+        elif is_day_yang and tick_close >= c_open and upper_shadow_ratio <= 0.25 and body_ratio >= 0.40:
             score_shape = 20.0
         elif is_day_yang and tick_close >= c_open:
             score_shape = 16.0
@@ -1301,12 +1484,6 @@ class SafeHoldingsThemeGateBot:
             score_anchor = 4.0
         else:
             score_anchor = 6.0
-
-        # 참고 모니터링용 지표
-        day_val = float(last_daily.get('trading_value', 0.0)) if pd.notna(last_daily.get('trading_value')) else 0.0
-        if day_val <= 0:
-            day_val = float(last_daily.get('close', tick_close)) * float(last_daily.get('volume', 0.0))
-        day_val_eok = day_val / 100_000_000.0
 
         if pre_day_close is not None and pre_day_close > 0:
             pre_close = float(pre_day_close)
@@ -1363,7 +1540,23 @@ class SafeHoldingsThemeGateBot:
         elif b_streak == 1:
             score_big_streak = 5.0   # 1회 3천만+ 체결 포착
 
-        total_score = score_speed + score_shape + score_anchor + score_120t + score_morning + score_global + score_big_streak
+        # 8. 💧 실제 거래대금 규모 유동성 가산점 (+0.0 ~ +10.0점)
+        if day_val_eok >= 300.0:
+            score_liquidity = 10.0
+        elif day_val_eok >= 100.0:
+            score_liquidity = 7.0
+        elif day_val_eok >= 30.0:
+            score_liquidity = 4.0
+        elif day_val_eok >= 10.0:
+            score_liquidity = 2.0
+        else:
+            score_liquidity = 0.0
+
+        total_score = min(
+            100.0,
+            score_speed + score_shape + score_anchor + score_120t
+            + score_morning + score_global + score_big_streak + score_liquidity
+        )
         details = {
             'total_score': total_score,
             'vol_ratio_prev': vol_ratio_prev,
@@ -1380,11 +1573,14 @@ class SafeHoldingsThemeGateBot:
             'score_morning': score_morning,
             'score_global': score_global,
             'score_big_streak': score_big_streak,
+            'score_liquidity': score_liquidity,
             'big_order_streak': b_streak,
             'big_order_last_amt': streak_info.get('last_amt', 0.0),
             'score_candle': score_shape + score_anchor,
             'day_ret_pct': day_ret_pct,
-            'day_val_eok': day_val_eok
+            'day_val_eok': day_val_eok,
+            'prev_day_val_eok': prev_day_val_eok,
+            't120_today_bars': t120_today_bars,
         }
         return total_score, details
 
@@ -1695,9 +1891,19 @@ class SafeHoldingsThemeGateBot:
                     except Exception:
                         pass
 
+                liq_metrics = self._compute_liquidity_metrics(
+                    tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t
+                )
+                liq_tag = (
+                    f"거래: {liq_metrics['today_val_eok']:,.1f}억"
+                    f"(전일 {liq_metrics['prev_day_val_eok']:,.1f}억·120t {liq_metrics['t120_today_bars']}봉)"
+                    if need_120t
+                    else f"거래: {liq_metrics['today_val_eok']:,.1f}억(전일 {liq_metrics['prev_day_val_eok']:,.1f}억)"
+                )
+
                 logger.info(
                     f"📊 {source_badge}[{name}]{mkt_tag} 상태: {state_display}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f}({day_ret_pct:+.2f}%) | "
-                    f"자격: {qual_str} | 120틱: {gate_120_str} | 60분: {align_str} | {m3_str}"
+                    f"자격: {qual_str} | 120틱: {gate_120_str} | 60분: {align_str} | {m3_str} | {liq_tag}"
                 )
 
                 eff_qty = cur_qty if (self.is_real and not self.dry_run) else max(
@@ -1778,6 +1984,18 @@ class SafeHoldingsThemeGateBot:
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
 
+                        # 💧 [실시간 유동성·거래대금 및 120틱 체결 활성도 게이트]: 허수·초저유동성 종목 1/1 슬롯 진입 원천 차단
+                        is_liq_ok, liq_reason = self.evaluate_liquidity_activity(
+                            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, metrics=liq_metrics
+                        )
+                        if not is_liq_ok:
+                            logger.info(
+                                f"   🚫 [유동성·체결량 미달 차단] [{name}({code})] {liq_reason} "
+                                f"➔ 120틱·관문선 타점이 떠도 거래 미형성 종목 1/1 슬롯 점유 원천 차단"
+                            )
+                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
+                            continue
+
                         p_score, p_details = self.calculate_priority_score(
                             code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1, df_daily=df_daily, df_120t=df_120t
                         )
@@ -1853,7 +2071,14 @@ class SafeHoldingsThemeGateBot:
             else:
                 # 2. 봇 운용 슬롯이 비어있음 (0/1): 전략 타점을 통과한 후보 중 [우선순위 1위 단 1종목 즉시 2주 매수 집행]
                 # (장초반 거래량/점수 미성숙으로 인해 실제 매수 기회 자체를 차단하던 불필요한 45~50점 하드 커트라인 제거!)
-                buy_candidates.sort(key=lambda x: (x.get('cond_overlap', 0), x['priority_score']), reverse=True)
+                buy_candidates.sort(
+                    key=lambda x: (
+                        x.get('cond_overlap', 0),
+                        x['priority_score'],
+                        x['details'].get('day_val_eok', 0.0),
+                    ),
+                    reverse=True,
+                )
                 winner = buy_candidates[0]
                 w_code = winner['code']
                 w_name = winner['name']
@@ -1873,7 +2098,8 @@ class SafeHoldingsThemeGateBot:
                 logger.info(
                     f"👑 [1종목 순환매매 1위 매수 집행] [{w_name}({w_code})] [🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
                     f"점수 1위: {w_score:.1f}점 ({mode_tag}) ➔ {w_order.qty}주 1차 실전 매수 집행! "
-                    f"[⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}%, "
+                    f"[💧거래대금: {w_d.get('day_val_eok', 0.0):,.1f}억(120t {w_d.get('t120_today_bars', 0)}봉), "
+                    f"⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}%, "
                     f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
                     f"기준선안착: {w_d.get('gijun_diff_pct', 0.0):+.2f}%, 120틱WMA: {w_d.get('score_120t', 0.0):.0f}점{streak_tag}]"
                 )
