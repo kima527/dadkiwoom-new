@@ -283,7 +283,8 @@ class SafeHoldingsThemeGateBot:
         condition_name: str = "Traiding,traiding,Traiding1,trading1",
         enable_ws: bool = True,
         min_overlap: int = 2,
-        fixed_qty: int = 2
+        fixed_qty: int = 2,
+        min_cond_stay_sec: float = 30.0
     ):
         """
         is_real: 키움 실전 API 연동 여부
@@ -292,11 +293,13 @@ class SafeHoldingsThemeGateBot:
         enable_ws: 키움 실시간 조건검색 웹소켓 수신 데몬 활성화 여부
         min_overlap: 신규 매수 허용 최소 조건식 중복 포착 수 (기본 2 = 중복 4·3·2순 Top10 엄선)
         fixed_qty: 고정 매수 수량 (기본값: 2주, 계좌 예수금 조회 TR 생략)
+        min_cond_stay_sec: 조건식 최소 연속 체류 인증 시간(초, 기본 30초 — 1~5초 휩소 들락날락 차단)
         """
         self.dry_run = dry_run
         self.condition_name = condition_name
         self.fixed_qty = fixed_qty
-        # 조건식 중복 포착 집계: 4개 조건식 중복 4·3·2 순으로 나열하여 09:30 기준 Top10 엄선
+        self.min_cond_stay_sec = max(0.0, float(min_cond_stay_sec))
+        # 조건식 중복 포착 집계: 4개 조건식 체류 인증 중복 4·3·2 순으로 나열하여 09:30 기준 Top10 엄선
         self.condition_total = max(1, len({n.strip() for n in str(condition_name).split(',') if n.strip()}))
         self.min_overlap = max(1, min(int(min_overlap), self.condition_total))
         self.enable_ws = enable_ws and HAS_WS_CLIENT
@@ -385,8 +388,61 @@ class SafeHoldingsThemeGateBot:
             clean_code = clean_code.zfill(6)
         return clean_code
 
+    def _compute_cond_pick_metrics(self, pick: dict, now_ts: Optional[float] = None) -> dict:
+        """
+        종목의 조건식별 체류시간·인증중복(confirmed_overlap)·현재유지(active_overlap)·들락날락(churn_count) 동적 산출
+        - 연속 min_cond_stay_sec(기본 30초) 이상 또는 누적 1.5배(45초) 이상 유지된 조건만 인증(confirmed)
+        - 인증된 조건은 이후 주가 눌림(하락) 중 조건식을 일시 이탈('D')하더라도 confirmed_overlap 유지
+        """
+        cur_ts = float(now_ts if now_ts is not None else time.time())
+        min_stay = max(0.0, float(getattr(self, 'min_cond_stay_sec', 30.0)))
+        cum_stay_req = min_stay * 1.5
+        cond_stats = pick.get('cond_stats')
+
+        if not isinstance(cond_stats, dict):
+            ov = int(pick.get('overlap', len(pick.get('seen_conds', [])) or 0))
+            act = int(pick.get('active_overlap', ov))
+            return {
+                'confirmed_conds': list(pick.get('confirmed_conds', pick.get('seen_conds', []))),
+                'confirmed_overlap': ov,
+                'active_overlap': act,
+                'seen_overlap': len(pick.get('seen_conds', [])) or ov,
+                'total_stay_sec': float(pick.get('total_stay_sec', 0.0) or 0.0),
+                'churn_count': int(pick.get('churn_count', 0) or 0),
+                'durability_score': float(pick.get('durability_score', 0.0) or 0.0),
+            }
+
+        confirmed_conds = []
+        active_cnt = 0
+        total_stay = 0.0
+        total_churn = 0
+        for cname, st in cond_stats.items():
+            is_act = bool(st.get('is_active', False))
+            live_sec = max(0.0, cur_ts - float(st.get('active_since', cur_ts) or cur_ts)) if is_act else 0.0
+            accum_sec = float(st.get('accum_stay_sec', 0.0) or 0.0)
+            c_total = accum_sec + live_sec
+            is_conf = bool(st.get('confirmed', False)) or (live_sec >= min_stay) or (c_total >= cum_stay_req)
+            if is_act:
+                active_cnt += 1
+            if is_conf:
+                confirmed_conds.append(cname)
+            total_stay += c_total
+            total_churn += int(st.get('churn_count', 0) or 0)
+
+        confirmed_conds.sort()
+        durability = total_stay - (total_churn * 30.0)
+        return {
+            'confirmed_conds': confirmed_conds,
+            'confirmed_overlap': len(confirmed_conds),
+            'active_overlap': active_cnt,
+            'seen_overlap': len(cond_stats),
+            'total_stay_sec': total_stay,
+            'churn_count': total_churn,
+            'durability_score': durability,
+        }
+
     def _on_condition_insert(self, code: str, cond_name: str = ""):
-        """키움 실시간 조건검색(Traiding, traiding, Traiding1, trading1) 종목 편입 콜백 (09:30까지 수집 → 중복 4·3·2순 Top10 엄선)"""
+        """키움 실시간 조건검색(Traiding, traiding, Traiding1, trading1) 편입 콜백 (최소 체류시간 인증 기반 중복 4·3·2순 Top10)"""
         clean_code = self._normalize_stock_code(code)
         if not clean_code.isalnum() or len(clean_code) != 6 or clean_code == "000000":
             return
@@ -398,91 +454,191 @@ class SafeHoldingsThemeGateBot:
             return
 
         effective_cond = cond_name.strip() if cond_name and cond_name.strip() else "Traiding"
-        with self.condition_lock:
-            is_new = clean_code not in self.condition_picks
-            existing = self.condition_picks.get(clean_code, {})
-            prev_active = set(existing.get('cond_names', []))
-            prev_seen = set(existing.get('seen_conds', prev_active))
-            is_new_cond = effective_cond not in prev_seen
+        now_ts = time.time()
+        min_stay = max(0.0, float(getattr(self, 'min_cond_stay_sec', 30.0)))
 
-            prev_active.add(effective_cond)
-            prev_seen.add(effective_cond)
-            overlap = len(prev_seen)
-            active_overlap = len(prev_active)
-            cond_label = ", ".join(sorted(prev_seen))
-            self.condition_picks[clean_code] = {
+        with self.condition_lock:
+            is_new_stock = clean_code not in self.condition_picks
+            existing = self.condition_picks.get(clean_code, {})
+            if not isinstance(existing, dict):
+                existing = {}
+
+            cond_stats = {k: dict(v) for k, v in (existing.get('cond_stats') or {}).items()}
+            is_new_cond_for_stock = effective_cond not in cond_stats
+            st = cond_stats.get(effective_cond)
+            is_reentry_bounce = False
+
+            if st is None:
+                st = {
+                    'is_active': True,
+                    'first_seen': now_ts,
+                    'active_since': now_ts,
+                    'accum_stay_sec': 0.0,
+                    'max_cont_sec': 0.0,
+                    'confirmed': (min_stay <= 0.0),
+                    'churn_count': 0,
+                }
+            else:
+                if not st.get('is_active', False):
+                    # 이탈('D') 후 재편입('I') → 들락날락(churn) 카운트 증가
+                    st['churn_count'] = int(st.get('churn_count', 0) or 0) + 1
+                    st['is_active'] = True
+                    st['active_since'] = now_ts
+                    is_reentry_bounce = True
+                else:
+                    live_sec = max(0.0, now_ts - float(st.get('active_since', now_ts) or now_ts))
+                    st['max_cont_sec'] = max(float(st.get('max_cont_sec', 0.0) or 0.0), live_sec)
+                    if live_sec >= min_stay or (float(st.get('accum_stay_sec', 0.0) or 0.0) + live_sec) >= min_stay * 1.5:
+                        st['confirmed'] = True
+            cond_stats[effective_cond] = st
+
+            active_conds = sorted(c for c, s in cond_stats.items() if s.get('is_active'))
+            seen_conds = sorted(cond_stats.keys())
+            pick_obj = {
                 'code': clean_code,
                 'name': self.stock_name_cache.get(clean_code, existing.get('name', '')),
-                'cond_names': sorted(prev_active),
-                'seen_conds': sorted(prev_seen),
-                'overlap': overlap,
-                'active_overlap': active_overlap,
+                'cond_names': active_conds,
+                'seen_conds': seen_conds,
+                'cond_stats': cond_stats,
                 'day_val_eok': float(existing.get('day_val_eok', 0.0) or 0.0),
-                'target_tag': f'🔔조건중복{overlap}/{self.condition_total}({cond_label})',
-                'captured_at': existing.get('captured_at', time.time()),
-                'last_update': time.time()
+                'captured_at': existing.get('captured_at', now_ts),
+                'last_update': now_ts,
             }
+            metrics = self._compute_cond_pick_metrics(pick_obj, now_ts=now_ts)
+            pick_obj['confirmed_conds'] = metrics['confirmed_conds']
+            pick_obj['confirmed_overlap'] = metrics['confirmed_overlap']
+            pick_obj['overlap'] = metrics['confirmed_overlap']
+            pick_obj['active_overlap'] = metrics['active_overlap']
+            pick_obj['seen_overlap'] = metrics['seen_overlap']
+            pick_obj['total_stay_sec'] = metrics['total_stay_sec']
+            pick_obj['churn_count'] = metrics['churn_count']
+            pick_obj['durability_score'] = metrics['durability_score']
+            cond_label = ", ".join(metrics['confirmed_conds'] or seen_conds)
+            pick_obj['target_tag'] = (
+                f"🔔확정중복{metrics['confirmed_overlap']}/{self.condition_total}"
+                f"(활성{metrics['active_overlap']}·{cond_label})"
+            )
+            self.condition_picks[clean_code] = pick_obj
 
         cached_nm = self.stock_name_cache.get(clean_code, f"종목_{clean_code}")
         min_ov = int(getattr(self, 'min_overlap', 2))
-        if is_new and overlap >= min_ov:
+        seen_ov = len(seen_conds)
+        conf_ov = metrics['confirmed_overlap']
+
+        if is_new_stock:
             logger.info(
-                f"🔔 [조건검색 후보 포착 {overlap}/{self.condition_total}] [{cached_nm}({clean_code})] ({effective_cond}) "
-                f"➔ 즉시 매수 금지, IDLE 관찰 등록 (하락 후 120틱 60-120 골든크로스 대기)"
+                f"🔔 [조건검색 포착·체류검증 시작] [{cached_nm}({clean_code})] ({effective_cond}) "
+                f"➔ {min_stay:.0f}초 연속 유지 + 중복 {min_ov}개↑ 인증 시 Top10 편입 (포착 즉시 매수 금지)"
             )
+        elif is_reentry_bounce:
+            logger.debug(
+                f"🔁 [조건식 재편입(들락날락 {metrics['churn_count']}회)] [{cached_nm}({clean_code})] "
+                f"'{effective_cond}' 재진입 (인증중복 {conf_ov}/{self.condition_total}, 누적체류 {metrics['total_stay_sec']:.0f}초)"
+            )
+        elif is_new_cond_for_stock and seen_ov >= min_ov:
+            logger.info(
+                f"🔥 [조건식 다중 포착 관찰(포착 {seen_ov}/{self.condition_total} · 확정 {conf_ov}/{self.condition_total})] "
+                f"[{cached_nm}({clean_code})] '{effective_cond}' 추가 ➔ {min_stay:.0f}초 체류 인증 후 4·3·2순 Top10 반영"
+            )
+        if conf_ov >= min_ov and (is_new_stock or is_new_cond_for_stock):
             self.condition_wakeup_event.set()
-        elif is_new_cond and overlap >= min_ov:
-            logger.info(
-                f"🔥 [조건식 중복 {overlap}/{self.condition_total} (Top10 대상)] [{cached_nm}({clean_code})] "
-                f"'{effective_cond}' 추가 포착 [{cond_label}] ➔ 4·3·2순 우선순위 반영 및 하락 후 60-120 GC 대기"
-            )
-            if len(prev_seen) == min_ov:
-                self.condition_wakeup_event.set()
 
     def _on_condition_delete(self, code: str, cond_name: str = ""):
-        """키움 실시간 조건검색 종목 이탈 콜백: 현재 활성 조건(cond_names)만 갱신하고 09:30까지 달성한 중복수(seen_conds)는 보존"""
+        """키움 실시간 조건검색 이탈('D') 콜백: 해당 조건식 체류시간 정산 및 인증여부 확정 (이미 30초+ 인증된 조건은 하락 보호 유지)"""
         clean_code = self._normalize_stock_code(code)
         effective_cond = cond_name.strip() if cond_name else ""
+        now_ts = time.time()
+        min_stay = max(0.0, float(getattr(self, 'min_cond_stay_sec', 30.0)))
+
         with self.condition_lock:
             pick = self.condition_picks.get(clean_code)
-            if isinstance(pick, dict) and effective_cond and effective_cond in pick.get('cond_names', []):
-                remaining = [c for c in pick['cond_names'] if c != effective_cond]
-                pick['cond_names'] = remaining
-                pick['active_overlap'] = len(remaining)
-                pick['last_update'] = time.time()
-        logger.debug(f"🔕 [실시간 조건검색 이탈] 종목코드: {clean_code} 조건식: {effective_cond or '-'} (하락·눌림 관찰 지속)")
+            if isinstance(pick, dict) and effective_cond:
+                cond_stats = pick.get('cond_stats')
+                if isinstance(cond_stats, dict) and effective_cond in cond_stats:
+                    st = cond_stats[effective_cond]
+                    if st.get('is_active', False):
+                        session_sec = max(0.0, now_ts - float(st.get('active_since', now_ts) or now_ts))
+                        st['accum_stay_sec'] = float(st.get('accum_stay_sec', 0.0) or 0.0) + session_sec
+                        st['max_cont_sec'] = max(float(st.get('max_cont_sec', 0.0) or 0.0), session_sec)
+                        if session_sec >= min_stay or st['accum_stay_sec'] >= min_stay * 1.5:
+                            st['confirmed'] = True
+                        st['is_active'] = False
+                        st['active_since'] = 0.0
+                    pick['cond_names'] = sorted(c for c, s in cond_stats.items() if s.get('is_active'))
+                    metrics = self._compute_cond_pick_metrics(pick, now_ts=now_ts)
+                    pick['confirmed_conds'] = metrics['confirmed_conds']
+                    pick['confirmed_overlap'] = metrics['confirmed_overlap']
+                    pick['overlap'] = metrics['confirmed_overlap']
+                    pick['active_overlap'] = metrics['active_overlap']
+                    pick['total_stay_sec'] = metrics['total_stay_sec']
+                    pick['churn_count'] = metrics['churn_count']
+                    pick['durability_score'] = metrics['durability_score']
+                    pick['last_update'] = now_ts
+                elif effective_cond in pick.get('cond_names', []):
+                    remaining = [c for c in pick['cond_names'] if c != effective_cond]
+                    pick['cond_names'] = remaining
+                    pick['active_overlap'] = len(remaining)
+                    pick['last_update'] = now_ts
+        logger.debug(f"🔕 [실시간 조건검색 이탈] 종목코드: {clean_code} 조건식: {effective_cond or '-'} (체류시간 정산 완료)")
 
     def get_condition_overlap(self, code: str) -> int:
-        """해당 종목이 4가지 조건검색식 중 몇 개에 중복 포착되었는지 반환 (0 = 미포착)"""
+        """해당 종목이 4가지 조건검색식 중 최소 체류시간을 통과해 인증된 중복 조건식 수 반환 (0 = 미인증/미포착)"""
+        now_ts = time.time()
         with self.condition_lock:
             pick = self.condition_picks.get(code)
             if isinstance(pick, dict):
-                return int(pick.get('overlap', len(pick.get('seen_conds', [])) or 1))
+                return int(self._compute_cond_pick_metrics(pick, now_ts=now_ts)['confirmed_overlap'])
             return len(pick) if pick else 0
 
     def _select_top10_condition_picks(self) -> list[dict]:
-        """4가지 조건검색식 중복 수(4 → 3 → 2 순) 나열 후 정예 Top 10 엄선"""
+        """
+        최소 체류시간 인증 완료 종목 중 아래 우선순위로 정예 Top 10 엄선:
+        ① confirmed_overlap (4 → 3 → 2)
+        ② 현재 이탈하지 않고 살아있는 active_overlap
+        ③ 누적 체류시간 합계(total_stay_sec) - 들락날락(churn_count * 30초) 페널티
+        """
         if getattr(self, 'top10_locked', False):
             return [dict(p) for p in getattr(self, 'locked_top10_picks', [])]
 
+        now_ts = time.time()
         min_ov = max(2, int(getattr(self, 'min_overlap', 2)))
         with self.condition_lock:
             raw_picks = [dict(p) for p in self.condition_picks.values() if isinstance(p, dict)]
 
-        eligible = [p for p in raw_picks if int(p.get('overlap', 0)) >= min_ov]
+        eligible = []
+        for p in raw_picks:
+            m = self._compute_cond_pick_metrics(p, now_ts=now_ts)
+            if m['confirmed_overlap'] >= min_ov:
+                enriched = dict(p)
+                enriched['confirmed_conds'] = m['confirmed_conds']
+                enriched['confirmed_overlap'] = m['confirmed_overlap']
+                enriched['overlap'] = m['confirmed_overlap']
+                enriched['active_overlap'] = m['active_overlap']
+                enriched['total_stay_sec'] = m['total_stay_sec']
+                enriched['churn_count'] = m['churn_count']
+                enriched['durability_score'] = m['durability_score']
+                cond_label = ", ".join(m['confirmed_conds'] or p.get('seen_conds', []))
+                enriched['target_tag'] = (
+                    f"🔔확정중복{m['confirmed_overlap']}/{self.condition_total}"
+                    f"(활성{m['active_overlap']}·체류{m['total_stay_sec']:.0f}s·재이탈{m['churn_count']})"
+                    f"[{cond_label}]"
+                )
+                eligible.append(enriched)
+
         eligible.sort(
             key=lambda x: (
-                int(x.get('overlap', 0)),                           # 1순위: 중복 4 -> 3 -> 2
-                int(x.get('active_overlap', x.get('overlap', 0))), # 2순위: 현재 동시 유지 조건 수
-                float(x.get('day_val_eok', 0.0)),                  # 3순위: 거래대금 규모
-                float(x.get('last_update', x.get('captured_at', 0.0))),
+                int(x['confirmed_overlap']),
+                int(x['active_overlap']),
+                round(float(x['durability_score']), 3),
+                float(x.get('day_val_eok', 0.0)),
+                -float(x.get('captured_at', 0.0)),
             ),
             reverse=True,
         )
         return eligible[:10]
 
     def _maybe_lock_top10(self, now_t: Optional[dtime] = None):
-        """09:30:00 도달 시 조건검색 중복 4·3·2순 Top 10 확정 락온 (이후 신규 잡주 편입 차단)"""
+        """09:30:00 도달 시 체류 인증 완료된 조건검색 중복 4·3·2순 Top 10 확정 락온 (이후 신규 잡주 편입 차단)"""
         if getattr(self, 'top10_locked', False):
             return
         cur_t = now_t or datetime.now().time()
@@ -491,20 +647,25 @@ class SafeHoldingsThemeGateBot:
             return
 
         init_evt = getattr(self, 'condition_init_event', None)
-        elapsed = time.time() - float(getattr(self, '_bot_start_ts', 0.0) or 0.0)
-        if init_evt is not None and not init_evt.is_set() and elapsed < 8.5 and not self.condition_picks:
+        uptime = time.time() - float(getattr(self, '_bot_start_ts', 0.0) or 0.0)
+        if init_evt is not None and not init_evt.is_set() and uptime < 8.5 and not self.condition_picks:
             return
 
         top10 = self._select_top10_condition_picks()
+        min_stay = max(0.0, float(getattr(self, 'min_cond_stay_sec', 30.0)))
+        # 장중 늦은 재시작 직후(<35초) 아직 최소 체류 인증 시간이 안 찼다면 잠시 대기해 빈 리스트 오락온 방지
+        if not top10 and self.condition_picks and min_stay > 0 and uptime < (min_stay + 5.0):
+            return
+
         self.locked_top10_picks = top10
         self.locked_top10_codes = {p['code'] for p in top10}
         self.top10_locked = True
         summary = ", ".join(
-            f"{self.get_stock_name(p['code'])}({p['code']}:{p.get('overlap', 0)}/4)"
+            f"{self.get_stock_name(p['code'])}({p['code']}:확정{p.get('confirmed_overlap', 0)}/활성{p.get('active_overlap', 0)}·체류{p.get('total_stay_sec', 0.0):.0f}s·들락{p.get('churn_count', 0)})"
             for p in top10
-        ) or "중복2+ 포착종목 없음"
+        ) or "체류인증 중복2+ 포착종목 없음"
         logger.info(
-            f"🔒 [09:30 조건검색 Top10 최종 확정 락온] 중복 4·3·2순 {len(top10)}개 엄선 완료 "
+            f"🔒 [09:30 조건검색 Top10 최종 확정 락온] 체류인증 중복 4·3·2순 {len(top10)}개 엄선 완료 "
             f"(신규 포착 마감 ➔ 하락 후 120틱 60-120 골든크로스 대기): [{summary}]"
         )
 
@@ -1934,7 +2095,16 @@ class SafeHoldingsThemeGateBot:
                 if is_cond_pick:
                     cond_overlap_now = self.get_condition_overlap(code)
                     star = "🔥" if cond_overlap_now >= 3 else "🔔"
-                    source_badge = f"{star}[조건중복 {cond_overlap_now}/{self.condition_total}] "
+                    with self.condition_lock:
+                        p_ref = self.condition_picks.get(code)
+                        c_met = self._compute_cond_pick_metrics(p_ref) if isinstance(p_ref, dict) else None
+                    if c_met:
+                        source_badge = (
+                            f"{star}[확정중복 {cond_overlap_now}/{self.condition_total}"
+                            f"·활성{c_met['active_overlap']}·체류{c_met['total_stay_sec']:.0f}s·들락{c_met['churn_count']}] "
+                        )
+                    else:
+                        source_badge = f"{star}[조건중복 {cond_overlap_now}/{self.condition_total}] "
                 else:
                     source_badge = ""
                 rs_status = f"🔥지수초과({day_alpha:+.2f}%p)"
@@ -2241,6 +2411,8 @@ if __name__ == '__main__':
                         help="키움 실시간 조건검색식 이름 (기본값: Traiding,traiding,Traiding1,trading1)")
     parser.add_argument("--min-overlap", type=int, default=2,
                         help="신규 매수 허용 최소 조건식 중복 포착 수 (기본 2=중복 4·3·2순 Top10 엄선)")
+    parser.add_argument("--min-stay-sec", type=float, default=30.0,
+                        help="조건식 최소 연속 체류 인증 시간(초, 기본 30초 — 1~5초 휩소 들락날락 차단)")
     parser.add_argument("--fixed-qty", type=int, default=2,
                         help="고정 매수 수량 (기본값: 2주, 계좌 예수금 조회 TR 생략)")
     parser.add_argument("--no-ws", action="store_true", help="실시간 조건검색 웹소켓 비활성화")
@@ -2253,7 +2425,8 @@ if __name__ == '__main__':
         condition_name=args.condition,
         enable_ws=(not args.no_ws),
         min_overlap=args.min_overlap,
-        fixed_qty=args.fixed_qty
+        fixed_qty=args.fixed_qty,
+        min_cond_stay_sec=args.min_stay_sec
     )
 
     if args.once:

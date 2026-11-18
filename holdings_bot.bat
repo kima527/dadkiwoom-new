@@ -7,13 +7,13 @@ echo   [09:30까지 Top 10 엄선 락온 ^| 포착 즉시 매수 금지 ^| 하�
 echo ===============================================================================
 echo.
 echo [1. 세션] ⏰ 평일 08:00 가동! (NXT 프리 08:00~08:50 + KRX 정규장 09:00~15:30)
-echo [2. 엄선] 🔥 09:30까지 4개 조건검색식 중복 4·3·2순 나열 ➔ 정예 Top 10 확정 락온
-echo [3. 대기] ⏳ 조건식 포착('뜨자마자') 즉시 매수 금지 ➔ 하락(파란색 음운 60^<120) 확인 대기
+echo [2. 엄선] 🔥 09:30까지 4개 조건식 30초+ 체류인증 중복 4·3·2순(활성·체류-들락) Top 10 확정 락온
+echo [3. 대기] ⏳ 1~5초 스치고 빠지는 휩소 차단 ^& 포착 즉시 매수 금지 ➔ 하락(파란색 음운) 확인 대기
 echo [4. 1차]  ⚡ 하락 후 120틱 테마 60-120 골든크로스(파란→노란) 발생 시 1차 매수
 echo [5. 2차]  ⚡ 관문선(-) 눌림 또는 +0.5%% 상향 돌파 시 2차 분할 매수
 echo [6. 청산] 🛑 120틱 테마 60-120 데드크로스 OR -2.5%% 비상 방어선 전량 매도
 echo [7. 수량] 🎯 고정 2주 실전 매매 (계좌 예수금 조회 TR 생략)
 echo ===============================================================================
 echo.
-python -X utf8 "execution\trading_bot_holdings_only.py" --condition "Traiding,traiding,Traiding1,trading1" --min-overlap 2 --fixed-qty 2
+python -X utf8 "execution\trading_bot_holdings_only.py" --condition "Traiding,traiding,Traiding1,trading1" --min-overlap 2 --min-stay-sec 30 --fixed-qty 2
 pause
