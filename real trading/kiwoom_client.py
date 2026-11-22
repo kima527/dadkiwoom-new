@@ -670,6 +670,14 @@ class KiwoomRealClient:
         # 전체 구간이 동일 초이거나 캐시와 연속 구간이 겹치지 않으면 최신 조회분 우선 사용
         return list(fresh_bars[-max_keep:])
 
+    def get_last_tick_fetch_ts(self, stock_code: str, tick_unit: str = "120") -> float:
+        """해당 종목 틱 차트가 마지막으로 REST 조회/갱신된 시각 반환"""
+        data_code = self._get_data_code(stock_code)
+        cache_key = (data_code, str(tick_unit))
+        with self._tick_cache_lock:
+            entry = self._tick_cache.get(cache_key)
+            return float(entry.get("last_ts", 0.0) or 0.0) if entry else 0.0
+
     def get_tick_data(self, stock_code: str, tick_unit: str = "120", limit: int = 100) -> list:
         """
         주식 종목의 틱 차트 데이터를 조회합니다. (TR: ka10079 연속조회 및 장기 메모리 캐시 지원)
@@ -776,9 +784,9 @@ class KiwoomRealClient:
 
             fresh_sorted = self._parse_raw_tick_candles(all_raw)
             if has_warm_cache:
-                merged = self._merge_tick_cache(cached_bars, fresh_sorted, max_keep=max(2000, target_limit))
+                merged = self._merge_tick_cache(cached_bars, fresh_sorted, max_keep=max(2400, target_limit))
             else:
-                merged = fresh_sorted[-max(2000, target_limit):]
+                merged = fresh_sorted[-max(2400, target_limit):]
 
             with self._tick_cache_lock:
                 self._tick_cache[cache_key] = {

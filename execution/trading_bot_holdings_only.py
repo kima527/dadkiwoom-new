@@ -345,6 +345,9 @@ class SafeHoldingsThemeGateBot:
         self._last_account_refresh_time: float = 0.0  # 🏛️ 키움 계좌 TR(초당 3회 제한) 방어용 캐시 타임스탬프
         self._cached_real_holdings: dict = {}
         self._cached_cash: float = 0.0
+        self._m60_cache: dict[str, tuple[float, int, pd.DataFrame]] = {}   # 60분봉 단기 캐시 (20초 TTL / 시간 경계 갱신)
+        self._daily_cache: dict[str, tuple[float, pd.DataFrame]] = {}       # 일봉 단기 캐시 (60초 TTL)
+        self._last_idle_scan_ts: float = 0.0                                 # 보유 중 비활성 후보 순환 평가 타임스탬프
         self.sold_cooldowns: dict[str, float] = {}  # 매도 종목 단기 쿨다운 (code -> cooldown_until_ts, 영구 차단 없이 관심종목 지속 유지)
         self.completed_trades_today: int = 0          # 당일 매도 완료(순환매매) 횟수 (0=1차 일봉 3-5 진입, >=1=교체 상승률<=20% 진입)
         self.current_trading_date = datetime.now().date()
@@ -1082,12 +1085,22 @@ class SafeHoldingsThemeGateBot:
         self.strategies = ordered_strategies
 
     def get_60m_candles(self, code: str) -> pd.DataFrame:
-        """60분봉 데이터 조회 (키움 실전 60분봉 API 직접 수신, 부재 시 30분봉 리샘플링)"""
+        """60분봉 데이터 조회 (키움 실전 60분봉 API + 20초 단기 캐시로 120틱 폴링 대역폭 확보)"""
         if self.is_real and self.api:
+            now_dt = datetime.now()
+            now_ts = time.time()
+            cur_hour = now_dt.hour
+            if hasattr(self, '_m60_cache') and code in self._m60_cache:
+                c_ts, c_hr, c_df = self._m60_cache[code]
+                if c_hr == cur_hour and (now_ts - c_ts) < 20.0 and c_df is not None and not c_df.empty:
+                    return c_df.copy()
             try:
                 if hasattr(self.api, 'get_60m_candles'):
                     df_60m = self.api.get_60m_candles(code)
                     if df_60m is not None and not df_60m.empty and len(df_60m) >= 4:
+                        if not hasattr(self, '_m60_cache'):
+                            self._m60_cache = {}
+                        self._m60_cache[code] = (now_ts, cur_hour, df_60m)
                         return df_60m
                 df_30m = self.api.get_30m_candles(code)
                 if df_30m is not None and not df_30m.empty and len(df_30m) >= 4:
@@ -1099,6 +1112,9 @@ class SafeHoldingsThemeGateBot:
                         'close': 'last',
                         'volume': 'sum'
                     }).dropna().reset_index()
+                    if not hasattr(self, '_m60_cache'):
+                        self._m60_cache = {}
+                    self._m60_cache[code] = (now_ts, cur_hour, df_60m)
                     return df_60m
             except Exception as e:
                 logger.error(f"60분봉 조회 에러 ({code}): {e}")
@@ -1114,10 +1130,18 @@ class SafeHoldingsThemeGateBot:
         return df_60m
 
     def get_daily_candles(self, code: str) -> pd.DataFrame:
-        """일봉 데이터 조회"""
+        """일봉 데이터 조회 (60초 단기 캐시로 120틱 고속 조회 여력 확보)"""
         if self.is_real and self.api:
+            now_ts = time.time()
+            if hasattr(self, '_daily_cache') and code in self._daily_cache:
+                c_ts, c_df = self._daily_cache[code]
+                if (now_ts - c_ts) < 60.0 and c_df is not None and not c_df.empty:
+                    return c_df.copy()
             df_d = self.api.get_daily_candles(code)
             if df_d is not None and not df_d.empty:
+                if not hasattr(self, '_daily_cache'):
+                    self._daily_cache = {}
+                self._daily_cache[code] = (now_ts, df_d)
                 return df_d
             # 🛡️ 실전 계좌 모드에서는 API 일시 지연 시 절대 가상 샘플 데이터를 섞지 않고 빈 DataFrame 반환
             return pd.DataFrame()
@@ -1129,7 +1153,7 @@ class SafeHoldingsThemeGateBot:
         return df_d
 
     def get_120t_candles(self, code: str) -> pd.DataFrame:
-        """실전 120틱 데이터 조회 (WMA 20-40-60 순차돌파 및 피크 반전 감지용)"""
+        """실전 120틱 데이터 조회 (TEMA 15·30·60·120 실차트 일치용 1800봉 확보)"""
         if self.is_real and self.api:
             try:
                 if hasattr(self.api, 'get_120t_candles'):
@@ -1137,7 +1161,7 @@ class SafeHoldingsThemeGateBot:
                     if df_120t is not None and not df_120t.empty and len(df_120t) >= 10:
                         return df_120t
                 elif hasattr(self.api, 'real_client') and hasattr(self.api.real_client, 'get_tick_data'):
-                    raw = self.api.real_client.get_tick_data(code, tick_unit="120", limit=1200)
+                    raw = self.api.real_client.get_tick_data(code, tick_unit="120", limit=1800)
                     if raw:
                         df_raw = pd.DataFrame(raw)
                         df_raw.columns = [c.lower() for c in df_raw.columns]
@@ -1722,23 +1746,27 @@ class SafeHoldingsThemeGateBot:
             pre_close = float(last_daily.get('close', tick_close))
         day_ret_pct = ((tick_close - pre_close) / pre_close * 100.0) if pre_close > 0 else 0.0
 
-        # 4. 120틱 듀얼 골든크로스(테마 60-120 GC & SMA 40-60 GC) 점수 (10점 만점)
+        # 4. 120틱 듀얼 골든크로스(테마 60>120·15-30 GC & SMA 40-60 GC) 점수 (10점 만점)
         score_120t = 0.0
         if df_120t is not None and len(df_120t) >= 40 and 'close' in df_120t:
             df_120t_calc = calculate_120t_tema_indicators(df_120t, current_price=tick_close)
             if not df_120t_calc.empty:
                 last_120 = df_120t_calc.iloc[-1]
                 is_yellow_cloud = bool(last_120.get('is_yellow_cloud', False))
+                is_15_30_bull = bool(last_120.get('is_tema15_30_bull', False))
                 is_sma_bull = bool(last_120.get('is_sma40_60_bull', False))
                 tema_gc_recent = bool(df_120t_calc['is_tema60_120_gc'].tail(8).any()) if 'is_tema60_120_gc' in df_120t_calc else False
+                tema15_gc_recent = bool(df_120t_calc['is_tema15_30_gc'].tail(4).any()) if 'is_tema15_30_gc' in df_120t_calc else False
                 sma_gc_recent = bool(df_120t_calc['is_sma40_60_gc'].tail(8).any()) if 'is_sma40_60_gc' in df_120t_calc else False
 
-                if (tema_gc_recent or is_yellow_cloud) and (sma_gc_recent or is_sma_bull):
-                    score_120t = 10.0  # 듀얼 크로스 완성/동시 돌파 (최고점)
+                if (tema_gc_recent or is_yellow_cloud) and (tema15_gc_recent or is_15_30_bull) and (sma_gc_recent or is_sma_bull):
+                    score_120t = 10.0  # 60-120 양운 + 15-30 정배열/GC + SMA 정배열 완성
+                elif (tema_gc_recent or is_yellow_cloud) and (tema15_gc_recent or is_15_30_bull):
+                    score_120t = 9.0   # 60-120 + 15-30 정배열/골든크로스 완성
                 elif tema_gc_recent or is_yellow_cloud:
-                    score_120t = 7.0   # 테마 60-120 골든크로스 (1차 타점 완료)
+                    score_120t = 6.0   # 테마 60-120 양운 확보
                 elif sma_gc_recent or is_sma_bull:
-                    score_120t = 5.0   # SMA 40-60 골든크로스 완료
+                    score_120t = 4.0   # SMA 40-60 골든크로스 완료
 
         # 5. 시초가 모멘텀 락온 점수 (+1.5% 돌파, 10점 만점 - NXT 프리마켓 08:03~08:30 & KRX 정규장 09:00~09:30)
         score_morning = 0.0
@@ -1887,16 +1915,21 @@ class SafeHoldingsThemeGateBot:
             act_state = self.strategies[active_code].position.state.value
             logger.info(
                 f"🔒 [1종목 순환매매 슬롯 1/1 점유] 봇 운용 종목: [{act_name}({active_code})] 상태: {act_state} "
-                f"➔ 전량 매도(테마 60-120 데드크로스) 시까지 1종목 집중 운용 (신규 매수 대기)"
+                f"➔ 120틱 테마 15-30 데드크로스(또는 60-120 DC) 시 전량 매도 고속 감시 중"
             )
         else:
             lock_note = "09:30 Top10 확정" if getattr(self, 'top10_locked', False) else "09:30까지 4·3·2중복 Top10 엄선 중"
             logger.info(
                 f"🔓 [1종목 순환매매 슬롯 0/1 비어있음] 봇 운용 종목 없음 ({lock_note}) "
-                "➔ Top10 후보 하락(음운) 후 120틱 60-120 골든크로스 발생 시 1위 종목 진입 대기"
+                "➔ Top10 중 120틱 (60>120 or 60-120 GC) & 15-30 골든크로스 발생 시 1위 종목 진입 대기"
             )
 
         buy_candidates = []
+        now_cycle_ts = time.time()
+        last_idle_scan = float(getattr(self, '_last_idle_scan_ts', 0.0) or 0.0)
+        skip_idle_for_fast_exit = bool(active_code and (now_cycle_ts - last_idle_scan) < 12.0)
+        if not active_code or not skip_idle_for_fast_exit:
+            self._last_idle_scan_ts = now_cycle_ts
 
         for code in list(self.strategies.keys()):
             name = self.get_stock_name(code)
@@ -1906,6 +1939,10 @@ class SafeHoldingsThemeGateBot:
 
             # 🕒 [14:30 이후 신규 매수 종료]: 미보유(IDLE) 종목 평가 스킵 ➔ 보유 종목 매도에만 API 집중
             if is_buy_cutoff and strat.position.state == StrategyState.IDLE:
+                continue
+
+            # ⚡ [보유 종목 초고속 15-30 DC 매도 감시]: 보유 중에는 비활성 후보 REST 스캔을 12초마다 분산
+            if skip_idle_for_fast_exit and code != active_code and strat.position.state == StrategyState.IDLE:
                 continue
 
             # 💡 쿨다운 확인: 매도 직후 단기 쿨다운(20초) 중인지 체크 (종목을 버리지 않고 계속 들여다봄)
@@ -1923,17 +1960,38 @@ class SafeHoldingsThemeGateBot:
                     logger.warning(f"⚠️ [{name}({code})] 실전 차트 데이터(60분봉/일봉) 수신 대기 중 ➔ 이번 사이클 평가 스킵")
                     continue
 
-                # 실시간 현재가 최우선 확보:
-                # 1) 웹소켓 실시간 0B 체결가가 15초 이내로 수신되었다면 초단타 지연 없는 실시간 가격 최우선!
-                # 2) NXT 세션에서는 _AL 통합 차트 현재가(candle_close) 적용
-                # 3) KRX 정규장에서는 계좌/차트 현재가 적용
+                # ⚡ [120틱 TR 선조회 및 실시간 현재가 시각 동기화]:
+                # REST 120틱 조회시각보다 더 최신인 0B 패킷만 덧씌워 구버전 0B가 최신 120틱 종가를 덮어쓰는 현상 원천 차단
                 h_info = self.active_holdings.get(code, {})
                 acc_price = float(h_info.get('current_price', 0.0) or 0.0)
+                is_cond_pick = bool(h_info.get('is_condition_pick', False)) or (code in self.condition_picks)
+                need_120t = (
+                    strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
+                    or is_cond_pick
+                )
+                df_120t = self.get_120t_candles(code) if need_120t else pd.DataFrame()
+                tick_fetch_ts = 0.0
+                if need_120t and self.is_real and self.api and hasattr(self.api, 'get_last_tick_fetch_ts'):
+                    tick_fetch_ts = float(self.api.get_last_tick_fetch_ts(code) or 0.0)
 
+                candle_120_close = (
+                    float(df_120t.iloc[-1]['close'])
+                    if (df_120t is not None and not df_120t.empty and 'close' in df_120t.columns)
+                    else 0.0
+                )
                 candle_close = float(df_60m.iloc[-1]['close']) if not df_60m.empty else 0.0
                 ws_tick = self._live_tick_prices.get(code)
-                if ws_tick and (time.time() - ws_tick.get('ts', 0.0)) <= 15.0 and ws_tick.get('price', 0.0) > 0:
+                ws_ts = float(ws_tick.get('ts', 0.0) or 0.0) if ws_tick else 0.0
+                is_ws_fresh = bool(
+                    ws_tick
+                    and (time.time() - ws_ts) <= 15.0
+                    and float(ws_tick.get('price', 0.0) or 0.0) > 0
+                    and (tick_fetch_ts <= 0.0 or ws_ts >= tick_fetch_ts)
+                )
+                if is_ws_fresh:
                     tick_close = float(ws_tick['price'])
+                elif candle_120_close > 0:
+                    tick_close = candle_120_close
                 elif exchange_hint == "NXT" and candle_close > 0:
                     tick_close = candle_close
                 elif acc_price > 0:
@@ -1995,19 +2053,11 @@ class SafeHoldingsThemeGateBot:
                 fut_flu_rt = float(matched_fut.get('flu_rt', 0.0) or 0.0)
                 fut_intraday_chg = float(matched_fut.get('intraday_chg_pct', 0.0) or 0.0)
 
-                is_cond_pick = bool(h_info.get('is_condition_pick', False)) or (code in self.condition_picks)
                 day_ret_pct = ((tick_close - pred1) / pred1 * 100.0) if pred1 > 0 else 0.0
                 day_open = float(last_daily.get('open', last_60m.get('open', tick_close)) or tick_close)
                 stock_intraday_chg = ((tick_close - day_open) / day_open * 100.0) if day_open > 0 else 0.0
                 day_alpha = day_ret_pct - fut_flu_rt
                 intraday_alpha = stock_intraday_chg - fut_intraday_chg
-
-                # ⚡ [120틱 TR 호출 최적화]: 활성 보유 중이거나 실시간 조건검색 포착 종목만 120틱 조회
-                need_120t = (
-                    strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
-                    or is_cond_pick
-                )
-                df_120t = self.get_120t_candles(code) if need_120t else pd.DataFrame()
 
                 # 🛡️ evaluate_bar 호출 전 포지션/예수금 원자적 스냅샷 보존
                 # (장외/준비시간 상태 변이 방지 및 매도/슬롯차단/주문실패 시 완벽 복원용)
@@ -2127,12 +2177,19 @@ class SafeHoldingsThemeGateBot:
                             l120 = df120_view.iloc[-1]
                             g120 = float(l120.get('theme_gate', np.nan))
                             yc120 = bool(l120.get('is_yellow_cloud', False))
+                            bull15 = bool(l120.get('is_tema15_30_bull', False))
                             bs_gc = float(l120.get('bars_since_tema60_120_gc', np.nan))
-                            gc_badge = f"[GC초입 {int(bs_gc)}봉]" if (yc120 and not np.isnan(bs_gc) and bs_gc <= 8) else ""
+                            bs_15_gc = float(l120.get('bars_since_tema15_30_gc', np.nan))
+                            gc_badge = f"[60-120GC {int(bs_gc)}봉]" if (yc120 and not np.isnan(bs_gc) and bs_gc <= 3) else ""
+                            tag15 = (
+                                f"15>30[GC {int(bs_15_gc)}봉]"
+                                if (bull15 and not np.isnan(bs_15_gc) and bs_15_gc <= 3)
+                                else ("15>30" if bull15 else "15<=30")
+                            )
                             wait_badge = ""
                             if ref_pos.state == StrategyState.IDLE:
-                                wait_badge = "[음운경유·GC대기]" if getattr(ref_pos, 'saw_decline_phase', False) else "[하락(음운)대기]"
-                            cloud_tag = f"양운(60>=120){gc_badge}{wait_badge}" if yc120 else f"음운(60<120){wait_badge}"
+                                wait_badge = "[15<=30눌림·GC대기]" if getattr(ref_pos, 'saw_15_30_cooling', False) else "[15>30추격보류]"
+                            cloud_tag = f"양운(60>120){gc_badge}·{tag15}{wait_badge}" if yc120 else f"음운(60<120)·{tag15}{wait_badge}"
                             if not np.isnan(g120) and g120 > 0:
                                 g120_diff = ((tick_close - g120) / g120) * 100.0
                                 gate_120_str = f"{cloud_tag} 관문 {g120:,.0f}({g120_diff:+.2f}%)"
@@ -2382,10 +2439,11 @@ class SafeHoldingsThemeGateBot:
                     )
                     self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
 
-    def start_loop(self, interval_sec: int = 30):
-        """실시간 반복 감시 시작 (09:30 조건검색 Top10 엄선 및 하락 후 120틱 60-120 GC 감시)"""
+    def start_loop(self, interval_sec: int = 5):
+        """실시간 반복 감시 시작 (09:30 조건검색 Top10 엄선 및 120틱 60>120·15-30 실시간 정밀 감시)"""
         logger.info(
-            f"🔄 실시간 조건검색({self.condition_name}) 09:30 중복 4·3·2순 Top10 엄선 & 하락 후 120틱 60-120 GC 감시를 시작합니다 (기본 주기: {interval_sec}초)."
+            f"🔄 실시간 조건검색({self.condition_name}) 09:30 중복 4·3·2순 Top10 엄선 & "
+            f"120틱 (60>120 or 60-120 GC) + 15-30 골든/데드크로스 감시를 시작합니다 (대기 {interval_sec}초, 보유중 2초)."
         )
         try:
             while True:
@@ -2393,10 +2451,11 @@ class SafeHoldingsThemeGateBot:
                     self.run_cycle()
                 except Exception as cycle_err:
                     logger.error(f"❌ [사이클 에러] 주기 실행 중 예외 발생: {cycle_err}", exc_info=True)
-                woke_early = self.condition_wakeup_event.wait(timeout=interval_sec)
+                wait_sec = min(interval_sec, 2) if self.get_active_stock_code() else interval_sec
+                woke_early = self.condition_wakeup_event.wait(timeout=wait_sec)
                 if woke_early:
                     self.condition_wakeup_event.clear()
-                    logger.info("⚡ [실시간 후보/수급 갱신] Top10 후보 등록 및 하락 후 120틱 60-120 골든크로스 타점 점검!")
+                    logger.info("⚡ [실시간 후보/수급 갱신] Top10 후보 등록 및 120틱 15-30·60-120 타점 점검!")
         except KeyboardInterrupt:
             logger.info("🛑 사용자에 의해 감시 루프가 정상 종료되었습니다.")
 
@@ -2406,7 +2465,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="키움 실시간 조건검색 전용 1종목 집중 매매 봇")
     parser.add_argument("--once", action="store_true", help="1회 감시만 실행 후 종료")
     parser.add_argument("--dry-run", action="store_true", help="모의 안전 모드(주문 미전송)")
-    parser.add_argument("--interval", type=int, default=30, help="루프 감시 주기(초, 기본 30초)")
+    parser.add_argument("--interval", type=int, default=5, help="루프 감시 주기(초, 기본 5초·보유중 2초)")
     parser.add_argument("--condition", type=str, default="Traiding,traiding,Traiding1,trading1",
                         help="키움 실시간 조건검색식 이름 (기본값: Traiding,traiding,Traiding1,trading1)")
     parser.add_argument("--min-overlap", type=int, default=2,

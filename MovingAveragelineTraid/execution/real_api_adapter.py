@@ -323,14 +323,22 @@ class RealAPIAdapter:
         return 0.0
 
     def get_120t_candles(self, stock_code: str) -> pd.DataFrame:
-        """실전 120틱 데이터를 가져와서 Pandas DataFrame으로 변환 (TEMA120 장기 수렴용 1200봉 확보)"""
+        """실전 120틱 데이터를 가져와서 Pandas DataFrame으로 변환 (TEMA 15·30·60·120 HTS 정합용 1800봉 확보)"""
         try:
-            # TEMA(120) 3중 EMA 정합성을 위해 연속조회 포함 1200봉 요청
-            raw_candles = self.real_client.get_tick_data(stock_code, tick_unit="120", limit=1200)
+            # TEMA(120) 3중 EMA 완전 수렴 및 15/30선 실차트 일치를 위해 연속조회 포함 1800봉 요청
+            raw_candles = self.real_client.get_tick_data(stock_code, tick_unit="120", limit=1800)
             return self._convert_raw_candles_to_df(raw_candles, stock_code, "120틱")
         except Exception as e:
             logger.error(f"120틱 데이터 조회 에러 ({stock_code}): {e}")
             return pd.DataFrame()
+
+    def get_last_tick_fetch_ts(self, stock_code: str, tick_unit: str = "120") -> float:
+        try:
+            if hasattr(self.real_client, "get_last_tick_fetch_ts"):
+                return float(self.real_client.get_last_tick_fetch_ts(stock_code, tick_unit=tick_unit))
+        except Exception:
+            pass
+        return 0.0
 
     def get_tick_data(self, stock_code: str) -> list:
         try:
