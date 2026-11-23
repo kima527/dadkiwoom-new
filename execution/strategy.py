@@ -71,6 +71,7 @@ class PositionTracker:
     open_5m: float = 0.0                # 첫 5분봉 시가 (제1전략 지지선 기준)
     trade_count_today: int = 0          # 당일 매매 완료 횟수 (제1전략 ➔ 제2전략 회전 전환용)
     tema60_bull_armed: bool = False     # 매수 진입 이후 120틱 테마60 > 테마120 정배열 안착 확인 여부 (사자마자 즉시 매도 원천 방지)
+    tema15_120_armed: bool = False      # 매수 진입 이후 120틱 테마15 >= 테마120 안착 확인 여부
     watch_initialized: bool = False     # 120틱 관찰 시작 기록 여부 (포착 즉시 매수 차단용)
     watch_start_bar_key: str = ""       # 관찰 시작 시점 120틱 마지막 봉 식별자
     saw_decline_phase: bool = False     # 관찰 이후 120틱 하락(파란색 음운: TEMA60 < TEMA120) 경유 확인 여부
@@ -292,6 +293,8 @@ class ThemeGate60mStrategy:
         is_tema15_30_gc_bar = False
         is_tema15_30_dc_bar = False
         is_tema15_30_dead = False
+        is_tema15_120_dc_bar = False
+        is_tema15_120_dead = False
         is_tema15_rising = False
         bars_since_15_30_gc = np.nan
         tema15_30_gc_price = np.nan
@@ -325,6 +328,11 @@ class ThemeGate60mStrategy:
                 is_tema15_30_dead = bool(
                     is_tema15_30_dc_bar
                     or (not np.isnan(t15) and not np.isnan(t30) and t30 > 0 and t15 < t30)
+                )
+                is_tema15_120_dc_bar = bool(last_120t.get('is_tema15_120_dc', False))
+                is_tema15_120_dead = bool(
+                    is_tema15_120_dc_bar
+                    or (not np.isnan(t15) and not np.isnan(t120) and t120 > 0 and t15 < t120)
                 )
 
                 recent_tema60_120_gc = bool(df_120t_calc['is_tema60_120_gc'].tail(8).any()) if 'is_tema60_120_gc' in df_120t_calc else False
@@ -449,6 +457,7 @@ class ThemeGate60mStrategy:
                     self.position.state = StrategyState.FIRST_BUY_DONE
                     self.position.entry_mode = "120T_TEMA"
                     self.position.tema60_bull_armed = False
+                    self.position.tema15_120_armed = bool(not np.isnan(t15) and not np.isnan(t120) and t120 > 0 and t15 >= t120)
                     self.position.low_5m = ref_low if ref_low > 0 else (low_5m if low_5m > 0 else buy_price * 0.992)
                     self.position.open_5m = ref_open if ref_open > 0 else buy_price
                     self.position.first_cross_type = "TEMA15_30_GC"
@@ -503,15 +512,16 @@ class ThemeGate60mStrategy:
 
             holding_sec = (time.time() - self.position.entry_time) if self.position.entry_time > 0 else 999.0
 
-            # 1) 15-30 데드크로스 / 60-120 데드크로스 / 비상손절은 2차 매수보다 먼저 즉시 청산 평가
+            # 1) 15-120 데드크로스 / 60-120 데드크로스 / 비상손절은 2차 매수보다 먼저 즉시 청산 평가
             exit_early = self._evaluate_exit(
                 timestamp, tick_close, base_p1, first_pnl, holding_sec, t60, t120, is_tema60_120_dead,
-                t15=t15, t30=t30, is_tema15_30_dead=is_tema15_30_dead
+                t15=t15, t30=t30, is_tema15_30_dead=is_tema15_30_dead,
+                is_tema15_120_dc_bar=is_tema15_120_dc_bar, is_tema15_120_dead=is_tema15_120_dead
             )
             if exit_early is not None:
                 return exit_early
 
-            # ⚡ 2차 매수 판단 (14:30 이후 중단, 15>30 & 60>=120 정배열 유지 중일 때 실질 눌림·계단 돌파 분할 매수)
+            # ⚡ 2차 매수 판단 (14:30 이후 중단, 15>30 & 15>120 & 60>=120 정배열 유지 중일 때 실질 눌림·계단 돌파 분할 매수)
             is_buy2_signal = False
             buy2_reason = ""
             has_valid_gate = (not np.isnan(active_gate) and active_gate > 0)
@@ -523,6 +533,7 @@ class ThemeGate60mStrategy:
                 and not is_tema60_120_dead
                 and is_tema15_30_bull
                 and not is_tema15_30_dead
+                and not is_tema15_120_dead
                 and has_valid_gate
             ):
                 gate_diff = ((tick_close - active_gate) / active_gate * 100.0)
@@ -578,6 +589,7 @@ class ThemeGate60mStrategy:
                     self.position.second_buy_time = time.time()
                     self.position.entry_time = time.time()
                     self.position.tema60_bull_armed = False
+                    self.position.tema15_120_armed = bool(not np.isnan(t15) and not np.isnan(t120) and t120 > 0 and t15 >= t120)
                     self.position.last_gate_line = active_gate
                     self.position.last_gate_high = active_gate_high
                     self.position.state = StrategyState.FULL_POSITION
@@ -596,11 +608,12 @@ class ThemeGate60mStrategy:
 
             return self._evaluate_exit(
                 timestamp, tick_close, base_p1, first_pnl, holding_sec, t60, t120, is_tema60_120_dead,
-                t15=t15, t30=t30, is_tema15_30_dead=is_tema15_30_dead
+                t15=t15, t30=t30, is_tema15_30_dead=is_tema15_30_dead,
+                is_tema15_120_dc_bar=is_tema15_120_dc_bar, is_tema15_120_dead=is_tema15_120_dead
             )
 
         # ─────────────────────────────────────────────────────────────
-        # 3. FULL_POSITION 상태: 120틱 테마 15-30 / 60-120 데드크로스 & 비상 하드손절 매도
+        # 3. FULL_POSITION 상태: 120틱 테마 15-120 / 60-120 데드크로스 & 비상 하드손절 매도
         # ─────────────────────────────────────────────────────────────
         elif self.position.state == StrategyState.FULL_POSITION:
             bot_entry_price = self.position.avg_price if self.position.avg_price > 0 else self.position.first_buy_price
@@ -611,7 +624,8 @@ class ThemeGate60mStrategy:
 
             return self._evaluate_exit(
                 timestamp, tick_close, bot_entry_price, profit_rate, holding_sec, t60, t120, is_tema60_120_dead,
-                t15=t15, t30=t30, is_tema15_30_dead=is_tema15_30_dead
+                t15=t15, t30=t30, is_tema15_30_dead=is_tema15_30_dead,
+                is_tema15_120_dc_bar=is_tema15_120_dc_bar, is_tema15_120_dead=is_tema15_120_dead
             )
 
         return None
@@ -628,12 +642,16 @@ class ThemeGate60mStrategy:
         is_tema60_120_dead: bool,
         t15: float = np.nan,
         t30: float = np.nan,
-        is_tema15_30_dead: bool = False
+        is_tema15_30_dead: bool = False,
+        is_tema15_120_dc_bar: bool = False,
+        is_tema15_120_dead: bool = False
     ) -> Optional[TradeOrder]:
-        """공통 전량 매도 평가: 120틱 테마 15-30 데드크로스(주력) / 60-120 데드크로스 / -2.5% 비상 하드손절"""
+        """공통 전량 매도 평가: 120틱 테마 15-120 데드크로스(주력) / 60-120 데드크로스 / -2.5% 비상 하드손절"""
         if not self.position.entry_mode or self.position.total_qty <= 1:
             return None
 
+        if not np.isnan(t15) and not np.isnan(t120) and t120 > 0 and t15 >= t120:
+            self.position.tema15_120_armed = True
         if holding_sec >= 5.0 and not np.isnan(t60) and not np.isnan(t120) and t120 > 0 and t60 > t120 * 1.0002:
             self.position.tema60_bull_armed = True
 
@@ -641,12 +659,13 @@ class ThemeGate60mStrategy:
         action_type = "TAKE_PROFIT"
         sell_reason = ""
 
-        # 1. ⚡ [주력 매도]: 120틱 테마 15-30 데드크로스 즉시 전량 매도 (실차트 일치)
-        if holding_sec >= 5.0 and is_tema15_30_dead:
+        # 1. ⚡ [주력 매도]: 120틱 테마 15-120 데드크로스 즉시 전량 매도 (추세 유지·수익 극대화)
+        can_exit_15_120 = bool(self.position.tema15_120_armed or is_tema15_120_dc_bar)
+        if holding_sec >= 5.0 and can_exit_15_120 and is_tema15_120_dead:
             is_exit = True
             action_type = "TAKE_PROFIT" if profit_rate >= 0.0 else "STOP_LOSS"
             sell_reason = (
-                f"⚡ [120틱 테마 15-30 데드크로스 매도] 테마15({t15:,.0f}원) < 테마30({t30:,.0f}원) "
+                f"⚡ [120틱 테마 15-120 데드크로스 매도] 테마15({t15:,.0f}원) < 테마120({t120:,.0f}원) "
                 f"데드크로스 발생 전량 매도 (체결가: {tick_close:,.0f}원, 수익률: {profit_rate:+.2f}%)"
             )
         # 2. ⚡ [추세 붕괴 백업 매도]: 120틱 테마 60-120 데드크로스 시 전량 매도

@@ -255,7 +255,7 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     gc_bar_idx = bar_idx.where(df['is_tema60_120_gc']).ffill()
     df['bars_since_tema60_120_gc'] = np.where(df['is_yellow_cloud'] & gc_bar_idx.notna(), bar_idx - gc_bar_idx, np.nan)
 
-    # 🌟 [120틱 단기 타점]: 테마 15-30 골든크로스(GC) 및 데드크로스(DC) (실차트 120틱 매수/매도 일원화)
+    # 🌟 [120틱 단기 타점]: 테마 15-30 골든크로스(GC) 및 데드크로스(DC) (매수/분할기준)
     df['is_tema15_30_bull'] = df['tema15'] > df['tema30']
     df['is_tema15_30_gc'] = (df['tema15'].shift(1) <= df['tema30'].shift(1)) & (df['tema15'] > df['tema30'])
     df['is_tema15_30_dc'] = (df['tema15'].shift(1) >= df['tema30'].shift(1)) & (df['tema15'] < df['tema30'])
@@ -263,6 +263,10 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     df['is_tema15_rising'] = df['tema15_slope'] > 0
     gc15_bar_idx = bar_idx.where(df['is_tema15_30_gc']).ffill()
     df['bars_since_tema15_30_gc'] = np.where(df['is_tema15_30_bull'] & gc15_bar_idx.notna(), bar_idx - gc15_bar_idx, np.nan)
+
+    # 🌟 [120틱 주력 매도 기준]: 테마 15-120 골든/데드크로스(DC)
+    df['is_tema15_120_bull'] = df['tema15'] > df['tema120']
+    df['is_tema15_120_dc'] = (df['tema15'].shift(1) >= df['tema120'].shift(1)) & (df['tema15'] < df['tema120'])
 
     # 🌟 [120틱 핵심 타점 2]: SMA 40-60 골든크로스 및 크로스 시점 가격 기록
     df['is_sma40_60_bull'] = df['sma40'] >= df['sma60']

@@ -1915,7 +1915,7 @@ class SafeHoldingsThemeGateBot:
             act_state = self.strategies[active_code].position.state.value
             logger.info(
                 f"🔒 [1종목 순환매매 슬롯 1/1 점유] 봇 운용 종목: [{act_name}({active_code})] 상태: {act_state} "
-                f"➔ 120틱 테마 15-30 데드크로스(또는 60-120 DC) 시 전량 매도 고속 감시 중"
+                f"➔ 120틱 테마 15-120 데드크로스(또는 60-120 DC) 시 전량 매도 고속 감시 중"
             )
         else:
             lock_note = "09:30 Top10 확정" if getattr(self, 'top10_locked', False) else "09:30까지 4·3·2중복 Top10 엄선 중"
@@ -1941,7 +1941,7 @@ class SafeHoldingsThemeGateBot:
             if is_buy_cutoff and strat.position.state == StrategyState.IDLE:
                 continue
 
-            # ⚡ [보유 종목 초고속 15-30 DC 매도 감시]: 보유 중에는 비활성 후보 REST 스캔을 12초마다 분산
+            # ⚡ [보유 종목 초고속 15-120 DC 매도 감시]: 보유 중에는 비활성 후보 REST 스캔을 12초마다 분산
             if skip_idle_for_fast_exit and code != active_code and strat.position.state == StrategyState.IDLE:
                 continue
 
@@ -2178,6 +2178,11 @@ class SafeHoldingsThemeGateBot:
                             g120 = float(l120.get('theme_gate', np.nan))
                             yc120 = bool(l120.get('is_yellow_cloud', False))
                             bull15 = bool(l120.get('is_tema15_30_bull', False))
+                            bull15_120 = bool(l120.get('is_tema15_120_bull', False))
+                            t15_v = float(l120.get('tema15', np.nan))
+                            t30_v = float(l120.get('tema30', np.nan))
+                            t60_v = float(l120.get('tema60', np.nan))
+                            t120_v = float(l120.get('tema120', np.nan))
                             bs_gc = float(l120.get('bars_since_tema60_120_gc', np.nan))
                             bs_15_gc = float(l120.get('bars_since_tema15_30_gc', np.nan))
                             gc_badge = f"[60-120GC {int(bs_gc)}봉]" if (yc120 and not np.isnan(bs_gc) and bs_gc <= 3) else ""
@@ -2186,15 +2191,19 @@ class SafeHoldingsThemeGateBot:
                                 if (bull15 and not np.isnan(bs_15_gc) and bs_15_gc <= 3)
                                 else ("15>30" if bull15 else "15<=30")
                             )
+                            tag15_120 = "15>120" if bull15_120 else "15<=120"
                             wait_badge = ""
                             if ref_pos.state == StrategyState.IDLE:
                                 wait_badge = "[15<=30눌림·GC대기]" if getattr(ref_pos, 'saw_15_30_cooling', False) else "[15>30추격보류]"
-                            cloud_tag = f"양운(60>120){gc_badge}·{tag15}{wait_badge}" if yc120 else f"음운(60<120)·{tag15}{wait_badge}"
+                            cloud_tag = f"양운(60>120){gc_badge}·{tag15}·{tag15_120}{wait_badge}" if yc120 else f"음운(60<120)·{tag15}·{tag15_120}{wait_badge}"
+                            tema_nums = ""
+                            if not any(np.isnan(x) for x in (t15_v, t30_v, t60_v, t120_v)):
+                                tema_nums = f" [15:{t15_v:,.0f}/30:{t30_v:,.0f}/60:{t60_v:,.0f}/120:{t120_v:,.0f}]"
                             if not np.isnan(g120) and g120 > 0:
                                 g120_diff = ((tick_close - g120) / g120) * 100.0
-                                gate_120_str = f"{cloud_tag} 관문 {g120:,.0f}({g120_diff:+.2f}%)"
+                                gate_120_str = f"{cloud_tag} 관문 {g120:,.0f}({g120_diff:+.2f}%){tema_nums}"
                             else:
-                                gate_120_str = cloud_tag
+                                gate_120_str = f"{cloud_tag}{tema_nums}"
                     except Exception:
                         pass
 
@@ -2443,7 +2452,7 @@ class SafeHoldingsThemeGateBot:
         """실시간 반복 감시 시작 (09:30 조건검색 Top10 엄선 및 120틱 60>120·15-30 실시간 정밀 감시)"""
         logger.info(
             f"🔄 실시간 조건검색({self.condition_name}) 09:30 중복 4·3·2순 Top10 엄선 & "
-            f"120틱 (60>120 or 60-120 GC) + 15-30 골든/데드크로스 감시를 시작합니다 (대기 {interval_sec}초, 보유중 2초)."
+            f"120틱 (60>120 or 60-120 GC) & 15-30 골든크로스 매수 / 15-120 데드크로스 매도 감시를 시작합니다 (대기 {interval_sec}초, 보유중 2초)."
         )
         try:
             while True:
