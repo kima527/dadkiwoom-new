@@ -322,6 +322,27 @@ class RealAPIAdapter:
             logger.debug(f"현재가 조회 에러 ({stock_code}): {e}")
         return 0.0
 
+    def get_10m_candles(self, stock_code: str) -> pd.DataFrame:
+        """실전 10분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (TEMA 15·30·60·120 HTS 정합용 1500봉 확보)"""
+        try:
+            raw_candles = []
+            if hasattr(self.real_client, 'get_10min_candles'):
+                raw_candles = self.real_client.get_10min_candles(stock_code, last_n_days=60, limit=1500)
+            elif hasattr(self.real_client, '_fetch_minute_candles'):
+                raw_candles = self.real_client._fetch_minute_candles(stock_code, tic_scope="10", last_n_days=60, limit=1500)
+            return self._convert_raw_candles_to_df(raw_candles, stock_code, "10분봉")
+        except Exception as e:
+            logger.error(f"10분봉 데이터 조회 에러 ({stock_code}): {e}")
+            return pd.DataFrame()
+
+    def get_last_minute_fetch_ts(self, stock_code: str, tic_scope: str = "10") -> float:
+        try:
+            if hasattr(self.real_client, "get_last_minute_fetch_ts"):
+                return float(self.real_client.get_last_minute_fetch_ts(stock_code, tic_scope=tic_scope))
+        except Exception:
+            pass
+        return 0.0
+
     def get_120t_candles(self, stock_code: str) -> pd.DataFrame:
         """실전 120틱 데이터를 가져와서 Pandas DataFrame으로 변환 (TEMA 15·30·60·120 HTS 정합용 1800봉 확보)"""
         try:

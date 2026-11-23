@@ -78,6 +78,8 @@ class KiwoomRealClient:
         self.stock_info_api = StockInfo(base_url=self.base_url, token_manager=self.token_manager)
         self._tick_cache_lock = threading.Lock()
         self._tick_cache = {}
+        self._minute_cache_lock = threading.Lock()
+        self._minute_cache = {}
 
         # 💡 [Patch] kiwoom_rest_api 라이브러리가 acnt_no를 누락하는 문제를 해결하기 위해
         # 계좌 관련 및 주문 API의 _execute_request에 config.KIWOOM_ACCOUNT_NUM을 강제 주입
@@ -153,36 +155,155 @@ class KiwoomRealClient:
         clean = code.replace("_AL", "").replace("_NX", "")
         return clean + "_AL"
 
-    def _fetch_minute_candles(self, stock_code: str, tic_scope: str, last_n_days: int) -> list:
-        """분봉 차트 데이터의 공통 조회/파싱 메서드.
-        
+    def _get_minute_cache_state(self):
+        lock = getattr(self, "_minute_cache_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._minute_cache_lock = lock
+        cache = getattr(self, "_minute_cache", None)
+        if cache is None:
+            cache = {}
+            self._minute_cache = cache
+        return lock, cache
+
+    def get_last_minute_fetch_ts(self, stock_code: str, tic_scope: str = "10") -> float:
+        """해당 종목·분봉 단위의 가장 최근 REST 분봉 조회/캐시 기준 시각(epoch sec) 반환"""
+        try:
+            data_code = self._get_data_code(stock_code)
+            lock, cache = self._get_minute_cache_state()
+            with lock:
+                entry = cache.get((data_code, str(tic_scope)))
+                return float(entry.get("last_ts", 0.0) or 0.0) if entry else 0.0
+        except Exception:
+            return 0.0
+
+    def _fetch_minute_candles(self, stock_code: str, tic_scope: str, last_n_days: int, limit: Optional[int] = None) -> list:
+        """분봉 차트 데이터의 공통 조회/파싱 메서드. (ka10080 연속조회 및 단기 메모리 캐시 지원)
+
         Args:
             stock_code: 종목코드 (자동 정규화됨)
-            tic_scope: 분봉 간격 ("1", "3", "5", "15")
+            tic_scope: 분봉 간격 ("1", "3", "5", "10", "15", "30", "60")
             last_n_days: 최근 N일치 데이터만 반환
+            limit: 연속조회 포함 확보할 최대 봉 수 (None이면 단일 페이지 조회)
         """
-        # 야간장 시간에는 자동으로 _NX가 붙은 코드로 전환하여 실시간 데이터를 수신합니다.
         data_code = self._get_data_code(stock_code)
-        logger.debug(f"Fetching {tic_scope}-minute candles for stock code {data_code}...")
+        scope_key = str(tic_scope)
+        cache_key = (data_code, scope_key)
+        use_multi = (limit is not None and int(limit) > 0)
+        target_limit = max(1, int(limit)) if use_multi else 0
+        now_ts = time.time()
+
+        lock, cache = self._get_minute_cache_state()
+        with lock:
+            cached_entry = cache.get(cache_key)
+            cached_bars = list(cached_entry["candles"]) if (cached_entry and cached_entry.get("candles")) else []
+            cache_age = (now_ts - cached_entry["last_ts"]) if cached_entry else 9999.0
+            cached_target = cached_entry.get("target_limit", 0) if cached_entry else 0
+
+        # 1.5초 이내 동일 종목·분봉 재조회는 즉시 캐시 반환 (연속조회 모드)
+        if use_multi and cached_bars and cache_age <= 1.5 and (len(cached_bars) >= target_limit or cached_target >= target_limit):
+            return [dict(c) for c in cached_bars[-target_limit:]]
+
+        if use_multi:
+            warm_threshold = max(400, int(target_limit * 0.7))
+            has_warm_cache = (len(cached_bars) >= warm_threshold)
+            max_pages = 1 if has_warm_cache else max(1, min(4, (target_limit + 499) // 500))
+            logger.info(f"Fetching {scope_key}-minute candles for stock code {data_code} (target={target_limit}, pages<= {max_pages})...")
+        else:
+            has_warm_cache = False
+            max_pages = 1
+            logger.debug(f"Fetching {scope_key}-minute candles for stock code {data_code}...")
+
         try:
-            result = self.chart_api.stock_minute_chart_request_ka10080(
-                stk_cd=data_code,
-                tic_scope=tic_scope,
-                upd_stkpc_tp="1"
-            )
-            if not result:
-                return []
+            all_raw = []
+            cont_yn = "N"
+            next_key = ""
 
-            raw_candles = result.get("stk_min_pole_chart_qry", [])
-            if not raw_candles:
-                return []
+            for page_idx in range(max_pages):
+                result = None
+                res_cont, res_next = "N", ""
+                use_direct_http = bool(use_multi and getattr(self, "_minute_prefer_direct_http", False) and max_pages > 1)
 
-            parsed_candles = []
-            for item in raw_candles:
-                raw_time = item.get("cntr_tm", "").strip()
+                if cont_yn == "N":
+                    if use_direct_http:
+                        result, res_cont, res_next = self._fetch_tick_page_http(
+                            data_code, scope_key, cont_yn="N", next_key="", api_id="ka10080"
+                        )
+                    if not result:
+                        result = self.chart_api.stock_minute_chart_request_ka10080(
+                            stk_cd=data_code,
+                            tic_scope=scope_key,
+                            upd_stkpc_tp="1"
+                        )
+                        res_cont, res_next = self._extract_tick_cont_headers(result)
+                        if (
+                            use_multi
+                            and max_pages > 1
+                            and res_cont != "Y"
+                            and isinstance(result, dict)
+                        ):
+                            first_raw = result.get("stk_min_pole_chart_qry") or []
+                            if 0 < len(first_raw) < target_limit and self._get_bearer_token():
+                                http_res, h_cont, h_next = self._fetch_tick_page_http(
+                                    data_code, scope_key, cont_yn="N", next_key="", api_id="ka10080"
+                                )
+                                if http_res:
+                                    self._minute_prefer_direct_http = True
+                                    result, res_cont, res_next = http_res, h_cont, h_next
+                else:
+                    if self._get_bearer_token():
+                        result, res_cont, res_next = self._fetch_tick_page_http(
+                            data_code, scope_key, cont_yn=cont_yn, next_key=next_key, api_id="ka10080"
+                        )
+                    if not result:
+                        try:
+                            result = self.chart_api.stock_minute_chart_request_ka10080(
+                                stk_cd=data_code,
+                                tic_scope=scope_key,
+                                upd_stkpc_tp="1",
+                                cont_yn=cont_yn,
+                                next_key=next_key,
+                            )
+                            res_cont, res_next = self._extract_tick_cont_headers(result)
+                        except TypeError:
+                            break
+
+                if not result:
+                    break
+
+                raw_candles = result.get("stk_min_pole_chart_qry") or []
+                if not raw_candles:
+                    break
+
+                if all_raw and raw_candles:
+                    prev_last = all_raw[-1]
+                    curr_first = raw_candles[0]
+                    if (
+                        prev_last.get("cntr_tm") == curr_first.get("cntr_tm")
+                        and prev_last.get("cur_prc") == curr_first.get("cur_prc")
+                        and prev_last.get("trde_qty") == curr_first.get("trde_qty")
+                    ):
+                        raw_candles = raw_candles[1:]
+
+                all_raw.extend(raw_candles)
+                if use_multi and len(all_raw) >= target_limit:
+                    break
+                if not use_multi or res_cont != "Y" or not res_next:
+                    break
+                cont_yn = "Y"
+                next_key = res_next
+
+            if not all_raw:
+                return [dict(c) for c in cached_bars[-target_limit:]] if (use_multi and cached_bars) else []
+
+            parsed_by_time = {}
+            for item in all_raw:
+                raw_time = str(item.get("cntr_tm", "")).strip()
                 if len(raw_time) < 12:
                     continue
                 dt_str = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:00"
+                if dt_str in parsed_by_time:
+                    continue
                 date_only = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
 
                 try:
@@ -194,23 +315,44 @@ class KiwoomRealClient:
                 except (ValueError, TypeError):
                     continue
 
-                parsed_candles.append({
+                parsed_by_time[dt_str] = {
                     "time": dt_str,
                     "date": date_only,
                     "open": open_prc,
                     "high": high_prc,
                     "low": low_prc,
                     "close": close_prc,
-                    "volume": volume
-                })
+                    "volume": volume,
+                }
 
-            parsed_candles.sort(key=lambda x: x["time"])
-            unique_dates = sorted(list(set(c["date"] for c in parsed_candles)))
-            target_dates = unique_dates[-last_n_days:]
-            return [c for c in parsed_candles if c["date"] in target_dates]
+            parsed_candles = sorted(parsed_by_time.values(), key=lambda x: x["time"])
+            if not parsed_candles:
+                return [dict(c) for c in cached_bars[-target_limit:]] if (use_multi and cached_bars) else []
+
+            if use_multi and has_warm_cache:
+                first_fresh_time = parsed_candles[0]["time"]
+                older_prefix = [dict(c) for c in cached_bars if c["time"] < first_fresh_time]
+                merged = (older_prefix + parsed_candles)[-max(2400, target_limit):]
+            else:
+                merged = parsed_candles
+
+            unique_dates = sorted(list(set(c["date"] for c in merged)))
+            target_dates = unique_dates[-last_n_days:] if last_n_days and last_n_days > 0 else unique_dates
+            filtered = [c for c in merged if c["date"] in target_dates]
+
+            with lock:
+                cache[cache_key] = {
+                    "candles": merged if use_multi else [],
+                    "last_ts": time.time(),
+                    "target_limit": max(cached_target, target_limit) if use_multi else cached_target,
+                }
+
+            if use_multi:
+                return [dict(c) for c in filtered[-target_limit:]]
+            return filtered
         except Exception as e:
             logger.error(f"Error fetching {tic_scope}-min candles for {stock_code}: {e}")
-            return []
+            return [dict(c) for c in cached_bars[-target_limit:]] if (use_multi and cached_bars) else []
 
     def test_connection(self) -> bool:
         """
@@ -526,6 +668,10 @@ class KiwoomRealClient:
         """주식 종목의 5분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="5", last_n_days=last_n_days)
 
+    def get_10min_candles(self, stock_code: str, last_n_days: int = 60, limit: int = 1500) -> list:
+        """주식 종목의 10분봉 차트 데이터를 조회합니다. (TEMA 120 완전 수렴용 연속조회 포함 최대 1,500봉)"""
+        return self._fetch_minute_candles(stock_code, tic_scope="10", last_n_days=last_n_days, limit=limit)
+
     def get_15min_candles(self, stock_code: str, last_n_days: int = 7) -> list:
         """주식 종목의 15분봉 차트 데이터를 조회합니다."""
         return self._fetch_minute_candles(stock_code, tic_scope="15", last_n_days=last_n_days)
@@ -576,8 +722,8 @@ class KiwoomRealClient:
                 continue
         return ""
 
-    def _fetch_tick_page_http(self, data_code: str, tick_unit: str, cont_yn: str = "N", next_key: str = "") -> tuple:
-        """ka10079 연속조회 HTTP 헤더(cont-yn, next-key) 직접 확보용 보조 호출"""
+    def _fetch_tick_page_http(self, data_code: str, tick_unit: str, cont_yn: str = "N", next_key: str = "", api_id: str = "ka10079") -> tuple:
+        """ka10079/ka10080 연속조회 HTTP 헤더(cont-yn, next-key) 직접 확보용 보조 호출"""
         tok = self._get_bearer_token()
         if not tok:
             return {}, "N", ""
@@ -593,7 +739,7 @@ class KiwoomRealClient:
                 "authorization": f"Bearer {tok}",
                 "cont-yn": cont_yn,
                 "next-key": next_key,
-                "api-id": "ka10079",
+                "api-id": api_id,
             }
             payload = {
                 "stk_cd": data_code,
@@ -607,7 +753,7 @@ class KiwoomRealClient:
             res_next = str(resp.headers.get("next-key", "")).strip()
             return data, res_cont, res_next
         except Exception as http_err:
-            logger.debug(f"ka10079 direct HTTP continuation failed ({data_code}): {http_err}")
+            logger.debug(f"{api_id} direct HTTP continuation failed ({data_code}): {http_err}")
             return {}, "N", ""
 
     @staticmethod

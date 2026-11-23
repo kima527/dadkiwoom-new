@@ -276,6 +276,15 @@ class BigOrderStreakTracker:
 
 
 class SafeHoldingsThemeGateBot:
+    BOT_ENTRY_MODES = (
+        "STAGE1_5M_ANCHOR",
+        "STAGE1_M3_BREAKOUT",
+        "STAGE2_120T_GATE",
+        "120T_TEMA",
+        "120T_ROTATION",
+        "10M_TEMA",
+    )
+
     def __init__(
         self,
         is_real: bool = True,
@@ -317,7 +326,7 @@ class SafeHoldingsThemeGateBot:
             qty_tag = f"고정 {self.fixed_qty}주 실전 매매 (예수금 TR 생략)" if self.fixed_qty > 0 else "예수금 100% 매매"
             logger.info(
                 f" 🚀 [키움 실전 계좌 거래 모드] {qty_tag} + 09:30 조건검색({self.condition_name}) "
-                f"중복 4·3·2순 Top10 엄선 + 하락 후 120틱 60-120 GC 진입"
+                f"중복 4·3·2순 Top10 엄선 + 하락 후 10분 (60>120 or 60-120 GC) & 15-30 GC 진입"
             )
         else:
             logger.info(" 🧪 [시뮬레이션 모드] 가상 데이터 모드")
@@ -669,7 +678,7 @@ class SafeHoldingsThemeGateBot:
         ) or "체류인증 중복2+ 포착종목 없음"
         logger.info(
             f"🔒 [09:30 조건검색 Top10 최종 확정 락온] 체류인증 중복 4·3·2순 {len(top10)}개 엄선 완료 "
-            f"(신규 포착 마감 ➔ 하락 후 120틱 60-120 골든크로스 대기): [{summary}]"
+            f"(신규 포착 마감 ➔ 10분 (60>120 or 60-120 GC) & 15-30 골든크로스 대기): [{summary}]"
         )
 
     def get_5m_anchor(self, code: str, df_60m: Optional[pd.DataFrame], df_daily: Optional[pd.DataFrame], tick_close: float) -> dict:
@@ -775,7 +784,7 @@ class SafeHoldingsThemeGateBot:
             logger.info(
                 f"🔥 [세력 3,000만+ 연속 체결 {streak}연타 포착!] [{name}({code})] "
                 f"단가: {price:,.0f}원 | 순간체결: {amt/10000:,.0f}만 원({qty:,}주) (체결강도: {gangdo:.1f}%) "
-                f"➔ 세력 수급 확인 (하락 후 120틱 60-120 GC 타점 평가)"
+                f"➔ 세력 수급 확인 (10분 (60>120 or 60-120 GC) & 15-30 GC 타점 평가)"
             )
             self.condition_wakeup_event.set()
 
@@ -989,7 +998,7 @@ class SafeHoldingsThemeGateBot:
             if int(h.get('qty', 0)) > 1:
                 is_bot_trade = (
                     code in self.strategies
-                    and self.strategies[code].position.entry_mode in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]
+                    and self.strategies[code].position.entry_mode in self.BOT_ENTRY_MODES
                 )
                 if is_bot_trade:
                     h_copy = dict(h)
@@ -1059,7 +1068,7 @@ class SafeHoldingsThemeGateBot:
                     strat.position.total_qty = 0
                     strat.position.base_account_qty = 0
                     logger.info(
-                        f"   🔔 [{name}({code})] 조건검색 Top10 후보 편입 ({target_tag} | IDLE 대기 ➔ 하락 후 120틱 60-120 GC 감시)"
+                        f"   🔔 [{name}({code})] 조건검색 Top10 후보 편입 ({target_tag} | IDLE 대기 ➔ 10분 (60>120 or 60-120 GC) & 15-30 GC 감시)"
                     )
                 else:
                     # 🛡️ [기존 계좌 보유 자산 절대 보호 원칙]
@@ -1085,7 +1094,7 @@ class SafeHoldingsThemeGateBot:
         self.strategies = ordered_strategies
 
     def get_60m_candles(self, code: str) -> pd.DataFrame:
-        """60분봉 데이터 조회 (키움 실전 60분봉 API + 20초 단기 캐시로 120틱 폴링 대역폭 확보)"""
+        """60분봉 데이터 조회 (키움 실전 60분봉 API + 20초 단기 캐시로 10분봉 고속 폴링 대역폭 확보)"""
         if self.is_real and self.api:
             now_dt = datetime.now()
             now_ts = time.time()
@@ -1130,7 +1139,7 @@ class SafeHoldingsThemeGateBot:
         return df_60m
 
     def get_daily_candles(self, code: str) -> pd.DataFrame:
-        """일봉 데이터 조회 (60초 단기 캐시로 120틱 고속 조회 여력 확보)"""
+        """일봉 데이터 조회 (60초 단기 캐시로 10분봉 고속 조회 여력 확보)"""
         if self.is_real and self.api:
             now_ts = time.time()
             if hasattr(self, '_daily_cache') and code in self._daily_cache:
@@ -1151,6 +1160,30 @@ class SafeHoldingsThemeGateBot:
             from execution.generate_sample_data import generate_realistic_sample_data
         _, df_d = generate_realistic_sample_data(num_days=40)
         return df_d
+
+    def get_10m_candles(self, code: str) -> pd.DataFrame:
+        """실전 10분봉 데이터 조회 (TEMA 15·30·60·120 실차트 일치용 1500봉 확보)"""
+        if self.is_real and self.api:
+            try:
+                if hasattr(self.api, 'get_10m_candles'):
+                    df_10m = self.api.get_10m_candles(code)
+                    if df_10m is not None and not df_10m.empty and len(df_10m) >= 10:
+                        return df_10m
+                elif hasattr(self.api, 'real_client') and hasattr(self.api.real_client, 'get_10min_candles'):
+                    raw = self.api.real_client.get_10min_candles(code, last_n_days=60, limit=1500)
+                    if raw:
+                        df_raw = pd.DataFrame(raw)
+                        df_raw.columns = [c.lower() for c in df_raw.columns]
+                        if 'time' in df_raw.columns:
+                            t_parsed = pd.to_datetime(df_raw['time'], errors='coerce')
+                            if not t_parsed.is_monotonic_increasing and t_parsed.is_monotonic_decreasing:
+                                df_raw = df_raw.iloc[::-1]
+                            df_raw['time'] = t_parsed
+                            df_raw = df_raw.dropna(subset=['time']).set_index('time')
+                        return df_raw
+            except Exception as e:
+                logger.debug(f"10분봉 데이터 조회 에러 ({code}): {e}")
+        return pd.DataFrame()
 
     def get_120t_candles(self, code: str) -> pd.DataFrame:
         """실전 120틱 데이터 조회 (TEMA 15·30·60·120 실차트 일치용 1800봉 확보)"""
@@ -1272,7 +1305,7 @@ class SafeHoldingsThemeGateBot:
                 if (strat and strat.position.entry_mode)
                 else (prev_pos.entry_mode if prev_pos else "")
             )
-            if not entry_mode or entry_mode not in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]:
+            if not entry_mode or entry_mode not in self.BOT_ENTRY_MODES:
                 logger.error(
                     f"🛑 [기존 계좌 보유 자산 보호 긴급 차단] [{name}({code})] 봇이 당일 매수한 포지션이 아닙니다 (entry_mode: '{entry_mode}'). "
                     f"대표님의 기존 투자 자산(한화에어로스페이스 등) 보호를 위해 매도 주문 발송을 100% 원천 차단합니다!"
@@ -1407,14 +1440,14 @@ class SafeHoldingsThemeGateBot:
             # 타점 재발생 시 즉각 '재매수' 또는 '다음 1위 종목 매수'가 가능하도록 보장!
             self.sold_cooldowns[code] = time.time() + 20.0
             self.completed_trades_today += 1
-            logger.info(f"   👀 [{name}({code})] 전량 매도 완료 (당일 순환 {self.completed_trades_today}회) ➔ 다음 종목 교체(등락률<=20%) 120틱 관문선 타점 대기")
+            logger.info(f"   👀 [{name}({code})] 전량 매도 완료 (당일 순환 {self.completed_trades_today}회) ➔ 다음 종목 교체(등락률<=20%) 10분봉 타점 대기")
 
     def get_active_stock_code(self, exclude_codes: Optional[set[str]] = None) -> str | None:
         """
         👑 [대표님 지시]: 로직으로 사지 않은 기존 보유종목은 100% 완전 제외하고,
         '봇이 로직으로 직접 매수한 활성 종목(1종목)'만 반환합니다.
         - 봇 직접 매수 증표:
-          1) entry_mode 가 ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"] 중 하나여야 함
+          1) entry_mode 가 self.BOT_ENTRY_MODES (예: "10M_TEMA") 중 하나여야 함
           2) 전략 상태가 FIRST_BUY_DONE 또는 FULL_POSITION 이어야 함
           3) 봇 매수 수량(total_qty) > 0 이어야 함
         - 로직으로 사지 않은 기존 중장기 보유주식(한화에어로스페이스 등) 및 관심 1주 마커는 슬롯을 점유하지 않습니다!
@@ -1424,7 +1457,7 @@ class SafeHoldingsThemeGateBot:
                 continue
             
             entry_mode = getattr(strat.position, 'entry_mode', '')
-            is_bot_trade = entry_mode in ["STAGE1_5M_ANCHOR", "STAGE1_M3_BREAKOUT", "STAGE2_120T_GATE", "120T_TEMA", "120T_ROTATION"]
+            is_bot_trade = entry_mode in self.BOT_ENTRY_MODES
             is_active_state = strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
             has_qty = strat.position.total_qty > 0
 
@@ -1471,8 +1504,9 @@ class SafeHoldingsThemeGateBot:
         df_60m: Optional[pd.DataFrame] = None,
         df_120t: Optional[pd.DataFrame] = None,
         today_str: Optional[str] = None,
+        df_10m: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
-        """당일 거래량/거래대금(억원), 전일 거래대금(억원), 당일 120틱 형성 봉수를 산출합니다. (NXT 0원 일봉 보정 포함)"""
+        """당일 거래량/거래대금(억원), 전일 거래대금(억원), 당일 10분봉(또는 120틱) 형성 봉수를 산출합니다. (NXT 0원 일봉 보정 포함)"""
         today_str = (today_str or datetime.now().strftime('%Y%m%d')).replace('-', '').replace('/', '').strip()[:8]
 
         def _safe_float(val: Any, default: float = 0.0) -> float:
@@ -1531,13 +1565,15 @@ class SafeHoldingsThemeGateBot:
             first_open = _safe_float(today_df.iloc[0].get('open', 0.0)) if 'open' in today_df else 0.0
             return float(vols.sum()), float((vols * closes).sum()), int(len(today_df)), first_open
 
+        df_intraday = df_10m if df_10m is not None else df_120t
+        bar_timeframe = "10m" if df_10m is not None else "120t"
         vol_60m_today, val_60m_today, bars_60m_today, open_60m_today = _sum_intraday(df_60m)
-        vol_120t_today, val_120t_today, t120_today_bars, _ = _sum_intraday(df_120t)
+        vol_120t_today, val_120t_today, t120_today_bars, _ = _sum_intraday(df_intraday)
 
         if day_open_p <= 0 and open_60m_today > 0:
             day_open_p = open_60m_today
 
-        # NXT 프리마켓(08:00~08:50)에는 일봉 volume이 0이므로 60분봉/120틱 당일 합산치로 자동 보정
+        # NXT 프리마켓(08:00~08:50)에는 일봉 volume이 0이므로 60분봉/10분봉 당일 합산치로 자동 보정
         today_vol = max(vol_daily_today, vol_60m_today, vol_120t_today)
         today_val_won = max(val_daily_today, val_60m_today, val_120t_today)
         if today_val_won <= 0 and today_vol > 0:
@@ -1554,6 +1590,8 @@ class SafeHoldingsThemeGateBot:
             'prev_day_val_eok': prev_day_val_eok,
             'bars_60m_today': bars_60m_today,
             't120_today_bars': t120_today_bars,
+            'm10_today_bars': t120_today_bars,
+            'bar_timeframe': bar_timeframe,
         }
 
     def evaluate_liquidity_activity(
@@ -1565,52 +1603,56 @@ class SafeHoldingsThemeGateBot:
         metrics: Optional[Dict[str, Any]] = None,
         now_t: Optional[dtime] = None,
         today_str: Optional[str] = None,
+        df_10m: Optional[pd.DataFrame] = None,
     ) -> Tuple[bool, str]:
         """
-        💧 [실시간 유동성·거래대금 및 120틱 체결 활성도 게이트]
-        당일 실제 체결량·거래대금이 미미해 120틱 지표가 전일 봉에 멈춰있는 초저유동성 종목이
+        💧 [실시간 유동성·거래대금 및 10분봉(또는 120틱) 체결 활성도 게이트]
+        당일 실제 체결량·거래대금이 미미해 지표가 전일 봉에 멈춰있는 초저유동성 종목이
         1/1 회전 슬롯을 선점하여 조건중복 대장주 진입을 막는 현상을 차단합니다.
         """
         m = metrics or self._compute_liquidity_metrics(
-            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, today_str=today_str
+            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, today_str=today_str, df_10m=df_10m
         )
         cur_t = now_t or datetime.now().time()
         today_val_eok = float(m['today_val_eok'])
         prev_val_eok = float(m['prev_day_val_eok'])
-        t120_bars = int(m['t120_today_bars'])
+        bar_tf = str(m.get('bar_timeframe', '10m' if df_10m is not None else '120t'))
+        intraday_bars = int(m.get('m10_today_bars', m.get('t120_today_bars', 0)))
+        tf_short = "10m" if bar_tf == "10m" else "120t"
+        tf_kr = "10분봉" if bar_tf == "10m" else "120틱"
 
         is_premarket = cur_t < dtime(9, 0, 0)
         is_early_nxt = dtime(8, 0, 0) <= cur_t < dtime(8, 3, 0)
         is_early_krx = dtime(9, 0, 0) <= cur_t < dtime(9, 3, 0)
 
-        min_t120_active = 3
+        min_bars_active = 1 if bar_tf == "10m" else 3
         min_today_val_active = 3.0 if is_premarket else 10.0
 
-        # 장초반 3분 내더라도 이미 활성 세션 유동성(거래대금·120틱 봉수)을 돌파한 주도주는 즉시 허용
+        # 장초반 3분 내더라도 이미 활성 세션 유동성(거래대금·당일 봉수)을 돌파한 주도주는 즉시 허용
         if (
-            t120_bars >= min_t120_active
+            intraday_bars >= min_bars_active
             and today_val_eok >= min_today_val_active
             and (prev_val_eok >= 10.0 or today_val_eok >= 10.0)
         ):
-            return True, f"당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / 120t {t120_bars}봉"
+            return True, f"당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / {tf_short} {intraday_bars}봉"
 
         if is_early_nxt or is_early_krx:
             min_val_early = 0.5 if is_early_nxt else 2.0
             min_prev_early = 50.0
             reasons = []
-            if t120_bars < 1:
-                reasons.append(f"당일 120틱 {t120_bars}봉 < 1봉")
+            if intraday_bars < 1:
+                reasons.append(f"당일 {tf_kr} {intraday_bars}봉 < 1봉")
             if today_val_eok < min_val_early:
                 reasons.append(f"금일거래대금 {today_val_eok:.2f}억 < {min_val_early:.1f}억")
             if prev_val_eok < min_prev_early:
                 reasons.append(f"장초반 전일거래대금 {prev_val_eok:.1f}억 < {min_prev_early:.0f}억")
             if reasons:
                 return False, " | ".join(reasons)
-            return True, f"장초반 유동성 충족 (당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / 120t {t120_bars}봉)"
+            return True, f"장초반 유동성 충족 (당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / {tf_short} {intraday_bars}봉)"
 
         reasons = []
-        if t120_bars < min_t120_active:
-            reasons.append(f"당일 120틱 형성 {t120_bars}봉 < {min_t120_active}봉(체결 부재)")
+        if intraday_bars < min_bars_active:
+            reasons.append(f"당일 {tf_kr} 형성 {intraday_bars}봉 < {min_bars_active}봉(체결 부재)")
         if today_val_eok < min_today_val_active:
             reasons.append(f"금일거래대금 {today_val_eok:.2f}억 < {min_today_val_active:.0f}억")
         if prev_val_eok < 10.0 and today_val_eok < 10.0:
@@ -1618,7 +1660,7 @@ class SafeHoldingsThemeGateBot:
 
         if reasons:
             return False, " | ".join(reasons)
-        return True, f"당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / 120t {t120_bars}봉"
+        return True, f"당일 {today_val_eok:.1f}억 / 전일 {prev_val_eok:.1f}억 / {tf_short} {intraday_bars}봉"
 
     def calculate_priority_score(
         self,
@@ -1633,7 +1675,8 @@ class SafeHoldingsThemeGateBot:
         vol_ratio_prev: Optional[float] = None,
         session_target_vol: Optional[float] = None,
         df_120t: Optional[pd.DataFrame] = None,
-        today_str: Optional[str] = None
+        today_str: Optional[str] = None,
+        df_10m: Optional[pd.DataFrame] = None,
     ) -> Tuple[float, Dict[str, Any]]:
         """
         ⚡ [세션별 차등 번개 돌파 + 실제 거래대금 검증 1위 선정 체계 - 100.0점 정규화]
@@ -1641,7 +1684,7 @@ class SafeHoldingsThemeGateBot:
            - 금일 거래대금 3억 미만은 % 착시 방지를 위해 속도점수 0점, 10억 미만 15점 상한, 30억 미만 28점 상한
         2. 🥈 시가 무훼손 양봉 순도 (20점 만점, 3억 미만 보합/1호가 캔들은 0점)
         3. 🥉 기준선(M선) 안착 이격도 (20점 만점)
-        4. ⚡ 120틱 듀얼 골든크로스 (10점 만점)
+        4. ⚡ 10분봉(또는 120틱) 듀얼 골든크로스 (10점 만점)
         5. 🔥 시초가 모멘텀 (+1.5%, 10점 만점) + 유동성 규모 가산점 (+0~+10점)
         """
         # 세션별 차등 목표 거래량 기준 설정 (프리 1.5%, 정규장 3.0%, 애프터 1.0%)
@@ -1652,7 +1695,7 @@ class SafeHoldingsThemeGateBot:
             target_vol, target_name = get_session_volume_target()
 
         liq = self._compute_liquidity_metrics(
-            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, today_str=today_str
+            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, today_str=today_str, df_10m=df_10m
         )
         today_str = liq['today_str']
         day_val_eok = liq['today_val_eok']
@@ -1746,10 +1789,11 @@ class SafeHoldingsThemeGateBot:
             pre_close = float(last_daily.get('close', tick_close))
         day_ret_pct = ((tick_close - pre_close) / pre_close * 100.0) if pre_close > 0 else 0.0
 
-        # 4. 120틱 듀얼 골든크로스(테마 60>120·15-30 GC & SMA 40-60 GC) 점수 (10점 만점)
+        # 4. 10분봉 듀얼 골든크로스(테마 60>120·15-30 GC & SMA 40-60 GC) 점수 (10점 만점)
+        df_wave_intraday = df_10m if df_10m is not None else df_120t
         score_120t = 0.0
-        if df_120t is not None and len(df_120t) >= 40 and 'close' in df_120t:
-            df_120t_calc = calculate_120t_tema_indicators(df_120t, current_price=tick_close)
+        if df_wave_intraday is not None and len(df_wave_intraday) >= 40 and 'close' in df_wave_intraday:
+            df_120t_calc = calculate_120t_tema_indicators(df_wave_intraday, current_price=tick_close)
             if not df_120t_calc.empty:
                 last_120 = df_120t_calc.iloc[-1]
                 is_yellow_cloud = bool(last_120.get('is_yellow_cloud', False))
@@ -1827,6 +1871,7 @@ class SafeHoldingsThemeGateBot:
             'upper_shadow_ratio': upper_shadow_ratio,
             'score_shape': score_shape,
             'score_120t': score_120t,
+            'score_10m': score_120t,
             'score_morning': score_morning,
             'score_global': score_global,
             'score_big_streak': score_big_streak,
@@ -1838,6 +1883,7 @@ class SafeHoldingsThemeGateBot:
             'day_val_eok': day_val_eok,
             'prev_day_val_eok': prev_day_val_eok,
             't120_today_bars': t120_today_bars,
+            'm10_today_bars': liq.get('m10_today_bars', t120_today_bars),
         }
         return total_score, details
 
@@ -1915,13 +1961,13 @@ class SafeHoldingsThemeGateBot:
             act_state = self.strategies[active_code].position.state.value
             logger.info(
                 f"🔒 [1종목 순환매매 슬롯 1/1 점유] 봇 운용 종목: [{act_name}({active_code})] 상태: {act_state} "
-                f"➔ 120틱 테마 15-120 데드크로스(또는 60-120 DC) 시 전량 매도 고속 감시 중"
+                f"➔ 10분 테마 15-120 데드크로스(또는 60-120 DC) 시 전량 매도 고속 감시 중"
             )
         else:
             lock_note = "09:30 Top10 확정" if getattr(self, 'top10_locked', False) else "09:30까지 4·3·2중복 Top10 엄선 중"
             logger.info(
                 f"🔓 [1종목 순환매매 슬롯 0/1 비어있음] 봇 운용 종목 없음 ({lock_note}) "
-                "➔ Top10 중 120틱 (60>120 or 60-120 GC) & 15-30 골든크로스 발생 시 1위 종목 진입 대기"
+                "➔ Top10 중 10분 (60>120 or 60-120 GC) & 15-30 골든크로스 발생 시 1위 종목 진입 대기"
             )
 
         buy_candidates = []
@@ -1960,23 +2006,26 @@ class SafeHoldingsThemeGateBot:
                     logger.warning(f"⚠️ [{name}({code})] 실전 차트 데이터(60분봉/일봉) 수신 대기 중 ➔ 이번 사이클 평가 스킵")
                     continue
 
-                # ⚡ [120틱 TR 선조회 및 실시간 현재가 시각 동기화]:
-                # REST 120틱 조회시각보다 더 최신인 0B 패킷만 덧씌워 구버전 0B가 최신 120틱 종가를 덮어쓰는 현상 원천 차단
+                # ⚡ [10분봉 TR 선조회 및 실시간 현재가 시각 동기화]:
+                # REST 10분봉 조회시각보다 더 최신인 0B 패킷만 덧씌워 구버전 0B가 최신 10분봉 종가를 덮어쓰는 현상 원천 차단
                 h_info = self.active_holdings.get(code, {})
                 acc_price = float(h_info.get('current_price', 0.0) or 0.0)
                 is_cond_pick = bool(h_info.get('is_condition_pick', False)) or (code in self.condition_picks)
-                need_120t = (
+                need_10m = (
                     strat.position.state in [StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION]
                     or is_cond_pick
                 )
-                df_120t = self.get_120t_candles(code) if need_120t else pd.DataFrame()
-                tick_fetch_ts = 0.0
-                if need_120t and self.is_real and self.api and hasattr(self.api, 'get_last_tick_fetch_ts'):
-                    tick_fetch_ts = float(self.api.get_last_tick_fetch_ts(code) or 0.0)
+                df_10m = self.get_10m_candles(code) if need_10m else pd.DataFrame()
+                bar_fetch_ts = 0.0
+                if need_10m and self.is_real and self.api:
+                    if hasattr(self.api, 'get_last_minute_fetch_ts'):
+                        bar_fetch_ts = float(self.api.get_last_minute_fetch_ts(code, tic_scope="10") or 0.0)
+                    elif hasattr(self.api, 'get_last_tick_fetch_ts'):
+                        bar_fetch_ts = float(self.api.get_last_tick_fetch_ts(code) or 0.0)
 
-                candle_120_close = (
-                    float(df_120t.iloc[-1]['close'])
-                    if (df_120t is not None and not df_120t.empty and 'close' in df_120t.columns)
+                candle_10m_close = (
+                    float(df_10m.iloc[-1]['close'])
+                    if (df_10m is not None and not df_10m.empty and 'close' in df_10m.columns)
                     else 0.0
                 )
                 candle_close = float(df_60m.iloc[-1]['close']) if not df_60m.empty else 0.0
@@ -1986,12 +2035,12 @@ class SafeHoldingsThemeGateBot:
                     ws_tick
                     and (time.time() - ws_ts) <= 15.0
                     and float(ws_tick.get('price', 0.0) or 0.0) > 0
-                    and (tick_fetch_ts <= 0.0 or ws_ts >= tick_fetch_ts)
+                    and (bar_fetch_ts <= 0.0 or ws_ts >= bar_fetch_ts)
                 )
                 if is_ws_fresh:
                     tick_close = float(ws_tick['price'])
-                elif candle_120_close > 0:
-                    tick_close = candle_120_close
+                elif candle_10m_close > 0:
+                    tick_close = candle_10m_close
                 elif exchange_hint == "NXT" and candle_close > 0:
                     tick_close = candle_close
                 elif acc_price > 0:
@@ -2088,7 +2137,7 @@ class SafeHoldingsThemeGateBot:
                         df_daily=df_daily,
                         day3_m_line=day3_m_line,
                         current_price=tick_close,
-                        df_120t=df_120t,
+                        df_10m=df_10m,
                         is_condition_pick=is_cond_pick,
                         day_alpha=day_alpha,
                         open_5m=open_5m,
@@ -2169,23 +2218,23 @@ class SafeHoldingsThemeGateBot:
                     state_display = ref_pos.state.value
 
                 qual_str = f"교체가능(<=20%)" if is_replacement_mode else daily_3_5_label
-                gate_120_str = "산출대기"
-                if df_120t is not None and not df_120t.empty and len(df_120t) >= 25 and 'close' in df_120t:
+                gate_10m_str = "산출대기"
+                if df_10m is not None and not df_10m.empty and len(df_10m) >= 25 and 'close' in df_10m:
                     try:
-                        df120_view = calculate_120t_tema_indicators(df_120t, current_price=tick_close)
-                        if not df120_view.empty:
-                            l120 = df120_view.iloc[-1]
-                            g120 = float(l120.get('theme_gate', np.nan))
-                            yc120 = bool(l120.get('is_yellow_cloud', False))
-                            bull15 = bool(l120.get('is_tema15_30_bull', False))
-                            bull15_120 = bool(l120.get('is_tema15_120_bull', False))
-                            t15_v = float(l120.get('tema15', np.nan))
-                            t30_v = float(l120.get('tema30', np.nan))
-                            t60_v = float(l120.get('tema60', np.nan))
-                            t120_v = float(l120.get('tema120', np.nan))
-                            bs_gc = float(l120.get('bars_since_tema60_120_gc', np.nan))
-                            bs_15_gc = float(l120.get('bars_since_tema15_30_gc', np.nan))
-                            gc_badge = f"[60-120GC {int(bs_gc)}봉]" if (yc120 and not np.isnan(bs_gc) and bs_gc <= 3) else ""
+                        df10m_view = calculate_120t_tema_indicators(df_10m, current_price=tick_close)
+                        if not df10m_view.empty:
+                            l10m = df10m_view.iloc[-1]
+                            g10m = float(l10m.get('theme_gate', np.nan))
+                            yc10m = bool(l10m.get('is_yellow_cloud', False))
+                            bull15 = bool(l10m.get('is_tema15_30_bull', False))
+                            bull15_120 = bool(l10m.get('is_tema15_120_bull', False))
+                            t15_v = float(l10m.get('tema15', np.nan))
+                            t30_v = float(l10m.get('tema30', np.nan))
+                            t60_v = float(l10m.get('tema60', np.nan))
+                            t120_v = float(l10m.get('tema120', np.nan))
+                            bs_gc = float(l10m.get('bars_since_tema60_120_gc', np.nan))
+                            bs_15_gc = float(l10m.get('bars_since_tema15_30_gc', np.nan))
+                            gc_badge = f"[60-120GC {int(bs_gc)}봉]" if (yc10m and not np.isnan(bs_gc) and bs_gc <= 3) else ""
                             tag15 = (
                                 f"15>30[GC {int(bs_15_gc)}봉]"
                                 if (bull15 and not np.isnan(bs_15_gc) and bs_15_gc <= 3)
@@ -2195,20 +2244,20 @@ class SafeHoldingsThemeGateBot:
                             wait_badge = ""
                             if ref_pos.state == StrategyState.IDLE:
                                 wait_badge = "[15<=30눌림·GC대기]" if getattr(ref_pos, 'saw_15_30_cooling', False) else "[15>30추격보류]"
-                            cloud_tag = f"양운(60>120){gc_badge}·{tag15}·{tag15_120}{wait_badge}" if yc120 else f"음운(60<120)·{tag15}·{tag15_120}{wait_badge}"
+                            cloud_tag = f"양운(60>120){gc_badge}·{tag15}·{tag15_120}{wait_badge}" if yc10m else f"음운(60<120)·{tag15}·{tag15_120}{wait_badge}"
                             tema_nums = ""
                             if not any(np.isnan(x) for x in (t15_v, t30_v, t60_v, t120_v)):
                                 tema_nums = f" [15:{t15_v:,.0f}/30:{t30_v:,.0f}/60:{t60_v:,.0f}/120:{t120_v:,.0f}]"
-                            if not np.isnan(g120) and g120 > 0:
-                                g120_diff = ((tick_close - g120) / g120) * 100.0
-                                gate_120_str = f"{cloud_tag} 관문 {g120:,.0f}({g120_diff:+.2f}%){tema_nums}"
+                            if not np.isnan(g10m) and g10m > 0:
+                                g10m_diff = ((tick_close - g10m) / g10m) * 100.0
+                                gate_10m_str = f"{cloud_tag} 관문 {g10m:,.0f}({g10m_diff:+.2f}%){tema_nums}"
                             else:
-                                gate_120_str = f"{cloud_tag}{tema_nums}"
+                                gate_10m_str = f"{cloud_tag}{tema_nums}"
                     except Exception:
                         pass
 
                 liq_metrics = self._compute_liquidity_metrics(
-                    tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t
+                    tick_close, df_daily=df_daily, df_60m=df_60m, df_10m=df_10m
                 )
                 with self.condition_lock:
                     c_entry = self.condition_picks.get(code)
@@ -2216,14 +2265,14 @@ class SafeHoldingsThemeGateBot:
                         c_entry['day_val_eok'] = float(liq_metrics.get('today_val_eok', 0.0) or 0.0)
                 liq_tag = (
                     f"거래: {liq_metrics['today_val_eok']:,.1f}억"
-                    f"(전일 {liq_metrics['prev_day_val_eok']:,.1f}억·120t {liq_metrics['t120_today_bars']}봉)"
-                    if need_120t
+                    f"(전일 {liq_metrics['prev_day_val_eok']:,.1f}억·10m {liq_metrics.get('m10_today_bars', 0)}봉)"
+                    if need_10m
                     else f"거래: {liq_metrics['today_val_eok']:,.1f}억(전일 {liq_metrics['prev_day_val_eok']:,.1f}억)"
                 )
 
                 logger.info(
                     f"📊 {source_badge}[{name}]{mkt_tag} 상태: {state_display}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f}({day_ret_pct:+.2f}%) | "
-                    f"자격: {qual_str} | 120틱: {gate_120_str} | 60분: {align_str} | {m3_str} | {liq_tag}"
+                    f"자격: {qual_str} | 10분: {gate_10m_str} | 60분: {align_str} | {m3_str} | {liq_tag}"
                 )
 
                 eff_qty = cur_qty if (self.is_real and not self.dry_run) else max(
@@ -2313,20 +2362,20 @@ class SafeHoldingsThemeGateBot:
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
 
-                        # 💧 [실시간 유동성·거래대금 및 120틱 체결 활성도 게이트]: 허수·초저유동성 종목 1/1 슬롯 진입 원천 차단
+                        # 💧 [실시간 유동성·거래대금 및 10분봉 체결 활성도 게이트]: 허수·초저유동성 종목 1/1 슬롯 진입 원천 차단
                         is_liq_ok, liq_reason = self.evaluate_liquidity_activity(
-                            tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t, metrics=liq_metrics
+                            tick_close, df_daily=df_daily, df_60m=df_60m, df_10m=df_10m, metrics=liq_metrics
                         )
                         if not is_liq_ok:
                             logger.info(
                                 f"   🚫 [유동성·체결량 미달 차단] [{name}({code})] {liq_reason} "
-                                f"➔ 120틱·관문선 타점이 떠도 거래 미형성 종목 1/1 슬롯 점유 원천 차단"
+                                f"➔ 10분·관문선 타점이 떠도 거래 미형성 종목 1/1 슬롯 점유 원천 차단"
                             )
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
 
                         p_score, p_details = self.calculate_priority_score(
-                            code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1, df_daily=df_daily, df_120t=df_120t
+                            code, name, tick_close, last_60m, last_daily, df_60m, pre_day_close=pred1, df_daily=df_daily, df_10m=df_10m
                         )
                         # 🏆 [1) 금일 지수 대비 초과강도(RS Alpha) 가산점 (+4~+10점) & 실시간 조건검색 중복 포착 가산점]
                         rs_alpha_bonus = 0.0
@@ -2420,17 +2469,17 @@ class SafeHoldingsThemeGateBot:
 
                 mode_tag = (
                     f"{w_fut_label} {w_fut_badge} "
-                    f"{'순환교체(등락률<=20%) 120틱 관문선 1차' if self.completed_trades_today > 0 else '일봉 3-5 자격 120틱 관문선 1차'}"
+                    f"{'순환교체(등락률<=20%) 10분 관문선 1차' if self.completed_trades_today > 0 else '일봉 3-5 자격 10분 관문선 1차'}"
                 )
 
                 streak_tag = f", 🔥세력3천만+: {w_d.get('big_order_streak')}연타(+{w_d.get('score_big_streak', 0.0):.0f}점)" if w_d.get('big_order_streak', 0) > 0 else ""
                 logger.info(
                     f"👑 [1종목 순환매매 1위 매수 집행] [{w_name}({w_code})] [🔥조건중복 {winner.get('cond_overlap', 0)}/{self.condition_total}] "
                     f"점수 1위: {w_score:.1f}점 ({mode_tag}) ➔ {w_order.qty}주 1차 실전 매수 집행! "
-                    f"[💧거래대금: {w_d.get('day_val_eok', 0.0):,.1f}억(120t {w_d.get('t120_today_bars', 0)}봉), "
+                    f"[💧거래대금: {w_d.get('day_val_eok', 0.0):,.1f}억(10m {w_d.get('m10_today_bars', w_d.get('t120_today_bars', 0))}봉), "
                     f"⚡전일대비 거래량: {w_d.get('vol_ratio_prev', 0.0):.1f}%, "
                     f"시가지지 캔들순도: {w_d.get('score_shape', 0.0):.0f}점, "
-                    f"기준선안착: {w_d.get('gijun_diff_pct', 0.0):+.2f}%, 120틱WMA: {w_d.get('score_120t', 0.0):.0f}점{streak_tag}]"
+                    f"기준선안착: {w_d.get('gijun_diff_pct', 0.0):+.2f}%, 10분WMA: {w_d.get('score_10m', w_d.get('score_120t', 0.0)):.0f}점{streak_tag}]"
                 )
                 self.execute_order(
                     w_code,
@@ -2449,10 +2498,10 @@ class SafeHoldingsThemeGateBot:
                     self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
 
     def start_loop(self, interval_sec: int = 5):
-        """실시간 반복 감시 시작 (09:30 조건검색 Top10 엄선 및 120틱 60>120·15-30 실시간 정밀 감시)"""
+        """실시간 반복 감시 시작 (09:30 조건검색 Top10 엄선 및 10분 60>120·15-30 실시간 정밀 감시)"""
         logger.info(
             f"🔄 실시간 조건검색({self.condition_name}) 09:30 중복 4·3·2순 Top10 엄선 & "
-            f"120틱 (60>120 or 60-120 GC) & 15-30 골든크로스 매수 / 15-120 데드크로스 매도 감시를 시작합니다 (대기 {interval_sec}초, 보유중 2초)."
+            f"10분 (60>120 or 60-120 GC) & 15-30 골든크로스 매수 / 15-120 데드크로스 매도 감시를 시작합니다 (대기 {interval_sec}초, 보유중 2초)."
         )
         try:
             while True:

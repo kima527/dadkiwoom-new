@@ -285,6 +285,9 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     
     return df
 
+
+calculate_10m_tema_indicators = calculate_120t_tema_indicators
+
 def calculate_day3_m_line(df_daily: Optional[pd.DataFrame], current_price: float) -> Tuple[float, float, float, float]:
     """
     영웅문(키움 HTS) 실시간 3일선 M/3 수식선 계산:
