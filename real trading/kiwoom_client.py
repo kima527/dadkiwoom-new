@@ -660,9 +660,9 @@ class KiwoomRealClient:
             candles = self.get_1min_candles(stock_code, last_n_days=last_n_days)
         return candles
 
-    def get_3min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
-        """주식 종목의 3분봉 차트 데이터를 조회합니다."""
-        return self._fetch_minute_candles(stock_code, tic_scope="3", last_n_days=last_n_days)
+    def get_3min_candles(self, stock_code: str, last_n_days: int = 30, limit: Optional[int] = 2400) -> list:
+        """주식 종목의 3분봉 차트 데이터를 조회합니다. (TEMA 60·120·240 완전 수렴용 연속조회 포함 최대 2,400봉)"""
+        return self._fetch_minute_candles(stock_code, tic_scope="3", last_n_days=last_n_days, limit=limit)
 
     def get_5min_candles(self, stock_code: str, last_n_days: int = 2) -> list:
         """주식 종목의 5분봉 차트 데이터를 조회합니다."""

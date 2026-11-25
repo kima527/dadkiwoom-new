@@ -265,9 +265,16 @@ class RealAPIAdapter:
             return pd.DataFrame()
 
     def get_3m_candles(self, stock_code: str) -> pd.DataFrame:
-        """실전 3분봉 데이터를 가져와서 Pandas DataFrame으로 변환"""
+        """실전 3분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (TEMA 60·120·240 HTS 정합용 2400봉 확보)"""
         try:
-            raw_candles = self.real_client.get_3min_candles(stock_code, last_n_days=2)
+            raw_candles = []
+            if hasattr(self.real_client, 'get_3min_candles'):
+                try:
+                    raw_candles = self.real_client.get_3min_candles(stock_code, last_n_days=30, limit=2400)
+                except TypeError:
+                    raw_candles = self.real_client.get_3min_candles(stock_code, last_n_days=30)
+            elif hasattr(self.real_client, '_fetch_minute_candles'):
+                raw_candles = self.real_client._fetch_minute_candles(stock_code, tic_scope="3", last_n_days=30, limit=2400)
             return self._convert_raw_candles_to_df(raw_candles, stock_code, "3분봉")
         except Exception as e:
             logger.error(f"3분봉 조회 에러 ({stock_code}): {e}")
