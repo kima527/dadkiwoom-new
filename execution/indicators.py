@@ -248,6 +248,8 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     df['tri_gate_ceiling'] = df[['theme_gate', 'wma_gate', 'wma_gate_high']].max(axis=1, skipna=True)
     df['tri_gate_floor'] = df[['theme_gate', 'wma_gate']].min(axis=1, skipna=True)
     df['is_above_tri_gates'] = df['close'] >= (df['tri_gate_ceiling'] * 0.999)
+    theme_gate_events = df['theme_gate'].where(df['gate_cross_up'])
+    df['prev_theme_gate'] = theme_gate_events.dropna().shift(1).reindex(df.index).ffill()
 
     gijun_at_peak = df['theme_gijun'].where(df['is_gijun_peak'])
     prev_gijun_peak = gijun_at_peak.dropna().shift(1).reindex(df.index).ffill()

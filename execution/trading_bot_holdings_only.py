@@ -2168,7 +2168,7 @@ class SafeHoldingsThemeGateBot:
             act_state = act_pos.state.value
             logger.info(
                 f"🔒 [1종목 순환매매 슬롯 1/1 점유] 봇 운용 종목: [{act_name}({active_code})] 상태: {act_state}(W{act_pos.wave_no}) "
-                f"➔ 120틱 5-60 GC(2차) · 기준선/5-60 DC 분할·청산 고속 감시 중"
+                f"➔ 120틱 5-60 DC 전량매도 · 직전테마관문선({act_pos.ratchet_prev_theme_gate:,.0f})/-2.5% 스탑로스 감시 중"
             )
         else:
             lock_note = "09:30 Top10 확정" if getattr(self, 'top10_locked', False) else "09:30까지 4·3·2중복 Top10 엄선 중"
@@ -2178,7 +2178,7 @@ class SafeHoldingsThemeGateBot:
                 sticky_note = f" | 🏆우선감시:[{self.sticky_leader.get('name')}]({rem_sticky:.0f}s)"
             logger.info(
                 f"🔓 [1종목 순환매매 슬롯 0/1 비어있음] 봇 운용 종목 없음 ({lock_note}{sticky_note}) "
-                "➔ 120틱 5-40 GC(1파) 또는 수익후 3관문 재돌파(N파) 대기"
+                "➔ 120틱 SMA 40<60 & 3관문(테마·WMA·WMA고가) 돌파 대기"
             )
 
         buy_candidates = []
@@ -2485,8 +2485,10 @@ class SafeHoldingsThemeGateBot:
                                 tc_diff = ((tick_close - tc_v) / tc_v) * 100.0
                                 tri_badge = f" · 3관문{'돌파' if tick_close >= tc_v * 1.001 else '대기'} {tc_v:,.0f}({tc_diff:+.2f}%)"
                             gj_badge = ""
-                            if strat.position.target_gijun_price > 0 or strat.position.support_gijun_price > 0:
-                                gj_badge = f" · 기준[목표:{strat.position.target_gijun_price:,.0f}/지지:{strat.position.support_gijun_price:,.0f}]"
+                            if getattr(strat.position, 'ratchet_prev_theme_gate', 0.0) > 0:
+                                gj_badge = f" · 직전관문스탑:{strat.position.ratchet_prev_theme_gate:,.0f}"
+                            elif getattr(strat.position, 'highest_theme_gate', 0.0) > 0:
+                                gj_badge = f" · 관문스탑대기(기준:{strat.position.highest_theme_gate:,.0f})"
                             if not np.isnan(g120) and g120 > 0:
                                 g120_diff = ((tick_close - g120) / g120) * 100.0
                                 gate_120t_str = f"{sma_tag}{tri_badge}{gj_badge} 관문 {g120:,.0f}({g120_diff:+.2f}%){sma_nums}"
