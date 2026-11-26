@@ -296,6 +296,7 @@ class ThemeGate60mStrategy:
         s5 = np.nan
         s40 = np.nan
         s60 = np.nan
+        is_sma40_lt_60 = False
         is_sma5_40_bull = False
         is_sma5_40_gc_bar = False
         is_sma5_40_dc_bar = False
@@ -350,6 +351,9 @@ class ThemeGate60mStrategy:
                 s5 = float(last_120t.get('sma5', np.nan))
                 s40 = float(last_120t.get('sma40', np.nan))
                 s60 = float(last_120t.get('sma60', np.nan))
+                is_sma40_lt_60 = bool(
+                    not np.isnan(s40) and not np.isnan(s60) and s60 > 0 and s40 < s60
+                )
                 is_sma5_40_gc_bar = bool(last_120t.get('is_sma5_40_gc', False))
                 is_sma5_40_dc_bar = bool(last_120t.get('is_sma5_40_dc', False))
                 is_sma5_40_bull = bool(
@@ -464,8 +468,8 @@ class ThemeGate60mStrategy:
                     return None
                 qual_tag = f"[순환교체(등락률 {day_ret_pct:+.2f}%<=20%)] "
 
-            # ⚡ [2단계: 실제 1차 매수 집행 = 120틱 단순 5-40 골든크로스 (0~1봉 이내, 기존 추세 추격 차단)]
-            if not has_120t_wave or not is_sma5_40_bull or is_sma5_40_dc_bar:
+            # ⚡ [2단계: 실제 1차 매수 집행 = 120틱 단순 5-40 골든크로스 (0~1봉 이내 & 매수시점 SMA40 < SMA60 필수)]
+            if not has_120t_wave or not is_sma40_lt_60 or not is_sma5_40_bull or is_sma5_40_dc_bar:
                 return None
 
             is_gc5_40_within_1bar = is_sma5_40_gc_bar or (not np.isnan(bars_since_5_40_gc) and 0 <= bars_since_5_40_gc <= 1)
@@ -520,8 +524,8 @@ class ThemeGate60mStrategy:
                     cond_tag = "🔔[실시간조건검색] " if is_condition_pick else ""
                     gc5_40_age = int(bars_since_5_40_gc) if not np.isnan(bars_since_5_40_gc) else 0
                     trigger_str = (
-                        f"⚡ [120틱 1차 매수·단순 5-40 GC({gc5_40_age}봉)] "
-                        f"단순5이평({s5:,.0f}원) > 단순40이평({s40:,.0f}원) 골든크로스 {qty}주 매수"
+                        f"⚡ [120틱 1차 매수·단순 5-40 GC({gc5_40_age}봉·40<60)] "
+                        f"단순5이평({s5:,.0f}원) > 단순40이평({s40:,.0f}원) < 단순60이평({s60:,.0f}원) 골든크로스 {qty}주 매수"
                     )
                     order = TradeOrder(
                         timestamp=timestamp,
@@ -556,12 +560,13 @@ class ThemeGate60mStrategy:
             if not np.isnan(s5) and not np.isnan(s60) and s60 > 0 and s5 <= s60:
                 self.position.sma5_60_buy2_armed = True
 
-            # ⚡ 2차 매수 판단 (14:30 이후 중단, 120틱 단순 5이평-60이평 골든크로스 0~1봉 이내)
+            # ⚡ 2차 매수 판단 (14:30 이후 중단, 매수시점 SMA40 < SMA60 유지 중 120틱 단순 5이평-60이평 골든크로스 0~1봉 이내)
             is_gc5_60_within_1bar = is_sma5_60_gc_bar or (not np.isnan(bars_since_5_60_gc) and 0 <= bars_since_5_60_gc <= 1)
             is_buy2_signal = bool(
                 allow_new_buys
                 and holding_sec >= 5.0
                 and has_120t_wave
+                and is_sma40_lt_60
                 and getattr(self.position, 'sma5_60_buy2_armed', True)
                 and is_sma5_60_bull
                 and not is_sma5_60_dead
@@ -569,8 +574,8 @@ class ThemeGate60mStrategy:
             )
             gc5_60_age = int(bars_since_5_60_gc) if not np.isnan(bars_since_5_60_gc) else 0
             buy2_reason = (
-                f"⚡ [120틱 2차 매수·단순 5-60 GC({gc5_60_age}봉)] "
-                f"단순5이평({s5:,.0f}원) > 단순60이평({s60:,.0f}원) 골든크로스 불타기 분할 매수"
+                f"⚡ [120틱 2차 매수·단순 5-60 GC({gc5_60_age}봉·40<60)] "
+                f"단순5이평({s5:,.0f}원) > 단순60이평({s60:,.0f}원) (40:{s40:,.0f} < 60:{s60:,.0f}) 골든크로스 불타기 분할 매수"
             )
 
             if is_buy2_signal:

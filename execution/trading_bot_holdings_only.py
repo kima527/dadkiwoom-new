@@ -1829,6 +1829,7 @@ class SafeHoldingsThemeGateBot:
             df_120t_calc = calculate_120t_tema_indicators(df_wave_intraday, current_price=tick_close)
             if not df_120t_calc.empty:
                 last_120 = df_120t_calc.iloc[-1]
+                is_sma40_lt_60 = bool(last_120.get('is_sma40_lt_60', False))
                 is_sma5_40_bull = bool(last_120.get('is_sma5_40_bull', False))
                 is_sma5_60_bull = bool(last_120.get('is_sma5_60_bull', False))
                 is_sma_bull = bool(last_120.get('is_sma40_60_bull', False))
@@ -1837,14 +1838,14 @@ class SafeHoldingsThemeGateBot:
                 sma5_40_gc_recent = bool(df_120t_calc['is_sma5_40_gc'].tail(6).any()) if 'is_sma5_40_gc' in df_120t_calc else False
                 sma_gc_recent = bool(df_120t_calc['is_sma40_60_gc'].tail(8).any()) if 'is_sma40_60_gc' in df_120t_calc else False
 
-                if (gc5_40_1bar or sma5_40_gc_recent or is_sma5_40_bull) and is_sma5_60_bull:
-                    score_120t = 10.0  # 120틱 단순 5>40 & 5>60 정배열
-                elif gc5_40_1bar or sma5_40_gc_recent:
-                    score_120t = 9.0   # 120틱 단순 5-40 골든크로스 신규 진입 구간
-                elif is_sma5_40_bull:
-                    score_120t = 6.0   # 120틱 단순 5>40 정배열 유지
-                elif sma_gc_recent or is_sma_bull:
-                    score_120t = 4.0   # SMA 40-60 정배열 기반
+                if is_sma40_lt_60 and (gc5_40_1bar or sma5_40_gc_recent) and is_sma5_60_bull:
+                    score_120t = 10.0  # 120틱 SMA 40<60 & 5-40 GC·5>60 정배열
+                elif is_sma40_lt_60 and (gc5_40_1bar or sma5_40_gc_recent):
+                    score_120t = 9.0   # 120틱 SMA 40<60 & 5-40 골든크로스 신규 진입 구간
+                elif is_sma40_lt_60 and is_sma5_40_bull:
+                    score_120t = 6.0   # 120틱 SMA 40<60 & 5>40 정배열 유지
+                elif is_sma40_lt_60:
+                    score_120t = 4.0   # SMA 40<60 매수 대기 후보
 
         # 5. 시초가 모멘텀 락온 점수 (+1.5% 돌파, 10점 만점 - NXT 프리마켓 08:03~08:30 & KRX 정규장 09:00~09:30)
         score_morning = 0.0
@@ -2275,7 +2276,12 @@ class SafeHoldingsThemeGateBot:
                                 tag5_60 = "5>60"
                             else:
                                 tag5_60 = "5<=60(2차대기)"
-                            sma_tag = f"단순5>40{gc5_40_badge}·{tag5_60}" if bull5_40 else f"단순5<=40·{tag5_60}"
+                            arr_tag = (
+                                "40<60(허용)"
+                                if (not np.isnan(s40_v) and not np.isnan(s60_v) and s40_v < s60_v)
+                                else "40>=60(매수차단)"
+                            )
+                            sma_tag = f"단순5>40{gc5_40_badge}·{tag5_60}·{arr_tag}" if bull5_40 else f"단순5<=40·{tag5_60}·{arr_tag}"
                             sma_nums = ""
                             if not any(np.isnan(x) for x in (s5_v, s40_v, s60_v)):
                                 sma_nums = f" [5:{s5_v:,.0f}/40:{s40_v:,.0f}/60:{s60_v:,.0f}]"

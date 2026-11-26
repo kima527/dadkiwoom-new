@@ -258,7 +258,8 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     gc_bar_idx = bar_idx.where(df['is_tema60_120_gc']).ffill()
     df['bars_since_tema60_120_gc'] = np.where(df['is_yellow_cloud'] & gc_bar_idx.notna(), bar_idx - gc_bar_idx, np.nan)
 
-    # 🌟 [120틱 주력 타점]: 단순 이평 5-40 GC(1차매수) / 단순 5-60 GC(2차매수) / 단순 5-60 DC(전량매도)
+    # 🌟 [120틱 주력 타점]: 단순 이평 5-40 GC(1차매수) / 단순 5-60 GC(2차매수) / 단순 5-60 DC(전량매도) (매수시점 SMA40 < SMA60 조건 포함)
+    df['is_sma40_lt_60'] = df['sma40'] < df['sma60']
     df['is_sma5_40_bull'] = df['sma5'] > df['sma40']
     df['is_sma5_40_gc'] = (df['sma5'].shift(1) <= df['sma40'].shift(1)) & (df['sma5'] > df['sma40'])
     df['is_sma5_40_dc'] = (df['sma5'].shift(1) >= df['sma40'].shift(1)) & (df['sma5'] < df['sma40'])
