@@ -21,6 +21,17 @@ def calculate_sma(series: pd.Series, period: int) -> pd.Series:
     """단순 이동평균 (SMA)"""
     return series.rolling(window=period).mean()
 
+def calculate_wma(series: pd.Series, period: int) -> pd.Series:
+    """가중 이동평균 (WMA / 영웅문 MA(C, 기간, 가중))"""
+    if series is None or len(series) < period:
+        return pd.Series(np.nan, index=getattr(series, 'index', None))
+    weights = np.arange(1, period + 1, dtype=float)
+    w_sum = weights.sum()
+    return series.rolling(window=period, min_periods=period).apply(
+        lambda p: np.dot(p, weights) / w_sum,
+        raw=True
+    )
+
 def calculate_theme_gate_line(df: pd.DataFrame, p1: int = 5, p2: int = 20) -> pd.DataFrame:
     """
     수식 1: 테마급등관문선 (기간1=5, 기간2=20)
@@ -218,11 +229,30 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
         if cp < float(df.iat[last_pos, df.columns.get_loc('low')]):
             df.iat[last_pos, df.columns.get_loc('low')] = cp
 
-    # 1) 상단 차트 지표: 노란색 급등관문선(theme_gate), 검정점선 급등관문고가선(theme_gate_high), 분홍색 기준선(theme_gijun)
+    # 1) 상단 차트 지표: 1.테마급등관문선(theme_gate), 테마고가선(theme_gate_high), 2.WMA급등관문선(wma_gate), 3.WMA급등고가선(wma_gate_high), 4.기준선(theme_gijun)
     df = calculate_theme_gate_line(df, p1=5, p2=20)
     df = calculate_theme_gate_high(df, p1=5, p2=20)
     df = calculate_theme_gijun_line(df, p_fast=5, p_mid=20, p_slow=60)
     df = detect_gate_inflection(df)
+
+    df['wma5'] = calculate_wma(df['close'], 5)
+    df['wma20'] = calculate_wma(df['close'], 20)
+    wma_cross_up = (df['wma5'].shift(1) <= df['wma20'].shift(1)) & (df['wma5'] > df['wma20'])
+    df['wma_cross_up'] = wma_cross_up
+    df['wma_gate'] = pd.Series(np.where(wma_cross_up, df['wma5'], np.nan), index=df.index).ffill()
+    df['wma_gate_high'] = pd.Series(np.where(wma_cross_up, df['high'], np.nan), index=df.index).ffill()
+    df['is_wma5_20_bull'] = df['wma5'] > df['wma20']
+    df['is_wma5_20_dc'] = df['wma5'] < df['wma20']
+
+    # 3중 관문 합성 천장(모두 돌파) & 하단 지지선(하락 테스트 기준)
+    df['tri_gate_ceiling'] = df[['theme_gate', 'wma_gate', 'wma_gate_high']].max(axis=1, skipna=True)
+    df['tri_gate_floor'] = df[['theme_gate', 'wma_gate']].min(axis=1, skipna=True)
+    df['is_above_tri_gates'] = df['close'] >= (df['tri_gate_ceiling'] * 0.999)
+
+    gijun_at_peak = df['theme_gijun'].where(df['is_gijun_peak'])
+    prev_gijun_peak = gijun_at_peak.dropna().shift(1).reindex(df.index).ffill()
+    df['prev_theme_gijun'] = prev_gijun_peak
+    df['is_lower_gijun_peak'] = (df['theme_gijun'] < df['prev_theme_gijun'] * 0.997) & (df['close'] < df['theme_gijun'])
 
     # 2) 하단 차트 지표: 단순 이동평균(SMA 5, 40, 60) 및 테마 5, 15, 20, 30, 60, 120, 240
     df['tema5'] = df['tema_fast']
@@ -309,6 +339,11 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     df['is_sma40_60_bull'] = df['sma40'] >= df['sma60']
     df['is_sma40_60_gc'] = (df['sma40'].shift(1) <= df['sma60'].shift(1)) & (df['sma40'] > df['sma60'])
     df['sma40_60_gc_price'] = df['close'].where(df['is_sma40_60_gc']).ffill()
+
+    df['sma40_slope_3'] = df['sma40'].diff(3)
+    df['sma60_slope_5'] = df['sma60'].diff(5)
+    df['is_sma60_rising'] = df['sma60_slope_5'] > 0
+    df['is_sma40_60_dc'] = (df['sma40'].shift(1) >= df['sma60'].shift(1)) & (df['sma40'] < df['sma60'])
 
     # 5 > 20 > 60 > 120 완전 정배열
     df['is_tema_aligned_120t'] = (
