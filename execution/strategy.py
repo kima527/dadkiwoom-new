@@ -6,9 +6,9 @@ import pandas as pd
 import numpy as np
 
 try:
-    from indicators import calculate_day3_m_line, calculate_120t_tema_indicators, check_daily_ma3_5_eligible
+    from indicators import calculate_day3_m_line, calculate_120t_tema_indicators, check_daily_ma3_5_eligible, calculate_3m_sma5_20_status
 except ImportError:
-    from execution.indicators import calculate_day3_m_line, calculate_120t_tema_indicators, check_daily_ma3_5_eligible
+    from execution.indicators import calculate_day3_m_line, calculate_120t_tema_indicators, check_daily_ma3_5_eligible, calculate_3m_sma5_20_status
 
 def calculate_wma(series: pd.Series, period: int = 60) -> pd.Series:
     """WMA(가중이동평균) 고속 연산 (120틱 WMA 순차돌파 및 고점 반전 연산)"""
@@ -75,6 +75,8 @@ class PositionTracker:
     tema15_120_armed: bool = False      # 매수 진입 이후 테마15 >= 테마120 안착 확인 여부
     sma5_60_armed: bool = False         # 매수 진입 이후 120틱 단순5이평 >= 단순60이평 안착 확인 여부
     sma5_60_buy2_armed: bool = True     # 1차 매수 시점 기준 신규 5-60 GC 2차 매수 대기 가능 여부
+    m3_sma5_20_armed: bool = False      # 3분봉 단순 5 >= 20 정배열 안착 이력 (오판정 방지용)
+    m3_dead_cross_seen: bool = False    # 보유 중 3분봉 SMA 5-20 데드크로스 발생 기록 (청산 후 타종목 전환용)
     # ── [3관문선(테마관문·WMA관문·WMA고가) + 기준선 파동 연속 대응 필드] ──
     entry_tri_ceiling: float = 0.0      # 진입 당시 3관문 천장 가격
     entry_tri_floor: float = 0.0        # 진입 당시 3관문 바닥 가격
@@ -271,7 +273,20 @@ class ThemeGate60mStrategy:
 
         # ⚡ [120틱 상·하단 통합 파동 및 단순 이평(SMA 5/40/60) 연산 (하위 호환 df_3m/df_10m fallback 지원)]:
         # 핵심: 120틱 단순 5-40 GC(1차 매수), 단순 5-60 GC(2차 매수), 단순 5-60 DC(전량 매도)
-        df_120t = kwargs.get('df_120t', None)
+        df_120t_explicit = kwargs.get('df_120t', None)
+        df_3m_raw = kwargs.get('df_3m', None) if df_120t_explicit is not None else None
+        has_3m_sma, m3_s5, m3_s20, m3_is_dc_bar, m3_is_bull = calculate_3m_sma5_20_status(
+            df_3m_raw, current_price=tick_close
+        )
+        if has_3m_sma and m3_s5 >= m3_s20:
+            self.position.m3_sma5_20_armed = True
+        is_3m_sma5_20_dc_now = bool(
+            has_3m_sma and (m3_is_dc_bar or (self.position.m3_sma5_20_armed and m3_s5 < m3_s20))
+        )
+        if self.position.state in (StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION) and is_3m_sma5_20_dc_now:
+            self.position.m3_dead_cross_seen = True
+
+        df_120t = df_120t_explicit
         if df_120t is None:
             df_120t = kwargs.get('df_3m', None)
         if df_120t is None:
@@ -642,6 +657,9 @@ class ThemeGate60mStrategy:
             self.position.sma5_60_armed = bool(not np.isnan(s5) and not np.isnan(s60) and s60 > 0 and s5 >= s60)
             had_prior_5_60_gc = bool(not np.isnan(s5) and not np.isnan(s60) and s60 > 0 and s5 >= s60 and not is_sma5_60_gc_bar)
             self.position.sma5_60_buy2_armed = (not had_prior_5_60_gc)
+            self.position.m3_dead_cross_seen = False
+            if has_3m_sma and m3_s5 >= m3_s20:
+                self.position.m3_sma5_20_armed = True
             self.position.low_5m = ref_low_fallback if ref_low_fallback > 0 else buy_price * 0.992
             self.position.open_5m = ref_open_fallback if ref_open_fallback > 0 else buy_price
             self.position.first_cross_type = "TRI_GATE_REENTRY" if is_reentry_wave else "TRI_GATE_40_LT_60"
@@ -810,7 +828,7 @@ class ThemeGate60mStrategy:
             )
 
         # ─────────────────────────────────────────────────────────────
-        # 4. PROFIT_TAKEN 상태: 눌림 후 SMA40<60 & 3관문 재돌파(반복) vs 2연패/손실상한 졸업
+        # 4. PROFIT_TAKEN 상태: 3분 SMA 5-20 DC 시 1종목 완주 종료(타종목 전환) / 미발생 시 N파 재진입 대기
         # ─────────────────────────────────────────────────────────────
         elif self.position.state == StrategyState.PROFIT_TAKEN:
             cur_tf = active_tri_floor if (not np.isnan(active_tri_floor) and active_tri_floor > 0) else 0.0
@@ -820,13 +838,24 @@ class ThemeGate60mStrategy:
                 if (cur_tf > 0 and tick_close <= cur_tf * 1.001) or (cur_tc > 0 and tick_close < cur_tc) or not is_wma5_20_bull:
                     self.position.saw_gate_pullback = True
 
+            is_3m_stale_bear = bool(
+                has_3m_sma
+                and not m3_is_bull
+                and self.position.last_exit_time > 0
+                and (time.time() - self.position.last_exit_time) >= 300.0
+            )
             is_risk_graduated = (
                 self.position.consecutive_losses >= 2
                 or self.position.realized_pnl_pct_today <= -2.5
                 or self.position.wave_no >= 5
             )
-            if is_risk_graduated:
-                self.position.top_confirmed_reason = f"리스크 졸업(연속손실 {self.position.consecutive_losses}회/누적 {self.position.realized_pnl_pct_today:+.2f}%)"
+            if is_3m_sma5_20_dc_now or is_3m_stale_bear or is_risk_graduated:
+                if is_3m_sma5_20_dc_now:
+                    self.position.top_confirmed_reason = f"3분 SMA 5-20 데드크로스({m3_s5:,.0f}<{m3_s20:,.0f}) 발생 ➔ 1종목 완주 종료"
+                elif is_3m_stale_bear:
+                    self.position.top_confirmed_reason = f"3분 SMA 5<20 5분+ 지속({m3_s5:,.0f}<{m3_s20:,.0f}) ➔ 타종목 전환"
+                else:
+                    self.position.top_confirmed_reason = f"리스크 졸업(연속손실 {self.position.consecutive_losses}회/누적 {self.position.realized_pnl_pct_today:+.2f}%)"
                 self.position.state = StrategyState.TERMINATED
                 return None
 
@@ -917,10 +946,14 @@ class ThemeGate60mStrategy:
         saved_session_hi = max(self.position.session_high_price, self.position.wave_high_price, tick_close)
         saved_wave_no = self.position.wave_no
 
+        saved_m3_armed = bool(getattr(self.position, 'm3_sma5_20_armed', False))
+        saved_m3_dc_seen = bool(getattr(self.position, 'm3_dead_cross_seen', False))
+
         should_terminate_now = (
             prev_losses >= 2
             or cum_pnl <= -2.5
             or saved_wave_no >= 5
+            or saved_m3_dc_seen
         )
         next_state = StrategyState.TERMINATED if should_terminate_now else StrategyState.PROFIT_TAKEN
 
@@ -934,6 +967,12 @@ class ThemeGate60mStrategy:
             stage=next_state.value
         )
         self.trade_history.append(order)
+
+        term_msg = (
+            "3분 SMA 5-20 데드크로스 확인 ➔ 청산 후 타종목 전환"
+            if saved_m3_dc_seen
+            else ("2연패/손실상한 도달 졸업" if should_terminate_now else "")
+        )
 
         self.position = PositionTracker(
             state=next_state,
@@ -949,7 +988,9 @@ class ThemeGate60mStrategy:
             last_exit_pnl_pct=profit_rate,
             saw_gate_pullback=False,
             saw_rebound_to_gate=False,
-            top_confirmed_reason=("2연패/손실상한 도달 졸업" if should_terminate_now else ""),
+            m3_sma5_20_armed=saved_m3_armed,
+            m3_dead_cross_seen=saved_m3_dc_seen,
+            top_confirmed_reason=term_msg,
         )
         return order
 

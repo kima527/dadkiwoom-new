@@ -265,8 +265,12 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     df['tema120'] = calculate_tema(df['close'], 120)
     df['tema240'] = calculate_tema(df['close'], 240)
     df['sma5'] = calculate_sma(df['close'], 5)
+    df['sma20'] = calculate_sma(df['close'], 20)
     df['sma40'] = calculate_sma(df['close'], 40)
     df['sma60'] = calculate_sma(df['close'], 60)
+    df['is_sma5_20_bull'] = df['sma5'] > df['sma20']
+    df['is_sma5_20_dc'] = (df['sma5'].shift(1) >= df['sma20'].shift(1)) & (df['sma5'] < df['sma20'])
+    df['is_sma5_20_dead'] = df['is_sma5_20_dc'] | (df['sma5'] < df['sma20'])
 
     df['tema15_slope'] = df['tema15'].diff()
     df['tema30_slope'] = df['tema30'].diff()
@@ -362,6 +366,38 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
 
 calculate_3m_tema_indicators = calculate_120t_tema_indicators
 calculate_10m_tema_indicators = calculate_120t_tema_indicators
+
+
+def calculate_3m_sma5_20_status(
+    df_3m: Optional[pd.DataFrame],
+    current_price: Optional[float] = None,
+) -> Tuple[bool, float, float, bool, bool]:
+    """
+    3분봉 단순 SMA(5) / SMA(20) 실시간 추세·데드크로스 판별 (1종목 완주 종료 판정용)
+
+    Returns:
+        Tuple[bool, float, float, bool, bool]:
+        (has_valid_3m, sma5_val, sma20_val, is_dc_bar, is_bull)
+    """
+    if df_3m is None or df_3m.empty or len(df_3m) < 21 or 'close' not in df_3m.columns:
+        return False, np.nan, np.nan, False, False
+
+    close_s = pd.to_numeric(df_3m['close'], errors='coerce').ffill().bfill().astype(float).copy()
+    if current_price is not None and float(current_price) > 0 and len(close_s) > 0:
+        close_s.iloc[-1] = float(current_price)
+
+    sma5_s = calculate_sma(close_s, 5)
+    sma20_s = calculate_sma(close_s, 20)
+    s5 = float(sma5_s.iloc[-1])
+    s20 = float(sma20_s.iloc[-1])
+    ps5 = float(sma5_s.iloc[-2])
+    ps20 = float(sma20_s.iloc[-2])
+    if any(np.isnan(x) or x <= 0 for x in (s5, s20, ps5, ps20)):
+        return False, np.nan, np.nan, False, False
+
+    is_bull = bool(s5 > s20)
+    is_dc_bar = bool(ps5 >= ps20 and s5 < s20)
+    return True, s5, s20, is_dc_bar, is_bull
 
 def calculate_day3_m_line(df_daily: Optional[pd.DataFrame], current_price: float) -> Tuple[float, float, float, float]:
     """
