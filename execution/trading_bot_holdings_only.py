@@ -50,9 +50,11 @@ try:
         check_daily_ma3_5_eligible,
         calculate_pred_volume_ratio,
         calculate_120t_tema_indicators,
+        calculate_1m_tema_indicators,
     )
     from execution.strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker
     from execution.overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
+    from execution.order_flow import ExecutionStrengthEngine, compute_v_ref_1m
 except ImportError:
     from indicators import (
         calculate_all_60m_indicators,
@@ -62,9 +64,11 @@ except ImportError:
         check_daily_ma3_5_eligible,
         calculate_pred_volume_ratio,
         calculate_120t_tema_indicators,
+        calculate_1m_tema_indicators,
     )
     from strategy import ThemeGate60mStrategy, TradeOrder, StrategyState, PositionTracker
     from overnight_market_radar import get_overnight_market_radar, get_stock_theme_alignment_score
+    from order_flow import ExecutionStrengthEngine, compute_v_ref_1m
 
 # 2) 실전 API(KiwoomRealClient)가 참조하는 real trading/config.py를 sys.modules['config']에 확정 바인딩
 _real_cfg_path = os.path.join(REAL_TRADING_PATH, "config.py")
@@ -206,6 +210,22 @@ def get_smart_buy_price(price: float) -> int:
     return base_p
 
 
+def get_smart_sell_price(price: float, best_bid: float = 0.0) -> int:
+    """
+    NXT 지정가 매도 체결률 확보용 스마트 지정가 산출 (-1~2호가 공격적 지정가, 상한 슬리피지 -0.3% 이내)
+    """
+    ref_p = best_bid if best_bid and best_bid > 0 else price
+    base_p = align_to_tick(ref_p)
+    if base_p <= 0:
+        return 0
+    tick = get_krx_tick_size(max(1, base_p - 1))
+    if (tick * 2) / base_p <= 0.003:
+        return max(tick, base_p - (tick * 2))
+    elif tick / base_p <= 0.0035:
+        return max(tick, base_p - tick)
+    return base_p
+
+
 class BigOrderStreakTracker:
     """
     👑 [대표님 비기]: 실시간 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 추적기
@@ -277,6 +297,7 @@ class BigOrderStreakTracker:
 
 class SafeHoldingsThemeGateBot:
     BOT_ENTRY_MODES = (
+        "1M_TEMA60_120",
         "STAGE1_5M_ANCHOR",
         "STAGE1_M3_BREAKOUT",
         "STAGE2_120T_GATE",
@@ -285,13 +306,14 @@ class SafeHoldingsThemeGateBot:
         "120T_ROTATION",
         "10M_TEMA",
         "3M_TEMA",
+        "1M_TEMA",
     )
 
     def __init__(
         self,
         is_real: bool = True,
         dry_run: bool = False,
-        condition_name: str = "Traiding,traiding,Traiding1,trading1",
+        condition_name: str = "Traiding,traiding,Traiding1,traiding1",
         enable_ws: bool = True,
         min_overlap: int = 2,
         fixed_qty: int = 2,
@@ -300,7 +322,7 @@ class SafeHoldingsThemeGateBot:
         """
         is_real: 키움 실전 API 연동 여부
         dry_run: True이면 신호는 계산하되 실제 주문 전송만 건너뜀 (안전 모의 테스트용)
-        condition_name: 키움 실시간 조건검색식 이름 (기본값: 'Traiding,traiding,Traiding1,trading1')
+        condition_name: 키움 실시간 조건검색식 이름 (기본값: 'Traiding,traiding,Traiding1,traiding1')
         enable_ws: 키움 실시간 조건검색 웹소켓 수신 데몬 활성화 여부
         min_overlap: 신규 매수 허용 최소 조건식 중복 포착 수 (기본 2 = 중복 4·3·2순 Top10 엄선)
         fixed_qty: 고정 매수 수량 (기본값: 2주, 계좌 예수금 조회 TR 생략)
@@ -327,8 +349,8 @@ class SafeHoldingsThemeGateBot:
         elif self.is_real:
             qty_tag = f"고정 {self.fixed_qty}주 실전 매매 (예수금 TR 생략)" if self.fixed_qty > 0 else "예수금 100% 매매"
             logger.info(
-                f" 🚀 [키움 실전 계좌 거래 모드] {qty_tag} + 09:30 조건검색({self.condition_name}) "
-                f"중복 4·3·2순 Top10 엄선 + 120틱 단순 5-40 GC(1차) · 5-60 GC(2차) 매매"
+                f" 🚀 [키움 실전 계좌 거래 모드] {qty_tag} + 실시간 조건검색({self.condition_name}) "
+                f"중복 4·3·2순 Top10 엄선 + 무규제 1분봉 TEMA 60-120 GC(RVP 체결강도) 매수 / (120>=240 ? 60-240 DC : 60-120 DC) 반복 매매"
             )
         else:
             logger.info(" 🧪 [시뮬레이션 모드] 가상 데이터 모드")
@@ -353,24 +375,33 @@ class SafeHoldingsThemeGateBot:
         self.ws_client = None
         self.ws_thread: Optional[threading.Thread] = None
         self.pending_buy_orders: dict[str, dict] = {}
+        self.pending_sell_orders: dict[str, dict] = {}
         self._last_account_refresh_time: float = 0.0  # 🏛️ 키움 계좌 TR(초당 3회 제한) 방어용 캐시 타임스탬프
         self._cached_real_holdings: dict = {}
         self._cached_cash: float = 0.0
         self._m60_cache: dict[str, tuple[float, int, pd.DataFrame]] = {}   # 60분봉 단기 캐시 (20초 TTL / 시간 경계 갱신)
-        self._m3_cache: dict[str, tuple[float, pd.DataFrame]] = {}          # 3분봉 단기 캐시 (10초 TTL · 3분 SMA 5-20 DC 판정용)
+        self._m1_cache: dict[str, tuple[float, tuple[int, int], pd.DataFrame]] = {}  # 1분봉 단기 캐시 (1.5~6초 TTL / 분 경계 즉시 갱신)
+        self._m3_cache: dict[str, tuple[float, pd.DataFrame]] = {}          # 3분봉 단기 캐시
         self._daily_cache: dict[str, tuple[float, pd.DataFrame]] = {}       # 일봉 단기 캐시 (60초 TTL)
+        self._v_ref_1m_cache: dict[str, float] = {}                         # 1분봉 기준 거래대금(V_ref_1m) 캐시
+        self._ka10003_seeded_codes: set[str] = set()                        # ka10003 초기 워밍업 1회 완료 종목
+        self._ka10003_warmup_lock = threading.Lock()
+        self._ka10003_warmup_queue: list[str] = []
+        self._ka10003_worker_running: bool = False
+        self._last_ws_session_exchange: str = ""
         self._last_idle_scan_ts: float = 0.0                                 # 보유 중 비활성 후보 순환 평가 타임스탬프
-        self.sold_cooldowns: dict[str, float] = {}  # 매도 종목 단기 쿨다운 (code -> cooldown_until_ts, 영구 차단 없이 관심종목 지속 유지)
-        self.completed_trades_today: int = 0          # 당일 매도 완료(순환매매) 횟수 (0=1차 일봉 3-5 진입, >=1=교체 상승률<=20% 진입)
+        self.sold_cooldowns: dict[str, float] = {}  # 매도 직후 주문 정산 최소 쿨다운(5초)
+        self.completed_trades_today: int = 0          # 당일 매도 완료 횟수
         self.current_trading_date = datetime.now().date()
-        self.m5_anchors: dict[str, dict] = {}        # 🎯 첫 5분봉 앵커 캐시 (open_5m, low_5m, high_5m, locked)
+        self.m5_anchors: dict[str, dict] = {}        # 🎯 첫 5분봉 앵커 캐시
         self.base_holdings_qty: dict[str, int] = {}   # 🛡️ 계좌 기존 보유/관종 1주 마커 수량 (매도 시 절대 보존)
-        self.focus_stock_code: Optional[str] = None   # 🎯 현재 완주 집중 중인 1종목 코드 (3분 SMA 5-20 DC / 종료 시까지 타종목 배제)
-        self.sticky_leader: Optional[dict] = None     # 🏆 직전 수익청산 대장주 파동 추적 정보 (3분 SMA 5-20 DC 시 해제)
-        self.stock_wave_context: dict[str, dict] = {} # 🌊 당일 종목별 파동·손익·고점확정(TERMINATED) 영속 컨텍스트
+        self.focus_stock_code: Optional[str] = None   # 🎯 현재 보유/주문 집중 중인 1종목 코드 (매도 완료 시 즉시 해제)
+        self.sticky_leader: Optional[dict] = None     # 🏆 직전 매도 종목 정보
+        self.stock_wave_context: dict[str, dict] = {} # 🌊 당일 종목별 파동·손익 영속 컨텍스트
         self._live_tick_prices: dict[str, dict] = {} # ⚡ 웹소켓 0B 실시간 체결 현재가 캐시 (price, ts)
-        # 👑 [대표님 비기]: 실시간 순간체결대금 3,000만 원 이상 매수 연속 체결(세력 입성) 추적기 (임계치: 3,000만 원, 윈도우: 5초)
+        # 👑 실시간 순간체결대금 3,000만 원 이상 매수 연속 체결 추적기 & 근본 RVP 체결강도 엔진
         self.big_order_tracker = BigOrderStreakTracker(threshold_won=30_000_000.0, streak_window_sec=5.0)
+        self.strength_engine = ExecutionStrengthEngine()
         self.dryrun_stats: dict[str, Any] = {
             'initial_seed': 0.0,
             'virtual_cash': 0.0,
@@ -461,7 +492,7 @@ class SafeHoldingsThemeGateBot:
         }
 
     def _on_condition_insert(self, code: str, cond_name: str = ""):
-        """키움 실시간 조건검색(Traiding, traiding, Traiding1, trading1) 편입 콜백 (최소 체류시간 인증 기반 중복 4·3·2순 Top10)"""
+        """키움 실시간 조건검색(Traiding, traiding, Traiding1, traiding1) 편입 콜백 (최소 체류시간 인증 기반 중복 4·3·2순 Top10)"""
         clean_code = self._normalize_stock_code(code)
         if not clean_code.isalnum() or len(clean_code) != 6 or clean_code == "000000":
             return
@@ -547,7 +578,7 @@ class SafeHoldingsThemeGateBot:
         if is_new_stock:
             logger.info(
                 f"🔔 [조건검색 포착·체류검증 시작] [{cached_nm}({clean_code})] ({effective_cond}) "
-                f"➔ {min_stay:.0f}초 연속 유지 + 중복 {min_ov}개↑ 인증 시 Top10 편입 (포착 즉시 매수 금지)"
+                f"➔ {min_stay:.0f}초 연속 유지 + 중복 {min_ov}개↑ 인증 시 Top10 편입 (1분봉 TEMA 60-120 GC 감시)"
             )
         elif is_reentry_bounce:
             logger.debug(
@@ -672,8 +703,11 @@ class SafeHoldingsThemeGateBot:
 
         top10 = self._select_top10_condition_picks()
         min_stay = max(0.0, float(getattr(self, 'min_cond_stay_sec', 30.0)))
-        # 장중 늦은 재시작 직후(<35초) 아직 최소 체류 인증 시간이 안 찼다면 잠시 대기해 빈 리스트 오락온 방지
-        if not top10 and self.condition_picks and min_stay > 0 and uptime < (min_stay + 5.0):
+        # 장중 늦은 재시작 직후(<min_stay+5초)에는 모든 조건식 초기 편입 종목들이 최소 체류 시간을 채울 때까지 대기
+        if self.condition_picks and min_stay > 0 and uptime < (min_stay + 5.0):
+            return
+        # 09:30 이후라도 선정된 Top 10이 비어있다면(웹소켓 재연결 직후/체류 인증 대기 등) 빈 리스트로 영구 락온하지 않고 대기
+        if not top10:
             return
 
         self.locked_top10_picks = top10
@@ -784,6 +818,14 @@ class SafeHoldingsThemeGateBot:
         if price > 0:
             self._live_tick_prices[code] = {'price': price, 'ts': time.time()}
 
+        if hasattr(self, 'strength_engine') and self.strength_engine is not None:
+            try:
+                _, _, ex_hint = get_market_session()
+                v_ref = getattr(self, '_v_ref_1m_cache', {}).get(code, 0.0)
+                self.strength_engine.on_tick(tick_data, v_ref_1m=v_ref, is_nxt=(ex_hint == "NXT"))
+            except Exception as se_err:
+                logger.debug(f"체결강도 엔진 틱 반영 예외 ({code}): {se_err}")
+
         is_big_buy_hit = (amt >= self.big_order_tracker.threshold_won) and is_buy
         streak = self.big_order_tracker.on_tick(code, price, qty, is_buy_tick=is_buy, chegyul_gangdo=gangdo)
         if is_big_buy_hit and streak >= 2:
@@ -791,9 +833,22 @@ class SafeHoldingsThemeGateBot:
             logger.info(
                 f"🔥 [세력 3,000만+ 연속 체결 {streak}연타 포착!] [{name}({code})] "
                 f"단가: {price:,.0f}원 | 순간체결: {amt/10000:,.0f}만 원({qty:,}주) (체결강도: {gangdo:.1f}%) "
-                f"➔ 세력 수급 확인 (120틱 단순 5-40 GC 1차 / 5-60 GC 2차 타점 평가)"
+                f"➔ 1분봉 TEMA 60-120 GC & RVP 체결강도 타점 평가"
             )
             self.condition_wakeup_event.set()
+
+    def _on_orderbook(self, ob_data: dict):
+        """실시간 호가잔량(0D) 수신 콜백 ➔ ExecutionStrengthEngine 최우선 호가 갱신"""
+        try:
+            code = self._normalize_stock_code(str(ob_data.get('code', '')).strip())
+            if not code:
+                return
+            ask1 = float(ob_data.get('ask1', 0.0) or 0.0)
+            bid1 = float(ob_data.get('bid1', 0.0) or 0.0)
+            if hasattr(self, 'strength_engine') and self.strength_engine is not None:
+                self.strength_engine.on_orderbook(code, ask1, bid1)
+        except Exception:
+            pass
 
     def _start_condition_ws_daemon(self):
         """백그라운드 데몬 스레드에서 KiwoomWebSocketClient 실시간 조건검색 수신 루프 구동"""
@@ -805,7 +860,8 @@ class SafeHoldingsThemeGateBot:
                     target_condition_name=self.condition_name,
                     on_insert=self._on_condition_insert,
                     on_delete=self._on_condition_delete,
-                    on_real_tick=self._on_real_tick
+                    on_real_tick=self._on_real_tick,
+                    on_orderbook=self._on_orderbook,
                 )
                 self.ws_client.init_sync_event = self.condition_init_event
                 logger.info(f"📡 [실시간 조건검색 웹소켓 가동] 목표 조건식: [{self.condition_name}] 실시간 수신 대기 중...")
@@ -937,16 +993,18 @@ class SafeHoldingsThemeGateBot:
         pos.m3_dead_cross_seen = bool(ctx.get('m3_dead_cross_seen', False))
         pos.top_confirmed_reason = ctx.get('top_confirmed_reason', '')
         saved_state = ctx.get('state')
-        if saved_state in (StrategyState.PROFIT_TAKEN, StrategyState.TERMINATED):
+        # 무규제 원칙: 기존 TERMINATED 상태가 저장돼 있더라도 PROFIT_TAKEN으로 복원하여 재진입 허용
+        if saved_state == StrategyState.TERMINATED:
+            pos.state = StrategyState.PROFIT_TAKEN
+        elif saved_state == StrategyState.PROFIT_TAKEN:
             pos.state = saved_state
 
     def _check_and_cleanup_unfilled_orders(self, real_holdings: dict):
         """
-        🛡️ [15초 미체결 매수 주문 자동 취소 및 유령 잠금(Ghost Lock) 해제]
-        매수 주문 발송 후 15초 내에 체결되지 않고 허공에 떠 있는 미체결 주문은 즉시 취소하고,
-        미체결 상태로 1종목 슬롯을 점유하던 전략 상태를 이전 상태(IDLE 등)로 안전 롤백합니다.
+        🛡️ [15초 미체결 매수 주문 자동 취소/롤백 & NXT 10초 미체결 매도 호가 재주문]
         """
-        if not (self.is_real and not self.dry_run and self.api and self.pending_buy_orders):
+        pending_sells = getattr(self, 'pending_sell_orders', {})
+        if not (self.is_real and not self.dry_run and self.api and (self.pending_buy_orders or pending_sells)):
             return
 
         try:
@@ -959,6 +1017,36 @@ class SafeHoldingsThemeGateBot:
                     unexec_by_code[c] = u
 
             now_ts = time.time()
+            # 1) NXT 지정가 매도 미체결 10초 초과 시 호가 재조정(bid - 1~2호가) 재전송
+            for code, ps_info in list(pending_sells.items()):
+                name = self.get_stock_name(code)
+                acc_qty = int(real_holdings.get(code, {}).get('qty', 0))
+                base_q = int(getattr(self, 'base_holdings_qty', {}).get(code, 0))
+                bot_acc_qty = max(0, acc_qty - base_q)
+                if code not in unexec_by_code or bot_acc_qty <= 0:
+                    logger.info(f"✅ [NXT 매도 실체결 완료 확인] [{name}({code})]")
+                    pending_sells.pop(code, None)
+                    continue
+                elapsed_s = now_ts - float(ps_info.get('timestamp', now_ts))
+                if elapsed_s >= 10.0:
+                    u_item = unexec_by_code[code]
+                    ord_no = str(u_item.get('order_no', ps_info.get('order_no', '')))
+                    u_qty = min(bot_acc_qty, int(u_item.get('unfilled_qty', bot_acc_qty)))
+                    if ord_no and u_qty > 0:
+                        self.api.cancel_order(ord_no, code, u_qty)
+                        live_ref = self._live_tick_prices.get(code, {}).get('price', 0.0) or ps_info.get('price', 0.0)
+                        best_bid = self.strength_engine.get_state(code).bid1 if hasattr(self, 'strength_engine') else 0.0
+                        new_px = get_smart_sell_price(float(live_ref), best_bid=best_bid) or align_to_tick(float(live_ref))
+                        is_act, _, ex_hint = get_market_session()
+                        if is_act and new_px > 0:
+                            o_type = "00" if ex_hint == "NXT" else "03"
+                            new_ord_no = self.api.place_sell_order(code, u_qty, price=new_px, order_type=o_type)
+                            if new_ord_no:
+                                pending_sells[code] = {'order_no': str(new_ord_no), 'qty': u_qty, 'price': new_px, 'timestamp': time.time()}
+                                logger.warning(f"🔄 [NXT 미체결 10초 정정 매도] [{name}({code})] {u_qty}주 @ {new_px:,.0f}원 (주문번호:{new_ord_no})")
+                                continue
+                    pending_sells.pop(code, None)
+
             for code, p_info in list(self.pending_buy_orders.items()):
                 name = self.get_stock_name(code)
                 acc_qty = int(real_holdings.get(code, {}).get('qty', 0))
@@ -1117,16 +1205,18 @@ class SafeHoldingsThemeGateBot:
                 )
             ):
                 exit_ref = float(st.position.last_exit_price or (self.sticky_leader.get('exit_price', 0.0) if self.sticky_leader else 0.0) or 0.0)
-                holdings[code] = {
+                holds_exit = {
                     'name': self.get_stock_name(code),
                     'qty': 0,
                     'buy_price': 0.0,
                     'current_price': exit_ref,
                     'is_condition_pick': (code in self.condition_picks),
-                    'target_tag': '🏆1종목완주대기(3분SMA5-20DC전까지집중)',
+                    'target_tag': '🔄1분봉 반복대기',
                 }
+                holdings[code] = holds_exit
 
         self.active_holdings = holdings
+        self._ensure_top10_background_strength(list(holdings.keys()))
         cash_str = f"고정 {self.fixed_qty}주 실전 매매 (예수금 조회 TR 생략)" if self.fixed_qty > 0 else f"가용 예수금: {cash:,.0f}원"
         lock_badge = "🔒09:30락온" if getattr(self, 'top10_locked', False) else "🔄09:30까지수집중"
         logger.info(
@@ -1160,7 +1250,7 @@ class SafeHoldingsThemeGateBot:
                     strat.position.base_account_qty = 0
                     self._restore_stock_wave_context(code, strat)
                     logger.info(
-                        f"   🔔 [{name}({code})] 조건검색 Top10 후보 편입 ({target_tag} | {strat.position.state.value} 대기 ➔ 120틱 파동 감시)"
+                        f"   🔔 [{name}({code})] 조건검색 Top10 후보 편입 ({target_tag} | {strat.position.state.value} 대기 ➔ 1분봉 TEMA 60-120 GC 감시)"
                     )
                 else:
                     # 🛡️ [기존 계좌 보유 자산 절대 보호 원칙]
@@ -1260,6 +1350,53 @@ class SafeHoldingsThemeGateBot:
             from execution.generate_sample_data import generate_realistic_sample_data
         _, df_d = generate_realistic_sample_data(num_days=40)
         return df_d
+
+    def get_1m_candles(self, code: str, fast_mode: bool = False) -> pd.DataFrame:
+        """실전 1분봉 데이터 조회 (분 경계 즉시 갱신 + 1.5~6초 단기 캐시 · 1분봉 TEMA 5-20 / SMA 40-60 / 5-60 판정용)"""
+        if self.is_real and self.api:
+            now_dt = datetime.now()
+            now_ts = time.time()
+            cur_min = (now_dt.hour, now_dt.minute)
+            ttl_sec = 1.5 if fast_mode else 6.0
+            if hasattr(self, '_m1_cache') and code in self._m1_cache:
+                c_ts, c_min, c_df = self._m1_cache[code]
+                if (
+                    c_min == cur_min
+                    and (now_ts - c_ts) < ttl_sec
+                    and isinstance(c_df, pd.DataFrame)
+                    and not c_df.empty
+                ):
+                    return c_df.copy()
+            try:
+                if hasattr(self.api, 'get_1m_candles'):
+                    df_1m = self.api.get_1m_candles(code)
+                    if isinstance(df_1m, pd.DataFrame) and not df_1m.empty and len(df_1m) >= 10:
+                        if not hasattr(self, '_m1_cache'):
+                            self._m1_cache = {}
+                        self._m1_cache[code] = (now_ts, cur_min, df_1m)
+                        return df_1m
+                elif hasattr(self.api, 'real_client') and hasattr(self.api.real_client, 'get_1min_candles'):
+                    try:
+                        raw = self.api.real_client.get_1min_candles(code, last_n_days=5, limit=1500)
+                    except TypeError:
+                        raw = self.api.real_client.get_1min_candles(code, last_n_days=3)
+                    if raw:
+                        df_raw = pd.DataFrame(raw)
+                        df_raw.columns = [c.lower() for c in df_raw.columns]
+                        if 'time' in df_raw.columns:
+                            t_parsed = pd.to_datetime(df_raw['time'], errors='coerce')
+                            if not t_parsed.is_monotonic_increasing and t_parsed.is_monotonic_decreasing:
+                                df_raw = df_raw.iloc[::-1]
+                            df_raw['time'] = t_parsed
+                            df_raw = df_raw.dropna(subset=['time']).set_index('time')
+                        if isinstance(df_raw, pd.DataFrame) and not df_raw.empty and len(df_raw) >= 10:
+                            if not hasattr(self, '_m1_cache'):
+                                self._m1_cache = {}
+                            self._m1_cache[code] = (now_ts, cur_min, df_raw)
+                            return df_raw
+            except Exception as e:
+                logger.debug(f"1분봉 데이터 조회 에러 ({code}): {e}")
+        return pd.DataFrame()
 
     def get_3m_candles(self, code: str) -> pd.DataFrame:
         """실전 3분봉 데이터 조회 (10초 단기 캐시 적용 · 3분봉 SMA 5-20 데드크로스 판정용)"""
@@ -1436,6 +1573,8 @@ class SafeHoldingsThemeGateBot:
                     logger.error(f"   ❌ [매수 주문 실패/거부] [{name}({code})] API 응답 없음 ➔ 전략 상태를 주문 이전으로 안전 롤백합니다.")
                     self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                     return
+                if getattr(self, 'ws_client', None) is not None and hasattr(self.ws_client, 'subscribe_focus_orderbook_sync'):
+                    self.ws_client.subscribe_focus_orderbook_sync(code)
                 logger.info(f"   ✅ [매수 접수 완료] 주문번호: {order_no} (15초 미체결 감시 타이머 가동)")
                 self.pending_buy_orders[code] = {
                     'order_no': str(order_no),
@@ -1581,28 +1720,15 @@ class SafeHoldingsThemeGateBot:
                         st_obj.cash = self.dryrun_stats['virtual_cash']
 
                 if not is_partial:
-                    if strat and strat.position.state == StrategyState.TERMINATED:
-                        self.sold_cooldowns[code] = time.time() + 300.0
-                        if getattr(self, 'focus_stock_code', None) == code:
-                            self.focus_stock_code = None
-                        if self.sticky_leader and self.sticky_leader.get('code') == code:
-                            self.sticky_leader = None
-                        logger.info(f"   🏁 [{name}({code})] 모의 전량 청산 완료 ➔ 완전 종료(TERMINATED) · 다음 종목 전환 개방!")
-                    else:
-                        cd_sec = 10.0 if net_pnl_pct >= 0.3 else 30.0
-                        self.sold_cooldowns[code] = time.time() + cd_sec
-                        self.focus_stock_code = code
-                        self.sticky_leader = {
-                            'code': code,
-                            'name': name,
-                            'exit_price': sell_price,
-                            'exit_ts': time.time(),
-                            'wave_no': int(getattr(strat.position, 'wave_no', 1)) if strat else 1,
-                        }
-                        logger.info(
-                            f"   🏆 [{name}({code})] 모의 전량 매도 완료 (쿨다운 {cd_sec:.0f}s) ➔ "
-                            f"1종목 완주 집중 유지 (3분 SMA 5-20 DC 전까지 재돌파 대기)"
-                        )
+                    self.sold_cooldowns[code] = time.time() + 5.0
+                    if getattr(self, 'focus_stock_code', None) == code:
+                        self.focus_stock_code = None
+                    if getattr(self, 'sticky_leader', None) and self.sticky_leader.get('code') == code:
+                        self.sticky_leader = None
+                    self._last_idle_scan_ts = 0.0
+                    logger.info(
+                        f"   ✅ [{name}({code})] 모의 전량 매도 완료 (5s 정산 대기 후 1/1 슬롯 즉시 개방 · Top10 전체 반복 감시)"
+                    )
                     self.completed_trades_today += 1
                 else:
                     rem_q = strat.position.total_qty if strat else 0
@@ -1611,52 +1737,129 @@ class SafeHoldingsThemeGateBot:
 
             if exchange_hint == "NXT":
                 sell_order_type = "00"  # NXT 지정가 필수
-                logger.info(f"🚨 [실전 매도 발송(NXT 지정가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (봇 매수분 한정) | 지정가: {sell_price:,.0f}원 | 사유: {order.reason}")
+                best_bid = self.strength_engine.get_state(code).bid1 if hasattr(self, 'strength_engine') else 0.0
+                nxt_sell_price = get_smart_sell_price(sell_price, best_bid=best_bid) or sell_price
+                exec_sell_price = nxt_sell_price
+                logger.info(f"🚨 [실전 매도 발송(NXT 지정가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (봇 매수분 한정) | 지정가: {exec_sell_price:,.0f}원 | 사유: {order.reason}")
             else:
                 sell_order_type = "03"  # KRX 정규장 시장가
-                logger.info(f"🚨 [실전 매도 발송(KRX 시장가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (봇 매수분 한정) | 기준가: {sell_price:,.0f}원 | 사유: {order.reason}")
+                exec_sell_price = sell_price
+                logger.info(f"🚨 [실전 매도 발송(KRX 시장가)] [{name}({code})] {order.action} | 세션: {session_name} | 수량: {final_sell_qty}주 (봇 매수분 한정) | 기준가: {exec_sell_price:,.0f}원 | 사유: {order.reason}")
 
             if self.is_real and self.api:
-                order_no = self.api.place_sell_order(code, final_sell_qty, price=sell_price, order_type=sell_order_type)
+                order_no = self.api.place_sell_order(code, final_sell_qty, price=exec_sell_price, order_type=sell_order_type)
                 if not order_no:
                     logger.error(f"   ❌ [{'분할 익절' if is_partial else '전량 매도'} 주문 실패/거부] [{name}({code})] API 응답 없음 ➔ 다음 사이클 즉시 재시도를 위해 포지션 상태를 보존합니다.")
                     self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                     return
                 logger.info(f"   ✅ [{'50% 분할 익절' if is_partial else '전량 매도'} 접수 완료] 주문번호: {order_no}")
+                if exchange_hint == "NXT" and not self.dry_run and hasattr(self, 'pending_sell_orders'):
+                    self.pending_sell_orders[code] = {
+                        'order_no': str(order_no),
+                        'qty': final_sell_qty,
+                        'price': exec_sell_price,
+                        'timestamp': time.time(),
+                    }
 
             if strat:
-                if not is_partial and strat.position.state not in (StrategyState.PROFIT_TAKEN, StrategyState.TERMINATED):
-                    strat.position = PositionTracker(state=StrategyState.PROFIT_TAKEN)
+                if not is_partial and strat.position.state != StrategyState.PROFIT_TAKEN:
+                    strat.position = PositionTracker(
+                        state=StrategyState.PROFIT_TAKEN,
+                        trade_count_today=strat.position.trade_count_today,
+                        wave_no=strat.position.wave_no,
+                        session_high_price=strat.position.session_high_price,
+                        last_exit_price=exec_sell_price,
+                        last_exit_time=time.time(),
+                        last_entry_gc_key=getattr(strat.position, 'last_entry_gc_key', ''),
+                    )
                 if hasattr(self, '_save_stock_wave_context'):
                     self._save_stock_wave_context(code, strat.position)
 
             if not is_partial:
-                if strat and strat.position.state == StrategyState.TERMINATED:
-                    self.sold_cooldowns[code] = time.time() + 300.0
-                    if getattr(self, 'focus_stock_code', None) == code:
-                        self.focus_stock_code = None
-                    if self.sticky_leader and self.sticky_leader.get('code') == code:
-                        self.sticky_leader = None
-                    logger.info(f"   🏁 [{name}({code})] 전량 매도 완료 ➔ 완전 종료(TERMINATED) · 다음 종목 전환 개방!")
-                else:
-                    cd_sec = 10.0 if est_net_pnl_pct >= 0.3 else 30.0
-                    self.sold_cooldowns[code] = time.time() + cd_sec
-                    self.focus_stock_code = code
-                    self.sticky_leader = {
-                        'code': code,
-                        'name': name,
-                        'exit_price': sell_price,
-                        'exit_ts': time.time(),
-                        'wave_no': int(getattr(strat.position, 'wave_no', 1)) if strat else 1,
-                    }
-                    logger.info(
-                        f"   🏆 [{name}({code})] 전량 매도 완료 (당일 순환 {self.completed_trades_today + 1}회, 쿨다운 {cd_sec:.0f}s) "
-                        f"➔ 1종목 완주 집중 유지 (3분 SMA 5-20 DC 전까지 타종목 배제 · N파 재돌파 감시)"
-                    )
+                self.sold_cooldowns[code] = time.time() + 5.0
+                if getattr(self, 'focus_stock_code', None) == code:
+                    self.focus_stock_code = None
+                if getattr(self, 'sticky_leader', None) and self.sticky_leader.get('code') == code:
+                    self.sticky_leader = None
+                self._last_idle_scan_ts = 0.0
+                logger.info(
+                    f"   ✅ [{name}({code})] 전량 매도 완료 (당일 순환 {self.completed_trades_today + 1}회 · 5s 정산 대기 후 1/1 슬롯 즉시 개방 · Top10 전체 감시)"
+                )
                 self.completed_trades_today += 1
             else:
                 rem_q = strat.position.total_qty if strat else 0
                 logger.info(f"   🌗 [{name}({code})] 50% 분할 익절 완료 ➔ 잔여 코어 {rem_q}주 홀딩 & 재불타기 감시(REENTRY_HOLDING)")
+
+    def _ensure_top10_background_strength(self, target_codes: list[str]):
+        """
+        Top 10 및 보유 전 종목의 실시간 체결강도(0B+0D 스트림 + 직렬 ka10003 워밍업)가
+        보유 중에도 백그라운드에서 끊김 없이 계측되도록 보장합니다.
+        """
+        if not target_codes:
+            return
+        is_act, _, ex_hint = get_market_session()
+        ex = ex_hint if is_act and ex_hint in ("KRX", "NXT") else "KRX"
+        prev_ex = getattr(self, '_last_ws_session_exchange', '')
+        if prev_ex and prev_ex != ex:
+            if hasattr(self, '_ka10003_seeded_codes'):
+                self._ka10003_seeded_codes.clear()
+        self._last_ws_session_exchange = ex
+
+        if getattr(self, 'ws_client', None) is not None and hasattr(self.ws_client, 'sync_top10_stream_sync'):
+            self.ws_client.sync_top10_stream_sync(target_codes, exchange_hint=ex)
+
+        if not (self.is_real and self.api and hasattr(self.api, 'get_recent_ticks_ka10003')):
+            return
+        if not hasattr(self, 'strength_engine') or self.strength_engine is None:
+            return
+
+        seeded_set = getattr(self, '_ka10003_seeded_codes', None)
+        q_lock = getattr(self, '_ka10003_warmup_lock', None)
+        q_list = getattr(self, '_ka10003_warmup_queue', None)
+        if seeded_set is None or q_lock is None or q_list is None:
+            return
+
+        added = False
+        with q_lock:
+            for code in target_codes[:12]:
+                cc = self._normalize_stock_code(code)
+                if not cc or cc in seeded_set or cc in q_list:
+                    continue
+                st = self.strength_engine.get_state(cc)
+                if st.tick_count >= 10 and (time.time() - st.last_tick_ts) < 30.0:
+                    seeded_set.add(cc)
+                    continue
+                q_list.append(cc)
+                added = True
+
+            if (added or q_list) and not getattr(self, '_ka10003_worker_running', False):
+                self._ka10003_worker_running = True
+                threading.Thread(target=self._run_ka10003_warmup_worker, name="KA10003WarmupWorker", daemon=True).start()
+
+    def _run_ka10003_warmup_worker(self):
+        """Top 10 후보에 한해 ka10003 체결 내역을 단일 스레드 직렬로 완만히 시드합니다."""
+        try:
+            while True:
+                with self._ka10003_warmup_lock:
+                    if not self._ka10003_warmup_queue:
+                        self._ka10003_worker_running = False
+                        break
+                    c_code = self._ka10003_warmup_queue.pop(0)
+                    self._ka10003_seeded_codes.add(c_code)
+                try:
+                    ticks = self.api.get_recent_ticks_ka10003(c_code, limit=80)
+                    if ticks:
+                        _, _, ex_hint = get_market_session()
+                        v_ref = getattr(self, '_v_ref_1m_cache', {}).get(c_code, 0.0)
+                        self.strength_engine.seed_from_ka10003(
+                            c_code, ticks, v_ref_1m=v_ref, is_nxt=(ex_hint == "NXT")
+                        )
+                except Exception:
+                    pass
+                time.sleep(0.30)
+        finally:
+            with self._ka10003_warmup_lock:
+                self._ka10003_worker_running = False
 
     def get_active_stock_code(self, exclude_codes: Optional[set[str]] = None) -> str | None:
         """
@@ -1687,8 +1890,8 @@ class SafeHoldingsThemeGateBot:
 
     def get_focused_stock_code(self, exclude_codes: Optional[set[str]] = None) -> str | None:
         """
-        현재 완주 집중 중인 1종목 코드를 반환합니다 (보유 중 OR PROFIT_TAKEN 재돌파 감시 중).
-        3분 SMA 5-20 데드크로스(TERMINATED) 또는 매수 롤백 전까지 타종목 진입을 차단합니다.
+        현재 보유 또는 미체결 매수 진행 중인 1종목 코드를 반환합니다.
+        무규제 1종목 슬롯 원칙에 따라 전량 매도 완료 시 즉시 해제되어 모든 Top10 종목이 공정하게 다음 1분봉 TEMA 60-120 GC 진입 기회를 가집니다.
         """
         active = self.get_active_stock_code(exclude_codes=exclude_codes)
         if active:
@@ -1697,15 +1900,12 @@ class SafeHoldingsThemeGateBot:
 
         f_code = getattr(self, 'focus_stock_code', None)
         if f_code:
-            f_strat = self.strategies.get(f_code)
-            if not f_strat or f_strat.position.state in (StrategyState.IDLE, StrategyState.TERMINATED):
-                if f_code not in getattr(self, 'pending_buy_orders', {}):
-                    self.focus_stock_code = None
-                    if getattr(self, 'sticky_leader', None) and self.sticky_leader.get('code') == f_code:
-                        self.sticky_leader = None
-                    return None
-            if not exclude_codes or f_code not in exclude_codes:
-                return f_code
+            if f_code in getattr(self, 'pending_buy_orders', {}):
+                if not exclude_codes or f_code not in exclude_codes:
+                    return f_code
+            self.focus_stock_code = None
+            if getattr(self, 'sticky_leader', None) and self.sticky_leader.get('code') == f_code:
+                self.sticky_leader = None
         return None
 
     @staticmethod
@@ -2178,10 +2378,9 @@ class SafeHoldingsThemeGateBot:
 
         is_active, session_name, exchange_hint = get_market_session()
         cur_t = datetime.now().time()
-        is_buy_cutoff = (cur_t >= dtime(14, 30, 0))
+        is_buy_cutoff = False  # 무규제: 시간 기반 매수 차단 전면 해제
 
-        cutoff_tag = " | 🕒14:30이후 매수종료(보유매도 집중)" if is_buy_cutoff else ""
-        market_status_str = f"🟢 {session_name}{cutoff_tag}" if is_active else f"🔴 {session_name}{cutoff_tag}"
+        market_status_str = f"🟢 {session_name} (무규제 전일관 가동)" if is_active else f"🔴 {session_name}"
         logger.info(f"⏱️ 감시 루프 실행 중... [현재 시장 상태: {market_status_str}]")
 
         # 🌐 [글로벌 선행지수 & 증권플러스 코스피/코스닥 야간선물 2612 기상도 실시간 브리핑]
@@ -2217,12 +2416,6 @@ class SafeHoldingsThemeGateBot:
 
         active_code = self.get_active_stock_code()
         focus_code = self.get_focused_stock_code()
-        if is_buy_cutoff and focus_code and not active_code:
-            f_st = self.strategies.get(focus_code)
-            if f_st and f_st.position.state == StrategyState.PROFIT_TAKEN:
-                self.focus_stock_code = None
-                self.sticky_leader = None
-                focus_code = None
 
         if active_code:
             act_name = self.get_stock_name(active_code)
@@ -2230,20 +2423,20 @@ class SafeHoldingsThemeGateBot:
             act_state = act_pos.state.value
             logger.info(
                 f"🔒 [1종목 순환매매 슬롯 1/1 점유] 봇 운용 종목: [{act_name}({active_code})] 상태: {act_state}(W{act_pos.wave_no}) "
-                f"➔ 120틱 5-60 DC 전량매도 · 직전테마관문선({act_pos.ratchet_prev_theme_gate:,.0f})/-2.5% 스탑로스 감시 중"
+                f"➔ 1분봉 (120>=240 ? TEMA 60-240 DC : TEMA 60-120 DC) 전량매도 감시 중 (강제손절·규제 없음)"
             )
         elif focus_code:
             f_name = self.get_stock_name(focus_code)
             f_pos = self.strategies[focus_code].position
             logger.info(
-                f"🎯 [1종목 완주 집중 대기중] [{f_name}({focus_code})] 상태: {f_pos.state.value}(W{f_pos.wave_no}) "
-                f"➔ 3분 SMA 5-20 DC 발생 전까지 타종목 보류 · SMA40<60 & 3관문 재돌파 고속 감시 중"
+                f"🎯 [1종목 주문 체결 대기중] [{f_name}({focus_code})] 상태: {f_pos.state.value}(W{f_pos.wave_no}) "
+                f"➔ 미체결 확인 및 1분봉 DC 취소 감시 중"
             )
         else:
             lock_note = "09:30 Top10 확정" if getattr(self, 'top10_locked', False) else "09:30까지 4·3·2중복 Top10 엄선 중"
             logger.info(
                 f"🔓 [1종목 순환매매 슬롯 0/1 비어있음] 봇 운용·집중 종목 없음 ({lock_note}) "
-                "➔ 120틱 SMA 40<60 & 3관문(테마·WMA·WMA고가) 돌파 대기"
+                "➔ 1분봉 TEMA 60-120 GC + RVP 체결강도 진입 대기"
             )
 
         buy_candidates = []
@@ -2261,15 +2454,20 @@ class SafeHoldingsThemeGateBot:
         for code in eval_keys:
             name = self.get_stock_name(code)
             strat = self.strategies.get(code)
-            if not strat or strat.position.state == StrategyState.TERMINATED:
+            if not strat:
                 continue
+            if strat.position.state == StrategyState.TERMINATED:
+                strat.position.state = StrategyState.PROFIT_TAKEN
 
-            # 🕒 [14:30 이후 신규 매수 종료]: 미보유(IDLE) 종목 평가 스킵 ➔ 보유 종목 매도에만 API 집중
-            if is_buy_cutoff and strat.position.state == StrategyState.IDLE:
-                continue
-
-            # ⚡ [보유·집중 종목 초고속 2초 감시]: 집중 운용 중에는 비활성 후보 REST 스캔을 12초마다 분산
-            if skip_idle_for_fast_exit and code != lock_target and strat.position.state == StrategyState.IDLE:
+            # ⚡ [보유·집중 종목 초고속 2초 감시]: 보유 중에는 비활성 후보 REST 스캔을 12초마다 분산하되,
+            #    v_ref_1m 기준 거래대금이 아직 한 번도 산출되지 않은 종목은 1회 즉시 계측해 백그라운드 RVP 정확도를 보장합니다.
+            v_ref_cache = getattr(self, '_v_ref_1m_cache', {})
+            if (
+                skip_idle_for_fast_exit
+                and code != lock_target
+                and strat.position.state in (StrategyState.IDLE, StrategyState.PROFIT_TAKEN)
+                and code in v_ref_cache
+            ):
                 continue
 
             # 💡 쿨다운 확인: 매도 직후 단기 쿨다운(20초) 중인지 체크 (종목을 버리지 않고 계속 들여다봄)
@@ -2302,26 +2500,45 @@ class SafeHoldingsThemeGateBot:
                     or is_cond_pick
                 )
                 df_120t = self.get_120t_candles(code) if need_120t else pd.DataFrame()
-                need_3m = (
-                    code == focus_code
-                    or strat.position.state in [
-                        StrategyState.FIRST_BUY_DONE,
-                        StrategyState.FULL_POSITION,
-                        StrategyState.REENTRY_HOLDING,
-                        StrategyState.PROFIT_TAKEN,
-                    ]
+                need_3m = False
+                df_3m = pd.DataFrame()
+                need_1m = True
+                df_1m = (
+                    self.get_1m_candles(
+                        code,
+                        fast_mode=bool(code == focus_code or strat.position.state != StrategyState.IDLE),
+                    )
+                    if need_1m
+                    else pd.DataFrame()
                 )
-                df_3m = self.get_3m_candles(code) if need_3m else pd.DataFrame()
                 bar_fetch_ts = 0.0
                 if need_120t and self.is_real and self.api:
                     if hasattr(self.api, 'get_last_tick_fetch_ts'):
                         bar_fetch_ts = float(self.api.get_last_tick_fetch_ts(code) or 0.0)
                     elif hasattr(self.api, 'get_last_minute_fetch_ts'):
                         bar_fetch_ts = float(self.api.get_last_minute_fetch_ts(code) or 0.0)
+                if (
+                    isinstance(df_1m, pd.DataFrame)
+                    and not df_1m.empty
+                    and self.is_real
+                    and self.api
+                    and hasattr(self.api, 'get_last_minute_fetch_ts')
+                ):
+                    try:
+                        m1_ts = float(self.api.get_last_minute_fetch_ts(code, tic_scope="1") or 0.0)
+                        if m1_ts > bar_fetch_ts:
+                            bar_fetch_ts = m1_ts
+                    except Exception:
+                        pass
 
                 candle_120t_close = (
                     float(df_120t.iloc[-1]['close'])
                     if (df_120t is not None and not df_120t.empty and 'close' in df_120t.columns)
+                    else 0.0
+                )
+                candle_1m_close = (
+                    float(df_1m.iloc[-1]['close'])
+                    if (isinstance(df_1m, pd.DataFrame) and not df_1m.empty and 'close' in df_1m.columns)
                     else 0.0
                 )
                 candle_close = float(df_60m.iloc[-1]['close']) if not df_60m.empty else 0.0
@@ -2337,6 +2554,8 @@ class SafeHoldingsThemeGateBot:
                     tick_close = float(ws_tick['price'])
                 elif candle_120t_close > 0:
                     tick_close = candle_120t_close
+                elif candle_1m_close > 0:
+                    tick_close = candle_1m_close
                 elif exchange_hint == "NXT" and candle_close > 0:
                     tick_close = candle_close
                 elif acc_price > 0:
@@ -2415,8 +2634,45 @@ class SafeHoldingsThemeGateBot:
                     or (dtime(9, 0, 0) <= now_t < dtime(9, 0, 15) and exchange_hint == "KRX")
                 )
                 is_replacement_mode = (self.completed_trades_today > 0)
-                allow_new_buys = (not is_buy_cutoff)
+                allow_new_buys = True
                 cur_qty = h_info.get('qty', 0)
+
+                # 📊 [근본 실시간 체결강도(ExecutionStrengthEngine RVP) 산출 및 v_ref_1m 갱신]
+                v_ref_1m, _ = compute_v_ref_1m(df_1m)
+                if v_ref_1m > 0:
+                    self._v_ref_1m_cache[code] = v_ref_1m
+                b_streak = self.big_order_tracker.get_streak(code) if hasattr(self, 'big_order_tracker') else 0
+                strength_metrics = self.strength_engine.evaluate_entry_strength(
+                    code,
+                    df_1m,
+                    v_ref_1m=v_ref_1m,
+                    big_order_streak=b_streak,
+                    is_nxt=(exchange_hint == "NXT"),
+                ) if hasattr(self, 'strength_engine') else {'passed': True}
+
+                # 🛡️ [미체결 매수 주문 조기 취소 방어]: 체결 전 1분봉 데드크로스(60-240 / 60-120) 확정 시 미체결 매수 즉시 취소
+                if code in self.pending_buy_orders and isinstance(df_1m, pd.DataFrame) and len(df_1m) >= 20:
+                    try:
+                        df1m_pend = calculate_1m_tema_indicators(df_1m, current_price=tick_close)
+                        if not df1m_pend.empty:
+                            lp = df1m_pend.iloc[-1]
+                            p_t60 = float(lp.get('tema60', np.nan))
+                            p_t120 = float(lp.get('tema120', np.nan))
+                            p_t240 = float(lp.get('tema240', np.nan))
+                            if not np.isnan(p_t60) and not np.isnan(p_t120) and p_t120 > 0:
+                                is_dc_now = (p_t60 < p_t240) if (not np.isnan(p_t240) and p_t240 > 0 and p_t120 >= p_t240) else (p_t60 < p_t120)
+                                if is_dc_now:
+                                    p_pend = self.pending_buy_orders.get(code, {})
+                                    ord_no_b = str(p_pend.get('order_no', ''))
+                                    qty_b = int(p_pend.get('qty', 0))
+                                    if self.is_real and not self.dry_run and self.api and ord_no_b and qty_b > 0:
+                                        self.api.cancel_order(ord_no_b, code, qty_b)
+                                    self._rollback_strategy_state(strat, p_pend.get('order'), p_pend.get('prev_pos'), p_pend.get('prev_cash'))
+                                    self.pending_buy_orders.pop(code, None)
+                                    logger.warning(f"🚫 [미체결 중 1분봉 DC 발생 ➔ 매수 취소] [{name}({code})] 주문번호:{ord_no_b}")
+                                    continue
+                    except Exception:
+                        pass
 
                 # 🎯 [첫 5분봉 앵커 산출]
                 anchor_5m = self.get_5m_anchor(code, df_60m, df_daily, tick_close)
@@ -2424,7 +2680,7 @@ class SafeHoldingsThemeGateBot:
                 low_5m = float(anchor_5m.get('low', 0.0) or 0.0)
                 high_5m = float(anchor_5m.get('high', 0.0) or 0.0)
 
-                # 장 운영 시간(또는 DRY-RUN 테스트 모드)에만 전략 상태 전이 평가 실행 (당일 강제청산 없음 — 매도 신호는 상시 평가)
+                # 장 운영 시간(또는 DRY-RUN 테스트 모드)에만 전략 상태 전이 평가 실행
                 if is_active or self.dry_run:
                     order = strat.evaluate_bar(
                         last_60m, 
@@ -2434,6 +2690,7 @@ class SafeHoldingsThemeGateBot:
                         day3_m_line=day3_m_line,
                         current_price=tick_close,
                         df_120t=df_120t,
+                        df_1m=df_1m,
                         df_3m=df_3m,
                         is_condition_pick=is_cond_pick,
                         day_alpha=day_alpha,
@@ -2445,29 +2702,11 @@ class SafeHoldingsThemeGateBot:
                         is_daily_3_5_eligible=is_daily_3_5_ok,
                         daily_3_5_label=daily_3_5_label,
                         is_replacement_mode=is_replacement_mode,
-                        allow_new_buys=allow_new_buys
+                        allow_new_buys=allow_new_buys,
+                        strength_metrics=strength_metrics,
                     )
                 else:
                     order = None
-
-                # 💡 [PROFIT_TAKEN ➔ TERMINATED 1종목 완주 종료 실시간 감지 및 다음 종목 개방]
-                if prev_pos.state == StrategyState.PROFIT_TAKEN and strat.position.state == StrategyState.TERMINATED:
-                    self._save_stock_wave_context(code, strat.position)
-                    if getattr(self, 'focus_stock_code', None) == code:
-                        self.focus_stock_code = None
-                    if self.sticky_leader and self.sticky_leader.get('code') == code:
-                        self.sticky_leader = None
-                    if focus_code == code:
-                        focus_code = None
-                    if lock_target == code:
-                        lock_target = None
-                        skip_idle_for_fast_exit = False
-                        self._last_idle_scan_ts = 0.0
-                    logger.info(
-                        f"🏁 [1종목 완주 종료 · 다음 종목 전환 개방(TERMINATED)] [{name}({code})] "
-                        f"{strat.position.top_confirmed_reason} ➔ 다음 Top10 종목 진행"
-                    )
-                    continue
 
                 # 60분봉 정배열/지지 상태 가시화
                 if sma5_val > sma20_val > sma60_val:
@@ -2586,8 +2825,13 @@ class SafeHoldingsThemeGateBot:
                     except Exception:
                         pass
 
+                df_liq_intraday = (
+                    df_120t
+                    if (isinstance(df_120t, pd.DataFrame) and not df_120t.empty)
+                    else (df_1m if (isinstance(df_1m, pd.DataFrame) and not df_1m.empty) else df_120t)
+                )
                 liq_metrics = self._compute_liquidity_metrics(
-                    tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_120t
+                    tick_close, df_daily=df_daily, df_60m=df_60m, df_120t=df_liq_intraday
                 )
                 with self.condition_lock:
                     c_entry = self.condition_picks.get(code)
@@ -2600,9 +2844,36 @@ class SafeHoldingsThemeGateBot:
                     else f"거래: {liq_metrics['today_val_eok']:,.1f}억(전일 {liq_metrics['prev_day_val_eok']:,.1f}억)"
                 )
 
+                m1_str = "산출대기"
+                if isinstance(df_1m, pd.DataFrame) and not df_1m.empty and len(df_1m) >= 20 and 'close' in df_1m:
+                    try:
+                        df1m_view = calculate_1m_tema_indicators(df_1m, current_price=tick_close)
+                        if not df1m_view.empty:
+                            l1m = df1m_view.iloc[-1]
+                            t60_1m = float(l1m.get('tema60', np.nan))
+                            t120_1m = float(l1m.get('tema120', np.nan))
+                            t240_1m = float(l1m.get('tema240', np.nan))
+                            bs_60_120 = float(l1m.get('bars_since_tema60_120_gc', np.nan))
+                            if not np.isnan(t60_1m) and not np.isnan(t120_1m):
+                                gc_tag = f"60-120GC({int(bs_60_120)}봉)" if (t60_1m > t120_1m and not np.isnan(bs_60_120)) else ("60>120" if t60_1m > t120_1m else "60<=120")
+                                reg_tag = "120>=240(60-240DC)" if (not np.isnan(t240_1m) and t240_1m > 0 and t120_1m >= t240_1m) else "120<240(60-120DC)"
+                                t240_txt = f"{t240_1m:,.0f}" if not np.isnan(t240_1m) else "N/A"
+                                m1_str = f"{gc_tag}·{reg_tag} [60:{t60_1m:,.0f}/120:{t120_1m:,.0f}/240:{t240_txt}]"
+                    except Exception:
+                        pass
+
+                rvp60_v = float(strength_metrics.get('rvp_60s', 100.0))
+                rvp180_v = float(strength_metrics.get('rvp_180s', 100.0))
+                nb3m_eok = float(strength_metrics.get('net_buy_3m', 0.0)) / 100_000_000.0
+                rng5_v = float(strength_metrics.get('range_5m', 0.0))
+                cp5_v = float(strength_metrics.get('close_pos_5m', 0.0))
+                src_s = strength_metrics.get('source', 'WARMUP')
+                str_badge = "🟢" if strength_metrics.get('passed') else "⚪"
+                strength_str = f"{str_badge}RVP60:{rvp60_v:.0f}%/180:{rvp180_v:.0f}%·순매수{nb3m_eok:+.2f}억·5m폭{rng5_v:.2f}%(종가{cp5_v:.2f})[{src_s}]"
+
                 logger.info(
                     f"📊 {source_badge}[{name}]{mkt_tag} 상태: {state_display}{bep_tag}{profit_tag} | 현재가: {tick_close:,.0f}({day_ret_pct:+.2f}%) | "
-                    f"자격: {qual_str} | 120틱: {gate_120t_str} | 60분: {align_str} | {m3_str} | {liq_tag}"
+                    f"1분: {m1_str} | 체결강도: {strength_str} | {liq_tag}"
                 )
 
                 eff_qty = cur_qty if (self.is_real and not self.dry_run) else max(
@@ -2650,36 +2921,12 @@ class SafeHoldingsThemeGateBot:
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
                         self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
-                    # 2) 2차 관문선 추가 매수: 14:30 이후 중단 및 1차 체결 대기 시 보류
-                    elif order.action == "BUY_2":
-                        if is_buy_cutoff:
-                            logger.info(f"   🕒 [{name}({code})] 14:30 이후 신규·추가 매수 종료 ➔ 2차 매수 보류 및 매도 집중")
-                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
-                            continue
-                        if code in self.pending_buy_orders:
-                            logger.info(f"   ⏳ [{name}({code})] 1차 매수 체결 확인 대기 중 ➔ 2차 매수 보류 (상태 복원)")
-                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
-                            continue
-                        self.execute_order(code, name, order, prev_pos=prev_pos, prev_cash=prev_cash)
-                    # 3) 신규 1차 매수: 14:30 이후 중단 / 쿨다운 / 시초 휩소 방어 / 조건검색 게이트 후 우선순위 수집
+                    # 2) 신규 매수: 정산 쿨다운(5초) 및 조건검색/유동성 확인 후 우선순위 수집 (시간·등락률 규제 전면 해제)
                     elif order.action == "BUY_1":
-                        if is_buy_cutoff:
-                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
-                            continue
                         if cooldown_rem > 0:
                             logger.info(
-                                f"   ⏳ [매도 후 재매수 쿨다운 대기] [{name}({code})] 잔여 {cooldown_rem:.0f}초 "
-                                f"➔ 체결 안정화 후 즉시 재매수/순환매매 평가 (상태 보존)"
-                            )
-                            self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
-                            continue
-
-                        if is_opening_whipsaw_window and not self.dry_run:
-                            whipsaw_label = "08:00~08:00:15 프리마켓 시초 15초 호가 안정화" if exchange_hint == "NXT" else "09:00~09:00:15 정규장 시초 15초 호가 안정화"
-                            resume_time_str = "08:00:15" if exchange_hint == "NXT" else "09:00:15"
-                            logger.info(
-                                f"   🛡️ [{whipsaw_label}] [{name}({code})] 시초 동시호가 체결 안정화 대기 중 "
-                                f"➔ {resume_time_str} 이후 양봉·지지 유지 확인 시 즉시 진입 (상태 안전 복원)"
+                                f"   ⏳ [매도 후 주문 정산 대기] [{name}({code})] 잔여 {cooldown_rem:.0f}초 "
+                                f"➔ 정산 안정화 후 즉시 매수 평가 (상태 보존)"
                             )
                             self._rollback_strategy_state(strat, order, prev_pos, prev_cash)
                             continue
@@ -2774,6 +3021,8 @@ class SafeHoldingsThemeGateBot:
                             'prev_pos': prev_pos,
                             'prev_cash': prev_cash,
                             'priority_score': p_score,
+                            'rvp_60s': float(strength_metrics.get('rvp_60s', 100.0) or 100.0),
+                            'net_buy_3m': float(strength_metrics.get('net_buy_3m', 0.0) or 0.0),
                             'details': p_details
                         })
 
@@ -2806,27 +3055,16 @@ class SafeHoldingsThemeGateBot:
                         x.get('cond_overlap', 0),
                         x['priority_score'],
                         x['details'].get('day_val_eok', 0.0),
+                        x.get('rvp_60s', 100.0),
                     ),
                     reverse=True,
                 )
 
-                # 🏆 [1종목 완주 집중 Lock]: 집중 중인 종목(PROFIT_TAKEN 포함)이 3분 SMA 5-20 DC로 완전히 종료되기 전에는 타종목 진입 차단
-                # (루프 내 미확정 BUY_1 후보가 임시로 FIRST_BUY_DONE으로 바뀐 것에 오염되지 않도록 루프 시작 시 확정한 focus_code 사용)
-                cur_focus = focus_code
-                if cur_focus:
-                    focus_hit = next((c for c in buy_candidates if c['code'] == cur_focus), None)
-                    if focus_hit is not None:
-                        buy_candidates = [focus_hit] + [c for c in buy_candidates if c['code'] != cur_focus]
-                    else:
-                        f_name = self.get_stock_name(cur_focus)
-                        f_state = self.strategies[cur_focus].position.state.value if cur_focus in self.strategies else "FOCUS"
-                        for cand in buy_candidates:
-                            logger.info(
-                                f"   🏆 [1종목 완주 집중 대기] [{f_name}({cur_focus})]({f_state}) 3분 SMA 5-20 DC 종료 전까지 "
-                                f"[{cand['name']}] (점수 {cand['priority_score']:.1f}점) 매수 보류 및 상태 원복"
-                            )
-                            self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
-                        buy_candidates = []
+                # 🏆 1종목 슬롯 잠금은 실제 활성 보유 또는 미체결 매수 주문 진행 중일 때만 적용 (전량 매도 후 즉시 개방)
+                if self.pending_buy_orders:
+                    for cand in buy_candidates:
+                        self._rollback_strategy_state(cand['strat'], cand['order'], cand['prev_pos'], cand['prev_cash'])
+                    buy_candidates = []
 
                 if not buy_candidates:
                     return
@@ -2841,10 +3079,7 @@ class SafeHoldingsThemeGateBot:
                 w_fut_badge = winner.get('fut_badge', '🟢정상')
                 w_d = winner['details']
 
-                mode_tag = (
-                    f"{w_fut_label} {w_fut_badge} "
-                    f"{'순환교체(<=20%) 120틱 SMA40<60·3관문돌파' if self.completed_trades_today > 0 else '일봉 3-5 자격 120틱 SMA40<60·3관문돌파'}"
-                )
+                mode_tag = f"{w_fut_label} {w_fut_badge} 무규제 1분봉 TEMA 60-120 GC·RVP 체결강도"
 
                 streak_tag = f", 🔥세력3천만+: {w_d.get('big_order_streak')}연타(+{w_d.get('score_big_streak', 0.0):.0f}점)" if w_d.get('big_order_streak', 0) > 0 else ""
                 logger.info(
@@ -2872,10 +3107,10 @@ class SafeHoldingsThemeGateBot:
                     self._rollback_strategy_state(other['strat'], other['order'], other['prev_pos'], other['prev_cash'])
 
     def start_loop(self, interval_sec: int = 5):
-        """실시간 반복 감시 시작 (09:30 조건검색 Top10 엄선 및 120틱 단순 5-40 GC · 5-60 GC · 5-60 DC 정밀 감시)"""
+        """실시간 반복 감시 시작 (무규제 1분봉 TEMA 60-120 GC + RVP 체결강도 매수 / 120>=240 ? 60-240 DC : 60-120 DC 매도 일원화)"""
         logger.info(
-            f"🔄 실시간 조건검색({self.condition_name}) 09:30 중복 4·3·2순 Top10 엄선 & "
-            f"120틱 단순 5-40 GC(1차) / 5-60 GC(2차) / 5-60 DC(매도) 감시를 시작합니다 (대기 {interval_sec}초, 보유중 2초)."
+            f"🔄 실시간 조건검색({self.condition_name}) 중복 4·3·2순 Top10 엄선 & "
+            f"무규제 1분봉 TEMA 60-120 GC(RVP 체결강도) 매수 / (120>=240 ? 60-240 DC : 60-120 DC) 반복 매매 감시를 시작합니다 (대기 {interval_sec}초, 보유중 2초)."
         )
         try:
             while True:
@@ -2888,7 +3123,7 @@ class SafeHoldingsThemeGateBot:
                 woke_early = self.condition_wakeup_event.wait(timeout=wait_sec)
                 if woke_early:
                     self.condition_wakeup_event.clear()
-                    logger.info("⚡ [실시간 후보/수급 갱신] Top10 후보 등록 및 120틱 단순 5-40·5-60 타점 점검!")
+                    logger.info("⚡ [실시간 후보/수급 갱신] Top10 후보 등록 및 1분봉 TEMA 60-120 GC · RVP 체결강도 타점 점검!")
         except KeyboardInterrupt:
             logger.info("🛑 사용자에 의해 감시 루프가 정상 종료되었습니다.")
 
@@ -2899,8 +3134,8 @@ if __name__ == '__main__':
     parser.add_argument("--once", action="store_true", help="1회 감시만 실행 후 종료")
     parser.add_argument("--dry-run", action="store_true", help="모의 안전 모드(주문 미전송)")
     parser.add_argument("--interval", type=int, default=5, help="루프 감시 주기(초, 기본 5초·보유중 2초)")
-    parser.add_argument("--condition", type=str, default="Traiding,traiding,Traiding1,trading1",
-                        help="키움 실시간 조건검색식 이름 (기본값: Traiding,traiding,Traiding1,trading1)")
+    parser.add_argument("--condition", type=str, default="Traiding,traiding,Traiding1,traiding1",
+                        help="키움 실시간 조건검색식 이름 (기본값: Traiding,traiding,Traiding1,traiding1)")
     parser.add_argument("--min-overlap", type=int, default=2,
                         help="신규 매수 허용 최소 조건식 중복 포착 수 (기본 2=중복 4·3·2순 Top10 엄선)")
     parser.add_argument("--min-stay-sec", type=float, default=30.0,
@@ -2910,6 +3145,39 @@ if __name__ == '__main__':
     parser.add_argument("--no-ws", action="store_true", help="실시간 조건검색 웹소켓 비활성화")
 
     args = parser.parse_args()
+
+    # 🛡️ 동일 AppKey 웹소켓 세션 충돌(R10001) 방지를 위한 OS 파일 락 (중복 실행 차단)
+    _instance_lock_fp = None
+    if not args.once:
+        try:
+            os.makedirs("logs", exist_ok=True)
+            lock_path = os.path.join("logs", "trading_bot_holdings_only.lock")
+            _instance_lock_fp = open(lock_path, "a+", encoding="utf-8")
+            if sys.platform.startswith("win"):
+                import msvcrt
+                _instance_lock_fp.seek(0)
+                msvcrt.locking(_instance_lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(_instance_lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _instance_lock_fp.seek(0)
+            _instance_lock_fp.truncate()
+            _instance_lock_fp.write(f"pid={os.getpid()} started={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            _instance_lock_fp.flush()
+        except Exception as lock_err:
+            existing_info = ""
+            try:
+                if _instance_lock_fp is not None:
+                    _instance_lock_fp.seek(0)
+                    existing_info = _instance_lock_fp.read().strip()
+                    _instance_lock_fp.close()
+            except Exception:
+                pass
+            logger.error(
+                f"⛔ 이미 다른 자동매매 봇 인스턴스가 실행 중입니다({existing_info or lock_err}). "
+                "동일 AppKey 웹소켓 충돌(R10001) 방지를 위해 새 프로세스를 종료합니다."
+            )
+            sys.exit(1)
 
     bot = SafeHoldingsThemeGateBot(
         is_real=True,

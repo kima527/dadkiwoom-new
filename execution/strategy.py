@@ -6,21 +6,33 @@ import pandas as pd
 import numpy as np
 
 try:
-    from indicators import calculate_day3_m_line, calculate_120t_tema_indicators, check_daily_ma3_5_eligible, calculate_3m_sma5_20_status
+    from indicators import (
+        calculate_day3_m_line,
+        calculate_120t_tema_indicators,
+        calculate_1m_tema_indicators,
+        check_daily_ma3_5_eligible,
+        calculate_3m_sma5_20_status,
+    )
 except ImportError:
-    from execution.indicators import calculate_day3_m_line, calculate_120t_tema_indicators, check_daily_ma3_5_eligible, calculate_3m_sma5_20_status
+    from execution.indicators import (
+        calculate_day3_m_line,
+        calculate_120t_tema_indicators,
+        calculate_1m_tema_indicators,
+        check_daily_ma3_5_eligible,
+        calculate_3m_sma5_20_status,
+    )
 
 def calculate_wma(series: pd.Series, period: int = 60) -> pd.Series:
     """WMA(가중이동평균) 고속 연산 (120틱 WMA 순차돌파 및 고점 반전 연산)"""
-    if series is None or len(series) < period:
-        return pd.Series(np.nan, index=getattr(series, 'index', None))
-    clean_series = series.ffill().bfill()
+    if series is None or period <= 0 or len(series) < period:
+        return pd.Series(np.nan, index=getattr(series, 'index', None), dtype=float)
+    clean_vals = np.asarray(series.ffill().bfill(), dtype=float)
     weights = np.arange(1, period + 1, dtype=float)
     w_sum = weights.sum()
-    return clean_series.rolling(window=period, min_periods=period).apply(
-        lambda p: np.dot(p, weights) / w_sum,
-        raw=True
-    )
+    out = np.full(len(clean_vals), np.nan, dtype=float)
+    windows = np.lib.stride_tricks.sliding_window_view(clean_vals, period)
+    out[period - 1:] = (windows @ weights) / w_sum
+    return pd.Series(out, index=series.index, dtype=float)
 
 class StrategyState(str, Enum):
     IDLE = "IDLE"                                     # 대기 중 (1차 진입 탐색)
@@ -71,10 +83,15 @@ class PositionTracker:
     open_5m: float = 0.0                # 첫 5분봉 시가 (제1전략 지지선 기준)
     trade_count_today: int = 0          # 당일 매매 완료 횟수 (제1전략 ➔ 제2전략 회전 전환용)
     tema60_bull_armed: bool = False     # 매수 진입 이후 테마60 > 테마120 정배열 안착 확인 여부 (사자마자 즉시 매도 원천 방지)
+    tema60_120_armed: bool = False      # 1분봉 TEMA 60-120 정배열 안착 여부
+    last_entry_gc_key: str = ""         # 직전 진입한 1분봉 TEMA 60-120 GC 봉 키 (동일 파동 중복 재진입 방지)
     tema30_60_armed: bool = False       # 매수 진입 이후 테마30 >= 테마60 정배열 안착 확인 여부
     tema15_120_armed: bool = False      # 매수 진입 이후 테마15 >= 테마120 안착 확인 여부
     sma5_60_armed: bool = False         # 매수 진입 이후 120틱 단순5이평 >= 단순60이평 안착 확인 여부
     sma5_60_buy2_armed: bool = True     # 1차 매수 시점 기준 신규 5-60 GC 2차 매수 대기 가능 여부
+    m1_tema5_20_armed: bool = False     # 매수 진입 이후 1분봉 테마 5 >= 20 정배열 안착 이력
+    m1_tema5_sma20_armed: bool = False  # 매수 진입 이후 1분봉 테마 5 >= 단순 20 안착 이력 (수익률 <= 2% 또는 5-60 GC전 매도용)
+    m1_tema5_60_armed: bool = False     # 매수 진입 이후 1분봉 테마 5 >= 테마 60 골든크로스/정배열 안착 이력 (5-60 DC 매도용)
     m3_sma5_20_armed: bool = False      # 3분봉 단순 5 >= 20 정배열 안착 이력 (오판정 방지용)
     m3_dead_cross_seen: bool = False    # 보유 중 3분봉 SMA 5-20 데드크로스 발생 기록 (청산 후 타종목 전환용)
     # ── [3관문선(테마관문·WMA관문·WMA고가) + 기준선 파동 연속 대응 필드] ──
@@ -275,16 +292,185 @@ class ThemeGate60mStrategy:
         # 핵심: 120틱 단순 5-40 GC(1차 매수), 단순 5-60 GC(2차 매수), 단순 5-60 DC(전량 매도)
         df_120t_explicit = kwargs.get('df_120t', None)
         df_3m_raw = kwargs.get('df_3m', None) if df_120t_explicit is not None else None
+        df_1m_raw = kwargs.get('df_1m', None)
         has_3m_sma, m3_s5, m3_s20, m3_is_dc_bar, m3_is_bull = calculate_3m_sma5_20_status(
             df_3m_raw, current_price=tick_close
         )
-        if has_3m_sma and m3_s5 >= m3_s20:
+        if self.position.state != StrategyState.IDLE and has_3m_sma and (m3_s5 >= m3_s20 or m3_is_dc_bar):
             self.position.m3_sma5_20_armed = True
         is_3m_sma5_20_dc_now = bool(
             has_3m_sma and (m3_is_dc_bar or (self.position.m3_sma5_20_armed and m3_s5 < m3_s20))
         )
         if self.position.state in (StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION) and is_3m_sma5_20_dc_now:
             self.position.m3_dead_cross_seen = True
+
+        # ⚡ [1분봉 일원화 파동·매매 지표]: 매수(TEMA 60-120 GC) & 매도(120>=240 ? TEMA 60-240 DC : TEMA 60-120 DC)
+        has_1m_wave = False
+        df_1m_calc = None
+        m1_t5 = np.nan
+        m1_t20 = np.nan
+        m1_t60 = np.nan
+        m1_t120 = np.nan
+        m1_t240 = np.nan
+        m1_s5 = np.nan
+        m1_s20 = np.nan
+        m1_s40 = np.nan
+        m1_s60 = np.nan
+        gate_1m = np.nan
+        settled_gate_1m = np.nan
+        active_1m_gate = np.nan
+        last_1m_open = tick_close
+        last_1m_high = tick_close
+        is_1m_gate_cross_up = False
+        is_m1_tema5_20_bull = False
+        is_m1_tema5_20_dc_bar = False
+        is_m1_tema5_20_dead = False
+        is_m1_tema5_sma20_dc_bar = False
+        is_m1_tema5_sma20_dead = False
+        is_m1_tema5_60_dc_bar = False
+        is_m1_tema5_60_dead = False
+        is_m1_tema60_120_bull = False
+        is_m1_tema60_120_gc_bar = False
+        is_m1_tema60_120_dc_bar = False
+        is_m1_tema60_120_dead = False
+        bars_since_m1_60_120_gc = np.nan
+        m1_gc_60_120_bar_key = ""
+        is_m1_tema60_240_dc_bar = False
+        is_m1_tema60_240_dead = False
+        is_m1_tema5_rising = False
+        is_m1_wma5_20_bull = False
+        is_m1_sma40_gt_60 = False
+        is_m1_sma5_60_bull = False
+        is_m1_sma5_60_gc_bar = False
+        is_m1_sma5_60_dc_bar = False
+        is_m1_sma5_60_dead = False
+        m1_bars_since_5_60_gc = np.nan
+
+        if isinstance(df_1m_raw, pd.DataFrame) and not df_1m_raw.empty and len(df_1m_raw) >= 20 and 'close' in df_1m_raw:
+            df_1m_calc = calculate_1m_tema_indicators(df_1m_raw, current_price=tick_close)
+            if not df_1m_calc.empty:
+                has_1m_wave = True
+                last_1m = df_1m_calc.iloc[-1]
+                prev_1m = df_1m_calc.iloc[-2] if len(df_1m_calc) >= 2 else last_1m
+                m1_t5 = float(last_1m.get('tema5', np.nan))
+                m1_t20 = float(last_1m.get('tema20', np.nan))
+                m1_t60 = float(last_1m.get('tema60', np.nan))
+                m1_t120 = float(last_1m.get('tema120', np.nan))
+                m1_t240 = float(last_1m.get('tema240', np.nan))
+                prev_m1_t5 = float(prev_1m.get('tema5', np.nan))
+                prev_m1_t20 = float(prev_1m.get('tema20', np.nan))
+                prev_m1_t60 = float(prev_1m.get('tema60', np.nan))
+                prev_m1_t120 = float(prev_1m.get('tema120', np.nan))
+                prev_m1_t240 = float(prev_1m.get('tema240', np.nan))
+
+                is_m1_tema60_120_bull = bool(
+                    not np.isnan(m1_t60) and not np.isnan(m1_t120) and m1_t120 > 0 and m1_t60 > m1_t120
+                )
+                is_m1_tema60_120_gc_bar = bool(last_1m.get('is_tema60_120_gc', False)) or bool(
+                    not any(np.isnan(x) for x in (prev_m1_t60, prev_m1_t120, m1_t60, m1_t120))
+                    and prev_m1_t60 <= prev_m1_t120
+                    and m1_t60 > m1_t120
+                )
+                is_m1_tema60_120_dc_bar = bool(last_1m.get('is_tema60_120_dc', False)) or bool(
+                    not any(np.isnan(x) for x in (prev_m1_t60, prev_m1_t120, m1_t60, m1_t120))
+                    and prev_m1_t60 >= prev_m1_t120
+                    and m1_t60 < m1_t120
+                )
+                is_m1_tema60_120_dead = bool(
+                    is_m1_tema60_120_dc_bar
+                    or (not np.isnan(m1_t60) and not np.isnan(m1_t120) and m1_t120 > 0 and m1_t60 < m1_t120)
+                )
+                bars_since_m1_60_120_gc = float(last_1m.get('bars_since_tema60_120_gc', np.nan))
+                if (np.isnan(bars_since_m1_60_120_gc)) and is_m1_tema60_120_gc_bar:
+                    bars_since_m1_60_120_gc = 0.0
+                if not np.isnan(bars_since_m1_60_120_gc) and bars_since_m1_60_120_gc >= 0:
+                    gc_pos = len(df_1m_calc) - 1 - int(bars_since_m1_60_120_gc)
+                    if 0 <= gc_pos < len(df_1m_calc):
+                        if 'datetime' in df_1m_calc.columns:
+                            m1_gc_60_120_bar_key = str(df_1m_calc['datetime'].iloc[gc_pos])
+                        elif 'time' in df_1m_calc.columns:
+                            m1_gc_60_120_bar_key = str(df_1m_calc['time'].iloc[gc_pos])
+                        else:
+                            m1_gc_60_120_bar_key = str(df_1m_calc.index[gc_pos])
+
+                is_m1_tema60_240_dc_bar = bool(last_1m.get('is_tema60_240_dc', False)) or bool(
+                    not any(np.isnan(x) for x in (prev_m1_t60, prev_m1_t240, m1_t60, m1_t240))
+                    and prev_m1_t60 >= prev_m1_t240
+                    and m1_t60 < m1_t240
+                )
+                is_m1_tema60_240_dead = bool(
+                    is_m1_tema60_240_dc_bar
+                    or (not np.isnan(m1_t60) and not np.isnan(m1_t240) and m1_t240 > 0 and m1_t60 < m1_t240)
+                )
+                is_m1_tema5_60_dc_bar = bool(
+                    not any(np.isnan(x) for x in (prev_m1_t5, prev_m1_t60, m1_t5, m1_t60))
+                    and prev_m1_t5 >= prev_m1_t60
+                    and m1_t5 < m1_t60
+                )
+                is_m1_tema5_60_dead = bool(
+                    is_m1_tema5_60_dc_bar
+                    or (not np.isnan(m1_t5) and not np.isnan(m1_t60) and m1_t60 > 0 and m1_t5 < m1_t60)
+                )
+                is_m1_tema5_20_bull = bool(not np.isnan(m1_t5) and not np.isnan(m1_t20) and m1_t20 > 0 and m1_t5 > m1_t20)
+                is_m1_tema5_rising = bool(not np.isnan(m1_t5) and not np.isnan(prev_m1_t5) and m1_t5 > prev_m1_t5)
+                is_m1_tema5_20_dc_bar = bool(
+                    not any(np.isnan(x) for x in (prev_m1_t5, prev_m1_t20, m1_t5, m1_t20))
+                    and prev_m1_t5 >= prev_m1_t20
+                    and m1_t5 < m1_t20
+                )
+                is_m1_tema5_20_dead = bool(
+                    is_m1_tema5_20_dc_bar
+                    or (not np.isnan(m1_t5) and not np.isnan(m1_t20) and m1_t20 > 0 and m1_t5 < m1_t20)
+                )
+                is_1m_gate_cross_up = bool(last_1m.get('gate_cross_up', False))
+                gate_1m = float(last_1m.get('theme_gate', np.nan))
+                settled_gate_1m = float(prev_1m.get('theme_gate', np.nan))
+                active_1m_gate = (
+                    gate_1m
+                    if (is_1m_gate_cross_up or np.isnan(settled_gate_1m) or settled_gate_1m <= 0)
+                    else settled_gate_1m
+                )
+                is_m1_wma5_20_bull = bool(last_1m.get('is_wma5_20_bull', False))
+                m1_s5 = float(last_1m.get('sma5', np.nan))
+                m1_s20 = float(last_1m.get('sma20', np.nan))
+                prev_m1_s20 = float(prev_1m.get('sma20', np.nan))
+                is_m1_tema5_sma20_dc_bar = bool(
+                    not any(np.isnan(x) for x in (prev_m1_t5, prev_m1_s20, m1_t5, m1_s20))
+                    and prev_m1_t5 >= prev_m1_s20
+                    and m1_t5 < m1_s20
+                )
+                is_m1_tema5_sma20_dead = bool(
+                    is_m1_tema5_sma20_dc_bar
+                    or (not np.isnan(m1_t5) and not np.isnan(m1_s20) and m1_s20 > 0 and m1_t5 < m1_s20)
+                )
+                m1_s40 = float(last_1m.get('sma40', np.nan))
+                m1_s60 = float(last_1m.get('sma60', np.nan))
+                is_m1_sma40_gt_60 = bool(
+                    not np.isnan(m1_s40) and not np.isnan(m1_s60) and m1_s60 > 0 and m1_s40 > m1_s60
+                )
+                is_m1_sma5_60_gc_bar = bool(last_1m.get('is_sma5_60_gc', False))
+                is_m1_sma5_60_dc_bar = bool(last_1m.get('is_sma5_60_dc', False))
+                is_m1_sma5_60_bull = bool(
+                    not np.isnan(m1_s5) and not np.isnan(m1_s60) and m1_s60 > 0 and m1_s5 > m1_s60
+                )
+                is_m1_sma5_60_dead = bool(
+                    is_m1_sma5_60_dc_bar
+                    or (not np.isnan(m1_s5) and not np.isnan(m1_s60) and m1_s60 > 0 and m1_s5 < m1_s60)
+                )
+                m1_bars_since_5_60_gc = float(last_1m.get('bars_since_sma5_60_gc', np.nan))
+                last_1m_open = float(last_1m.get('open', tick_close))
+                last_1m_high = float(last_1m.get('high', tick_close))
+
+        is_1m_entry_assist_ok = True if not has_1m_wave else bool(
+            is_m1_tema5_20_bull
+            or (
+                is_m1_tema5_rising
+                and not np.isnan(m1_t5)
+                and not np.isnan(m1_t20)
+                and m1_t20 > 0
+                and m1_t5 >= m1_t20 * 0.9985
+            )
+        )
 
         df_120t = df_120t_explicit
         if df_120t is None:
@@ -441,15 +627,31 @@ class ThemeGate60mStrategy:
                 last_120t_open = float(last_120t.get('open', tick_close))
 
                 # 120틱 미완성 봉 떨림(Flicker) 방지: 레벨 확정은 직전 완성봉(-2) 우선 참조
+                # 단, 직전봉에 WMA 5-20 GC가 먼저 완료된 뒤 현재봉(-1)에서 TEMA 5-20 GC(gate_cross_up)가 발생한 경우
+                # 이전 고점 파동의 구버전 theme_gate 대신 현재 바닥 파동의 신규 theme_gate / 3관문 천장을 즉시 반영
                 ref_bar_120t = df_120t_calc.iloc[-2] if len(df_120t_calc) >= 2 else last_120t
+                is_cur_120t_gate_cross = bool(last_120t.get('gate_cross_up', False))
+                is_cur_120t_wma_cross = bool(last_120t.get('wma_cross_up', False))
                 _sg = float(ref_bar_120t.get('theme_gijun', np.nan))
                 settled_gijun_120t = _sg if (not np.isnan(_sg) and _sg > 0) else gijun_120t
                 _sgate = float(ref_bar_120t.get('theme_gate', np.nan))
-                settled_gate_120t = _sgate if (not np.isnan(_sgate) and _sgate > 0) else gate_120t
+                settled_gate_120t = (
+                    gate_120t
+                    if (is_cur_120t_gate_cross and not np.isnan(gate_120t) and gate_120t > 0)
+                    else (_sgate if (not np.isnan(_sgate) and _sgate > 0) else gate_120t)
+                )
                 _stc = float(ref_bar_120t.get('tri_gate_ceiling', np.nan))
-                settled_tri_ceiling_120t = _stc if (not np.isnan(_stc) and _stc > 0) else tri_gate_ceiling_120t
+                settled_tri_ceiling_120t = (
+                    tri_gate_ceiling_120t
+                    if (is_cur_120t_gate_cross and not is_cur_120t_wma_cross and not np.isnan(tri_gate_ceiling_120t) and tri_gate_ceiling_120t > 0)
+                    else (_stc if (not np.isnan(_stc) and _stc > 0) else tri_gate_ceiling_120t)
+                )
                 _stf = float(ref_bar_120t.get('tri_gate_floor', np.nan))
-                settled_tri_floor_120t = _stf if (not np.isnan(_stf) and _stf > 0) else tri_gate_floor_120t
+                settled_tri_floor_120t = (
+                    tri_gate_floor_120t
+                    if (is_cur_120t_gate_cross and not is_cur_120t_wma_cross and not np.isnan(tri_gate_floor_120t) and tri_gate_floor_120t > 0)
+                    else (_stf if (not np.isnan(_stf) and _stf > 0) else tri_gate_floor_120t)
+                )
                 is_tema60_120_gc_bar = bool(last_120t.get('is_tema60_120_gc', False))
                 is_tema60_120_dc_bar = bool(last_120t.get('is_tema60_120_dc', False))
                 is_tema60_120_dead = bool(
@@ -529,9 +731,9 @@ class ThemeGate60mStrategy:
             else tri_gate_floor_120t
         )
 
-        # 고점 확정(TERMINATED) 종목은 일자 전환 전까지 절대 자동 리셋하지 않음
+        # 무규제 원칙: 과거 TERMINATED 상태가 남아 있어도 즉시 PROFIT_TAKEN으로 복원하여 반복 매매 허용
         if self.position.state == StrategyState.TERMINATED:
-            return None
+            self.position.state = StrategyState.PROFIT_TAKEN
 
         if tick_close > self.position.session_high_price:
             self.position.session_high_price = tick_close
@@ -540,6 +742,8 @@ class ThemeGate60mStrategy:
                 self.position.wave_high_price = tick_close
             if last_120t_high > self.position.wave_high_price:
                 self.position.wave_high_price = last_120t_high
+            if has_1m_wave and last_1m_high > self.position.wave_high_price:
+                self.position.wave_high_price = last_1m_high
 
         enable_core_swing_split = bool(kwargs.get('enable_core_swing_split', True))
 
@@ -579,45 +783,43 @@ class ThemeGate60mStrategy:
                         else:
                             self.position.target_gijun_price = 0.0
 
-        def _is_unified_3gate_buy_ready(require_pullback_state: bool = False) -> bool:
-            """1파(IDLE) · N파(PROFIT_TAKEN) 공통 매수 판정: SMA40 < SMA60 상태에서 3관문(테마·WMA·WMA고가) 상향 돌파"""
-            if not has_120t_wave or not is_sma40_lt_60 or day_ret_pct > 25.0:
-                return False
-            if np.isnan(active_tri_ceiling) or active_tri_ceiling <= 0:
-                return False
-            if not is_wma5_20_bull or is_wma5_20_dead:
-                return False
-            if tick_close < last_120t_open:
-                return False
-            if not (active_tri_ceiling * 1.001 <= tick_close <= active_tri_ceiling * 1.018):
-                return False
-            if require_pullback_state:
-                return bool(self.position.saw_gate_pullback)
-            if self.position.saw_gate_pullback:
-                return True
-            if df_120t_calc is not None and len(df_120t_calc) >= 2 and 'tri_gate_ceiling' in df_120t_calc:
-                prev_win = df_120t_calc.iloc[max(0, len(df_120t_calc) - 10):-1]
-                below_prev = (prev_win['close'] < (prev_win['tri_gate_ceiling'] * 1.002)) | (~prev_win['is_wma5_20_bull'])
-                if bool(below_prev.any()):
-                    return True
-            return bool(tick_close <= active_tri_ceiling * 1.012)
+        strength_metrics = kwargs.get('strength_metrics', None)
 
-        def _build_buy1_order(qual_prefix: str, is_reentry_wave: bool) -> Optional[TradeOrder]:
-            """IDLE(1파) · PROFIT_TAKEN(N파) 공통 BUY_1 체결 주문 생성 및 상태 전이"""
+        def _is_1m_60_120_gc_buy_ready() -> bool:
+            """
+            통합 일원화 매수 판정 (1파·N파 공통, 모든 규제 제거):
+              1) 1분봉 TEMA 60 > TEMA 120 골든크로스 발생 시점(0~2봉 이내)
+              2) 동일 골든크로스 파동 중복 재진입 방지 (last_entry_gc_key)
+              3) 근본 체결강도(ExecutionStrengthEngine RVP/순매수/5분 박스) 충족 시 진입 (상한 캡/규제 없음)
+            """
+            if not has_1m_wave:
+                return False
+            if not is_m1_tema60_120_bull or is_m1_tema60_120_dead:
+                return False
+            is_recent_gc = bool(
+                is_m1_tema60_120_gc_bar
+                or (not np.isnan(bars_since_m1_60_120_gc) and 0 <= bars_since_m1_60_120_gc <= 2)
+            )
+            if not is_recent_gc:
+                return False
+            if m1_gc_60_120_bar_key and m1_gc_60_120_bar_key == getattr(self.position, 'last_entry_gc_key', ''):
+                return False
+            if strength_metrics is not None and not bool(strength_metrics.get('passed', False)):
+                return False
+            return True
+
+        def _build_buy1_order(qual_prefix: str = "", is_reentry_wave: bool = False) -> Optional[TradeOrder]:
+            """1분봉 TEMA 60-120 골든크로스 일원화 매수 주문 생성 및 상태 전이"""
             buy_price = tick_close
             if getattr(self, 'fixed_qty', 0) > 0:
                 qty = self.fixed_qty
                 cost = qty * buy_price
             else:
-                budget = self.cash * 0.50
+                budget = self.cash * 0.99
                 qty = int(budget // buy_price)
                 cost = qty * buy_price
             if qty <= 0:
                 return None
-
-            cur_tc = float(active_tri_ceiling)
-            cur_tf = float(active_tri_floor) if (not np.isnan(active_tri_floor) and active_tri_floor > 0) else 0.0
-            cur_gate_val = float(active_gate) if (not np.isnan(active_gate) and active_gate > 0) else 0.0
 
             self.cash = max(0.0, self.cash - cost)
             self.position.total_qty = qty
@@ -632,52 +834,28 @@ class ThemeGate60mStrategy:
             self.position.bep_locked = False
             if is_reentry_wave:
                 self.position.wave_no += 1
-            self.position.wave_high_price = max(buy_price, last_120t_high)
+            self.position.wave_high_price = max(buy_price, last_1m_high)
             if self.position.wave_high_price > self.position.session_high_price:
                 self.position.session_high_price = self.position.wave_high_price
-            self.position.last_gate_line = cur_gate_val
-            self.position.last_gate_high = float(active_gate_high) if (not np.isnan(active_gate_high) and active_gate_high > 0) else 0.0
-            self.position.last_gijun_line = float(active_gijun) if (not np.isnan(active_gijun) and active_gijun > 0) else 0.0
-            self.position.entry_tri_ceiling = cur_tc
-            self.position.entry_tri_floor = cur_tf if cur_tf > 0 else self.position.prev_wave_tri_floor
-            self.position.entry_theme_gate = cur_gate_val
-            self.position.highest_theme_gate = cur_gate_val
-            self.position.ratchet_prev_theme_gate = 0.0
-            self.position.tri_gate_cleared = True
-            self.position.target_gijun_price = float(active_gijun) if (not np.isnan(active_gijun) and active_gijun > buy_price * 1.003) else 0.0
-            self.position.touched_target_gijun = False
-            self.position.support_gijun_price = 0.0
-            self.position.saw_gate_pullback = False
-            self.position.saw_rebound_to_gate = False
             self.position.state = StrategyState.FIRST_BUY_DONE
-            self.position.entry_mode = "120T_SMA"
-            self.position.tema60_bull_armed = bool(not np.isnan(t60) and not np.isnan(t120) and t120 > 0 and t60 >= t120)
-            self.position.tema30_60_armed = bool(not np.isnan(t30) and not np.isnan(t60) and t60 > 0 and t30 >= t60)
-            self.position.tema15_120_armed = bool(not np.isnan(t15) and not np.isnan(t120) and t120 > 0 and t15 >= t120)
-            self.position.sma5_60_armed = bool(not np.isnan(s5) and not np.isnan(s60) and s60 > 0 and s5 >= s60)
-            had_prior_5_60_gc = bool(not np.isnan(s5) and not np.isnan(s60) and s60 > 0 and s5 >= s60 and not is_sma5_60_gc_bar)
-            self.position.sma5_60_buy2_armed = (not had_prior_5_60_gc)
-            self.position.m3_dead_cross_seen = False
-            if has_3m_sma and m3_s5 >= m3_s20:
-                self.position.m3_sma5_20_armed = True
+            self.position.entry_mode = "1M_TEMA60_120"
+            self.position.first_cross_type = "1M_TEMA60_120_GC"
+            self.position.first_cross_price = buy_price
+            self.position.tema60_bull_armed = True
+            self.position.tema60_120_armed = True
+            self.position.last_entry_gc_key = m1_gc_60_120_bar_key
             self.position.low_5m = ref_low_fallback if ref_low_fallback > 0 else buy_price * 0.992
             self.position.open_5m = ref_open_fallback if ref_open_fallback > 0 else buy_price
-            self.position.first_cross_type = "TRI_GATE_REENTRY" if is_reentry_wave else "TRI_GATE_40_LT_60"
-            self.position.first_cross_price = cur_tc
-
-            if not np.isnan(active_gijun) and active_gijun > 0 and buy_price >= active_gijun * 1.001:
-                self.position.first_gijun_cleared = True
-                self.position.cleared_gijun_price = active_gijun
-            else:
-                self.position.first_gijun_cleared = False
-                self.position.cleared_gijun_price = active_gijun if (not np.isnan(active_gijun) and active_gijun > 0) else 0.0
-            self.position.second_gijun_price = 0.0
 
             cond_tag = "🔔[실시간조건검색] " if is_condition_pick else ""
-            wave_lbl = f"{self.position.wave_no}파 재매수" if is_reentry_wave else "1파 매수"
+            wave_lbl = f"{self.position.wave_no}파 반복매수" if is_reentry_wave else "1파 매수"
+            rvp_tag = ""
+            if isinstance(strength_metrics, dict):
+                rvp_tag = f" | RVP60:{strength_metrics.get('rvp_60s', 100.0):.0f}%/180:{strength_metrics.get('rvp_180s', 100.0):.0f}%"
+            t240_tag = f"/240:{m1_t240:,.0f}" if (not np.isnan(m1_t240) and m1_t240 > 0) else ""
             trigger_str = (
-                f"⚡ [120틱 {wave_lbl}·SMA40<60 & 3관문 돌파] "
-                f"40({s40:,.0f})<60({s60:,.0f}) 상태에서 3관문({cur_tc:,.0f}원) 돌파 {qty}주 매수"
+                f"⚡ [1분봉 {wave_lbl}·TEMA 60-120 GC] "
+                f"TEMA60({m1_t60:,.0f})>TEMA120({m1_t120:,.0f}{t240_tag}) 골든크로스 가격 {buy_price:,.0f}원 {qty}주 매수{rvp_tag}"
             )
             order = TradeOrder(
                 timestamp=timestamp,
@@ -685,7 +863,7 @@ class ThemeGate60mStrategy:
                 price=buy_price,
                 qty=qty,
                 amount=cost,
-                reason=f"{cond_tag}{qual_prefix}{trigger_str} (체결가: {buy_price:,.0f}원)",
+                reason=f"{cond_tag}{qual_prefix}{trigger_str}",
                 stage="FIRST_BUY_DONE"
             )
             self.trade_history.append(order)
@@ -698,124 +876,27 @@ class ThemeGate60mStrategy:
         ref_open_fallback = day_open_val if day_open_val > 0 else (open_5m if open_5m > 0 else tick_close)
 
         # ─────────────────────────────────────────────────────────────
-        # 1. IDLE 상태: 1파 매수 (일봉 자격/교체 <=20% + SMA40 < SMA60 & 3관문 돌파)
+        # 1. IDLE / PROFIT_TAKEN 상태: 1분봉 TEMA 60-120 GC + 근본 체결강도 일원화 반복 매수 (무규제)
         # ─────────────────────────────────────────────────────────────
-        if self.position.state == StrategyState.IDLE:
-            if has_120t_wave and df_120t_calc is not None:
-                self._update_idle_decline_phase(df_120t, df_120t_calc, tick_close)
-
-            if not allow_new_buys:
+        if self.position.state in (StrategyState.IDLE, StrategyState.PROFIT_TAKEN):
+            if not allow_new_buys or not has_1m_wave:
                 return None
 
-            if self.last_sell_time > 0 and (time.time() - self.last_sell_time < 20):
+            # 매도 직후 주문 정산 안정화 최소 간격(5초)만 유지, 손실 페널티·시간·등락률·일봉 규제 전면 해제
+            if self.last_sell_time > 0 and (time.time() - self.last_sell_time < 5.0):
                 return None
 
-            if not is_replacement_mode:
-                if not is_daily_3_5_ok:
-                    return None
-                qual_tag = f"[{daily_3_5_label}] "
-            else:
-                if day_ret_pct > 20.0:
-                    return None
-                qual_tag = f"[순환교체(등락률 {day_ret_pct:+.2f}%<=20%)] "
-
-            if _is_unified_3gate_buy_ready(require_pullback_state=False):
-                return _build_buy1_order(qual_tag, is_reentry_wave=False)
+            if _is_1m_60_120_gc_buy_ready():
+                is_repeat = (self.position.state == StrategyState.PROFIT_TAKEN or self.position.trade_count_today > 0)
+                return _build_buy1_order(qual_prefix="", is_reentry_wave=is_repeat)
             return None
 
         # ─────────────────────────────────────────────────────────────
-        # 2. FIRST_BUY_DONE 상태: SMA40<60 & 5-60 GC 2차 매수 + 5-60 DC·래칫 스탑 감시
+        # 2. 보유 중 상태 (FIRST_BUY_DONE / FULL_POSITION / REENTRY_HOLDING):
+        #    - 강제 손절(-2.5%), 장마감 청산, 2차 추매 없이 오직 1분봉 데드크로스 일원화 매도만 평가
+        #      (120 >= 240 ➔ TEMA 60-240 DC 매도 / 120 < 240 ➔ TEMA 60-120 DC 매도)
         # ─────────────────────────────────────────────────────────────
-        elif self.position.state == StrategyState.FIRST_BUY_DONE:
-            _sync_wave_targets(tick_close, last_120t_high)
-            base_p1 = self.position.first_buy_price if self.position.first_buy_price > 0 else self.position.avg_price
-            first_pnl = ((tick_close - base_p1) / base_p1) * 100.0 if base_p1 > 0 else 0.0
-            if first_pnl > self.position.max_profit_pct:
-                self.position.max_profit_pct = first_pnl
-
-            holding_sec = (time.time() - self.position.entry_time) if self.position.entry_time > 0 else 999.0
-
-            # 1) -2.5% 비상손절 / 직전 테마급등관문선 트레일링 스탑 / 5-60 데드크로스 매도 평가
-            exit_early = self._evaluate_exit(
-                timestamp, tick_close, base_p1, first_pnl, holding_sec, s5, s60, is_sma5_60_dead,
-                active_tri_floor=active_tri_floor,
-            )
-            if exit_early is not None:
-                return exit_early
-
-            if not np.isnan(s5) and not np.isnan(s60) and s60 > 0 and s5 <= s60:
-                self.position.sma5_60_buy2_armed = True
-
-            # ⚡ 2차 매수 판단: 14:30 이후 중단 · SMA40 < SMA60 필수 · 단순 5-60 GC(0~1봉)
-            is_gc5_60_within_1bar = is_sma5_60_gc_bar or (not np.isnan(bars_since_5_60_gc) and 0 <= bars_since_5_60_gc <= 1)
-            is_buy2_signal = bool(
-                allow_new_buys
-                and holding_sec >= 5.0
-                and has_120t_wave
-                and is_sma40_lt_60
-                and getattr(self.position, 'sma5_60_buy2_armed', True)
-                and is_sma5_60_bull
-                and not is_sma5_60_dead
-                and is_gc5_60_within_1bar
-            )
-            gc5_60_age = int(bars_since_5_60_gc) if not np.isnan(bars_since_5_60_gc) else 0
-            buy2_reason = (
-                f"⚡ [120틱 2차 매수·단순 5-60 GC({gc5_60_age}봉·40<60)] "
-                f"단순5이평({s5:,.0f}원) > 단순60이평({s60:,.0f}원) (40:{s40:,.0f} / 60:{s60:,.0f}) 골든크로스 불타기 추가 매수"
-            )
-
-            if is_buy2_signal:
-                buy_price = tick_close
-                if getattr(self, 'fixed_qty', 0) > 0:
-                    qty = self.fixed_qty
-                else:
-                    usable_cash = self.cash * 0.99
-                    target_qty = self.position.first_buy_qty if self.position.first_buy_qty > 0 else self.position.total_qty
-                    if usable_cash < target_qty * buy_price:
-                        target_qty = int(usable_cash // buy_price)
-                    qty = target_qty
-                if qty > 0:
-                    cost = qty * buy_price
-                    self.cash = max(0.0, self.cash - cost)
-                    prev_qty = self.position.total_qty
-                    prev_cost = prev_qty * self.position.avg_price
-                    self.position.total_qty += qty
-                    self.position.avg_price = (prev_cost + cost) / self.position.total_qty
-                    self.position.second_buy_price = buy_price
-                    self.position.second_buy_qty = qty
-                    self.position.second_buy_time = time.time()
-                    self.position.sma5_60_armed = True
-                    self.position.sma5_60_buy2_armed = False
-                    if not np.isnan(active_gate) and active_gate > 0:
-                        self.position.last_gate_line = active_gate
-                    if not np.isnan(active_gate_high) and active_gate_high > 0:
-                        self.position.last_gate_high = active_gate_high
-                    if not np.isnan(active_tri_floor) and active_tri_floor > 0 and self.position.entry_tri_floor <= 0:
-                        self.position.entry_tri_floor = float(active_tri_floor)
-                    self.position.state = StrategyState.FULL_POSITION
-
-                    order = TradeOrder(
-                        timestamp=timestamp,
-                        action="BUY_2",
-                        price=buy_price,
-                        qty=qty,
-                        amount=cost,
-                        reason=f"{buy2_reason} (체결가: {buy_price:,.0f}원)",
-                        stage="FULL_POSITION"
-                    )
-                    self.trade_history.append(order)
-                    return order
-
-            return self._evaluate_exit(
-                timestamp, tick_close, base_p1, first_pnl, holding_sec, s5, s60, is_sma5_60_dead,
-                active_tri_floor=active_tri_floor,
-            )
-
-        # ─────────────────────────────────────────────────────────────
-        # 3. FULL_POSITION 상태: 5-60 DC 일원화 전량 매도 + 직전 테마급등관문선/-2.5% 스탑로스
-        # ─────────────────────────────────────────────────────────────
-        elif self.position.state == StrategyState.FULL_POSITION:
-            _sync_wave_targets(tick_close, last_120t_high)
+        elif self.position.state in (StrategyState.FIRST_BUY_DONE, StrategyState.FULL_POSITION, StrategyState.REENTRY_HOLDING):
             bot_entry_price = self.position.avg_price if self.position.avg_price > 0 else self.position.first_buy_price
             profit_rate = ((tick_close - bot_entry_price) / bot_entry_price) * 100.0 if bot_entry_price > 0 else 0.0
             if profit_rate > self.position.max_profit_pct:
@@ -825,49 +906,13 @@ class ThemeGate60mStrategy:
             return self._evaluate_exit(
                 timestamp, tick_close, bot_entry_price, profit_rate, holding_sec, s5, s60, is_sma5_60_dead,
                 active_tri_floor=active_tri_floor,
+                m1_t60=m1_t60,
+                m1_t120=m1_t120,
+                m1_t240=m1_t240,
+                is_m1_tema60_120_dead=is_m1_tema60_120_dead,
+                is_m1_tema60_240_dead=is_m1_tema60_240_dead,
+                has_1m_wave=has_1m_wave,
             )
-
-        # ─────────────────────────────────────────────────────────────
-        # 4. PROFIT_TAKEN 상태: 3분 SMA 5-20 DC 시 1종목 완주 종료(타종목 전환) / 미발생 시 N파 재진입 대기
-        # ─────────────────────────────────────────────────────────────
-        elif self.position.state == StrategyState.PROFIT_TAKEN:
-            cur_tf = active_tri_floor if (not np.isnan(active_tri_floor) and active_tri_floor > 0) else 0.0
-            cur_tc = active_tri_ceiling if (not np.isnan(active_tri_ceiling) and active_tri_ceiling > 0) else 0.0
-
-            if has_120t_wave:
-                if (cur_tf > 0 and tick_close <= cur_tf * 1.001) or (cur_tc > 0 and tick_close < cur_tc) or not is_wma5_20_bull:
-                    self.position.saw_gate_pullback = True
-
-            is_3m_stale_bear = bool(
-                has_3m_sma
-                and not m3_is_bull
-                and self.position.last_exit_time > 0
-                and (time.time() - self.position.last_exit_time) >= 300.0
-            )
-            is_risk_graduated = (
-                self.position.consecutive_losses >= 2
-                or self.position.realized_pnl_pct_today <= -2.5
-                or self.position.wave_no >= 5
-            )
-            if is_3m_sma5_20_dc_now or is_3m_stale_bear or is_risk_graduated:
-                if is_3m_sma5_20_dc_now:
-                    self.position.top_confirmed_reason = f"3분 SMA 5-20 데드크로스({m3_s5:,.0f}<{m3_s20:,.0f}) 발생 ➔ 1종목 완주 종료"
-                elif is_3m_stale_bear:
-                    self.position.top_confirmed_reason = f"3분 SMA 5<20 5분+ 지속({m3_s5:,.0f}<{m3_s20:,.0f}) ➔ 타종목 전환"
-                else:
-                    self.position.top_confirmed_reason = f"리스크 졸업(연속손실 {self.position.consecutive_losses}회/누적 {self.position.realized_pnl_pct_today:+.2f}%)"
-                self.position.state = StrategyState.TERMINATED
-                return None
-
-            if not allow_new_buys or not has_120t_wave:
-                return None
-            reentry_cd = 10.0 if self.position.last_exit_pnl_pct >= 0.3 else 60.0
-            if self.last_sell_time > 0 and (time.time() - self.last_sell_time) < reentry_cd:
-                return None
-
-            if _is_unified_3gate_buy_ready(require_pullback_state=True):
-                qual_re = "[순환교체 재진입] " if is_replacement_mode else ""
-                return _build_buy1_order(qual_re, is_reentry_wave=True)
 
         return None
 
@@ -884,50 +929,53 @@ class ThemeGate60mStrategy:
         **kwargs
     ) -> Optional[TradeOrder]:
         """
-        통합 매도 평가 (매도 5-60 DC 일원화 + 2번 직전 테마급등관문선 래칫 스탑로스 + -2.5% 비상손절):
-        0) -2.5% 비상 하드손절 (초기 방어)
-        1) 상향 래칫 기반 바로 이전 테마급등관문선 하향 이탈 스탑로스 (2번)
-        2) 120틱 단순 5-60 데드크로스 전량 매도 (일원화)
+        1분봉 데드크로스 일원화 매도 평가 (강제 손절/강제 청산 전면 삭제):
+          - TEMA 120 >= TEMA 240 구간: TEMA 60 < TEMA 240 (60-240 데드크로스) 시 전량 매도
+          - TEMA 120 <  TEMA 240 구간: TEMA 60 < TEMA 120 (60-120 데드크로스) 시 전량 매도
         """
         if not self.position.entry_mode or self.position.total_qty <= 0:
             return None
 
-        if not np.isnan(s5) and not np.isnan(s60) and s60 > 0 and s5 >= s60:
-            self.position.sma5_60_armed = True
+        has_1m_wave = bool(kwargs.get('has_1m_wave', False))
+        m1_t60 = float(kwargs.get('m1_t60', np.nan))
+        m1_t120 = float(kwargs.get('m1_t120', np.nan))
+        m1_t240 = float(kwargs.get('m1_t240', np.nan))
+        is_m1_tema60_120_dead = bool(kwargs.get('is_m1_tema60_120_dead', False))
+        is_m1_tema60_240_dead = bool(kwargs.get('is_m1_tema60_240_dead', False))
 
-        active_tri_floor = float(kwargs.get('active_tri_floor', np.nan))
+        has_60 = not np.isnan(m1_t60) and m1_t60 > 0
+        has_120 = not np.isnan(m1_t120) and m1_t120 > 0
+        has_240 = not np.isnan(m1_t240) and m1_t240 > 0
+
+        if has_1m_wave and has_60 and has_120 and m1_t60 >= m1_t120:
+            self.position.tema60_120_armed = True
+
         is_exit = False
         action_type = "TAKE_PROFIT"
         sell_reason = ""
 
-        # 0. 🛑 [초기 비상 방어선]: -2.5% 도달 시 보유 시간 5초+ 즉시 전량 손절
-        if holding_sec >= 5.0 and entry_ref_price > 0 and tick_close <= entry_ref_price * 0.975:
-            is_exit = True
-            action_type = "STOP_LOSS"
-            sell_reason = (
-                f"🛑 [비상 하드 방어선] -2.5% 도달 계좌 보호 전량 손절 "
-                f"(매수가: {entry_ref_price:,.0f}원, 현재가: {tick_close:,.0f}원, 수익률: {profit_rate:+.2f}%)"
-            )
-        # 1. 🛡️ [2번 트레일링 스탑로스]: 상향 래칫 기반 바로 이전 테마급등관문선 이탈
-        elif (
-            holding_sec >= 5.0
-            and self.position.ratchet_prev_theme_gate > 0
-            and tick_close < self.position.ratchet_prev_theme_gate * 0.998
-        ):
-            is_exit = True
-            action_type = "TAKE_PROFIT" if profit_rate >= 0.0 else "STOP_LOSS"
-            sell_reason = (
-                f"🛡️ [직전 테마급등관문선 트레일링 스탑] 상향 직전 테마관문({self.position.ratchet_prev_theme_gate:,.0f}원) "
-                f"하향 이탈 전량 매도 (체결가: {tick_close:,.0f}원, 수익률: {profit_rate:+.2f}%)"
-            )
-        # 2. ⚡ [매도 일원화]: 120틱 단순 5-60 데드크로스 전량 매도
-        elif holding_sec >= 5.0 and self.position.sma5_60_armed and is_sma5_60_dead:
-            is_exit = True
-            action_type = "TAKE_PROFIT" if profit_rate >= 0.0 else "STOP_LOSS"
-            sell_reason = (
-                f"⚡ [120틱 단순 5-60 데드크로스 매도] 단순5이평({s5:,.0f}원) < 단순60이평({s60:,.0f}원) "
-                f"데드크로스 발생 전량 매도 (체결가: {tick_close:,.0f}원, 수익률: {profit_rate:+.2f}%)"
-            )
+        if has_1m_wave and holding_sec >= 5.0 and has_60 and has_120:
+            if has_240 and m1_t120 >= m1_t240:
+                # 120 >= 240 상승 추세 구간: 60-240 데드크로스 기준 전량 매도
+                if is_m1_tema60_240_dead:
+                    is_exit = True
+                    action_type = "TAKE_PROFIT" if profit_rate >= 0.0 else "STOP_LOSS"
+                    sell_reason = (
+                        f"📉 [1분봉 TEMA 60-240 데드크로스 매도] (120:{m1_t120:,.0f} >= 240:{m1_t240:,.0f}) "
+                        f"TEMA60({m1_t60:,.0f}원) < TEMA240({m1_t240:,.0f}원) 전량 매도 "
+                        f"(체결가: {tick_close:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                    )
+            else:
+                # 120 < 240 (또는 240 미산출) 구간: 60-120 데드크로스 기준 전량 매도
+                if is_m1_tema60_120_dead:
+                    is_exit = True
+                    action_type = "TAKE_PROFIT" if profit_rate >= 0.0 else "STOP_LOSS"
+                    t240_lbl = f"{m1_t240:,.0f}" if has_240 else "N/A"
+                    sell_reason = (
+                        f"📉 [1분봉 TEMA 60-120 데드크로스 매도] (120:{m1_t120:,.0f} < 240:{t240_lbl}) "
+                        f"TEMA60({m1_t60:,.0f}원) < TEMA120({m1_t120:,.0f}원) 전량 매도 "
+                        f"(체결가: {tick_close:,.0f}원, 수익률: {profit_rate:+.2f}%)"
+                    )
 
         if not is_exit:
             return None
@@ -935,28 +983,17 @@ class ThemeGate60mStrategy:
         now_ts = time.time()
         self.last_sell_time = now_ts
 
-        # 전량 청산: 다음 파동(SMA40<60 & 3관문 재돌파) 대기(PROFIT_TAKEN) 또는 리스크 졸업(TERMINATED)
         sell_qty = self.position.total_qty
         sell_amt = sell_qty * tick_close
         self.cash += sell_amt
         prev_trades = self.position.trade_count_today + 1
-        prev_losses = self.position.consecutive_losses + (1 if profit_rate < 0 else 0) if profit_rate < 0 else 0
+        prev_losses = self.position.consecutive_losses + 1 if profit_rate < 0 else 0
         cum_pnl = self.position.realized_pnl_pct_today + profit_rate
-        cur_tf = active_tri_floor if (not np.isnan(active_tri_floor) and active_tri_floor > 0) else self.position.entry_tri_floor
         saved_session_hi = max(self.position.session_high_price, self.position.wave_high_price, tick_close)
         saved_wave_no = self.position.wave_no
+        saved_gc_key = getattr(self.position, 'last_entry_gc_key', '')
 
-        saved_m3_armed = bool(getattr(self.position, 'm3_sma5_20_armed', False))
-        saved_m3_dc_seen = bool(getattr(self.position, 'm3_dead_cross_seen', False))
-
-        should_terminate_now = (
-            prev_losses >= 2
-            or cum_pnl <= -2.5
-            or saved_wave_no >= 5
-            or saved_m3_dc_seen
-        )
-        next_state = StrategyState.TERMINATED if should_terminate_now else StrategyState.PROFIT_TAKEN
-
+        next_state = StrategyState.PROFIT_TAKEN
         order = TradeOrder(
             timestamp=timestamp,
             action=action_type,
@@ -968,29 +1005,18 @@ class ThemeGate60mStrategy:
         )
         self.trade_history.append(order)
 
-        term_msg = (
-            "3분 SMA 5-20 데드크로스 확인 ➔ 청산 후 타종목 전환"
-            if saved_m3_dc_seen
-            else ("2연패/손실상한 도달 졸업" if should_terminate_now else "")
-        )
-
         self.position = PositionTracker(
             state=next_state,
             trade_count_today=prev_trades,
             wave_no=saved_wave_no,
             wave_high_price=self.position.wave_high_price,
             session_high_price=saved_session_hi,
-            prev_wave_tri_floor=cur_tf,
             consecutive_losses=prev_losses,
             realized_pnl_pct_today=cum_pnl,
             last_exit_price=tick_close,
             last_exit_time=now_ts,
             last_exit_pnl_pct=profit_rate,
-            saw_gate_pullback=False,
-            saw_rebound_to_gate=False,
-            m3_sma5_20_armed=saved_m3_armed,
-            m3_dead_cross_seen=saved_m3_dc_seen,
-            top_confirmed_reason=term_msg,
+            last_entry_gc_key=saved_gc_key,
         )
         return order
 

@@ -39,8 +39,17 @@ class RealAPIAdapter:
         logger.info(" ⚠️ [실전 연동 완료] 진짜 계좌로 매매가 전송됩니다 ⚠️")
         logger.info("==================================================")
         self.real_client = KiwoomRealClient()
-        if not self.real_client.test_connection():
-            logger.error("❌ 실전 API 연결 테스트 실패. 토큰이나 인증 설정을 확인하세요.")
+        connected = False
+        for attempt in range(1, 5):
+            if self.real_client.test_connection():
+                connected = True
+                break
+            if attempt < 4:
+                wait_sec = attempt * 1.5
+                logger.warning(f"⚠️ 실전 API 연결 테스트 실패 ({attempt}/4) ➔ {wait_sec:.1f}초 후 재시도 (일시적 502/네트워크 장애 방어)")
+                time.sleep(wait_sec)
+        if not connected:
+            logger.error("❌ 실전 API 연결 테스트 최종 실패(4회 시도). 토큰이나 인증 설정을 확인하세요.")
             sys.exit(1)
 
     def extract_order_no(self, result):
@@ -64,35 +73,17 @@ class RealAPIAdapter:
             return 0.0
 
     def get_1m_candles(self, stock_code: str) -> pd.DataFrame:
-        """실전 1분봉 데이터를 가져와서 trading_bot이 쓰는 Pandas DataFrame으로 변환"""
+        """실전 1분봉 데이터를 가져와서 trading_bot이 쓰는 Pandas DataFrame으로 변환 (연속조회·캐시 정합)"""
         try:
-            # 실전 API는 리스트 형태 반환: [{'time': '090000', 'close': 50000, ...}, ...] (추정)
-            # 여기서는 get_1min_candles 를 호출한다고 가정합니다.
-            raw_candles = self.real_client.get_1min_candles(stock_code, last_n_days=2)
-            
-            if not raw_candles:
-                return pd.DataFrame()
-                
-            df = pd.DataFrame(raw_candles)
-            # 키움 실전 API 반환값에 맞춰 컬럼명을 소문자로 통일하고 형변환
-            df.columns = [col.lower() for col in df.columns]
-            
-            # 최신순(미래->과거)으로 오는 데이터를 과거->현재순으로 뒤집기
-            df = df.iloc[::-1].reset_index(drop=True)
-            
-            if 'time' in df.columns:
-                df['time'] = pd.to_datetime(df['time'], errors='coerce')
-                df.set_index('time', inplace=True)
-                df.sort_index(inplace=True)
-                
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                    
-            if 'date' in df.columns:
-                df.drop(columns=['date'], inplace=True)
-                
-            return df
+            raw_candles = []
+            if hasattr(self.real_client, 'get_1min_candles'):
+                try:
+                    raw_candles = self.real_client.get_1min_candles(stock_code, last_n_days=5, limit=1500)
+                except TypeError:
+                    raw_candles = self.real_client.get_1min_candles(stock_code, last_n_days=3)
+            elif hasattr(self.real_client, '_fetch_minute_candles'):
+                raw_candles = self.real_client._fetch_minute_candles(stock_code, tic_scope="1", last_n_days=5, limit=1500)
+            return self._convert_raw_candles_to_df(raw_candles, stock_code, "1분봉")
         except Exception as e:
             logger.error(f"1분봉 변환 에러 ({stock_code}): {e}")
             return pd.DataFrame()
@@ -234,6 +225,7 @@ class RealAPIAdapter:
                     high_prc = abs(float(item.get("high_pric", 0.0)))
                     low_prc = abs(float(item.get("low_pric", 0.0)))
                     volume = int(item.get("trde_qty", 0))
+                    trde_prica = abs(float(item.get("trde_prica", 0.0) or 0.0))
                 except (ValueError, TypeError):
                     continue
                     
@@ -243,7 +235,8 @@ class RealAPIAdapter:
                     "high": high_prc,
                     "low": low_prc,
                     "close": close_prc,
-                    "volume": volume
+                    "volume": volume,
+                    "trde_prica": trde_prica if trde_prica > 0 else (close_prc * volume) / 1_000_000.0,
                 })
                 
             # 최신 데이터가 맨 뒤로 오도록 정렬
@@ -291,12 +284,14 @@ class RealAPIAdapter:
             logger.error(f"30분봉 조회 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
-    def get_60m_candles(self, stock_code: str) -> pd.DataFrame:
+    def get_60m_candles(self, stock_code: str, limit: int = 600) -> pd.DataFrame:
         """실전 60분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (HTS 60분봉 공식 차트 일치)"""
         try:
             raw_candles = []
             if hasattr(self.real_client, '_fetch_minute_candles'):
-                raw_candles = self.real_client._fetch_minute_candles(stock_code, tic_scope="60", last_n_days=30)
+                raw_candles = self.real_client._fetch_minute_candles(
+                    stock_code, tic_scope="60", last_n_days=30, limit=limit
+                )
             elif hasattr(self.real_client, 'get_60min_candles'):
                 raw_candles = self.real_client.get_60min_candles(stock_code, last_n_days=30)
 
@@ -375,6 +370,15 @@ class RealAPIAdapter:
             logger.error(f"틱 데이터 조회 에러 ({stock_code}): {e}")
             return []
 
+    def get_recent_ticks_ka10003(self, stock_code: str, limit: int = 80) -> list:
+        """웹소켓 편입 초기 체결강도 RVP 워밍업용 ka10003 최근 체결 내역 1회 조회"""
+        try:
+            if hasattr(self.real_client, "get_recent_ticks_ka10003"):
+                return self.real_client.get_recent_ticks_ka10003(stock_code, limit=limit)
+        except Exception as e:
+            logger.debug(f"ka10003 틱 워밍업 조회 에러 ({stock_code}): {e}")
+        return []
+
     def calculate_momentum(self, stock_code: str) -> float:
         """체결 가속도 (모의 로직과 동일하게 유지하거나 실전 틱 활용)"""
         ticks = self.get_tick_data(stock_code)
@@ -406,16 +410,25 @@ class RealAPIAdapter:
         tick_size = self.get_tick_size(target_price)
         return float((int(target_price) // tick_size) * tick_size)
 
-    def place_buy_order(self, stock_code: str, qty: int, price: float, order_type: str = "00"):
+    def get_orderable_cash_100pct(self) -> float:
+        """미수(신용) 없는 현금 100% 주문가능금액(kt00001 '100stk_ord_alow_amt') 조회"""
+        try:
+            if hasattr(self.real_client, "get_orderable_cash_100pct"):
+                return float(self.real_client.get_orderable_cash_100pct() or 0.0)
+        except Exception as e:
+            logger.error(f"주문가능현금 조회 에러: {e}")
+        return 0.0
+
+    def place_buy_order(self, stock_code: str, qty: int, price: float, order_type: str = "00", exchange_override: Optional[str] = None):
         """실전 매수 주문"""
-        logger.info(f"🚀 [실전 매수 쏨!] 종목:{stock_code}, 수량:{qty}, 단가:{price}, 타입:{order_type}")
-        result = self.real_client.place_buy_order(stock_code, qty, price=price, order_type=order_type)
+        logger.info(f"🚀 [실전 매수 쏨!] 종목:{stock_code}, 수량:{qty}, 단가:{price}, 타입:{order_type}, 거래소:{exchange_override or 'AUTO'}")
+        result = self.real_client.place_buy_order(stock_code, qty, price=price, order_type=order_type, exchange_override=exchange_override)
         return self.extract_order_no(result)
 
-    def place_sell_order(self, stock_code: str, qty: int, price: float, order_type: str = "00"):
+    def place_sell_order(self, stock_code: str, qty: int, price: float, order_type: str = "00", exchange_override: Optional[str] = None):
         """실전 매도 주문"""
-        logger.info(f"🚨 [실전 매도 쏨!] 종목:{stock_code}, 수량:{qty}, 단가:{price}, 타입:{order_type}")
-        result = self.real_client.place_sell_order(stock_code, qty, price=price, order_type=order_type)
+        logger.info(f"🚨 [실전 매도 쏨!] 종목:{stock_code}, 수량:{qty}, 단가:{price}, 타입:{order_type}, 거래소:{exchange_override or 'AUTO'}")
+        result = self.real_client.place_sell_order(stock_code, qty, price=price, order_type=order_type, exchange_override=exchange_override)
         return self.extract_order_no(result)
 
     def get_account_holdings(self) -> dict:
@@ -456,10 +469,10 @@ class RealAPIAdapter:
             logger.error(f"미체결 주문 목록 조회 에러: {e}")
             return []
 
-    def cancel_order(self, order_no: str, stock_code: str, qty: int):
+    def cancel_order(self, order_no: str, stock_code: str, qty: int, exchange_override: Optional[str] = None):
         """실전 매수/매도 주문 취소"""
         logger.info(f"취소 주문 전송: {order_no} ({stock_code})")
-        return self.real_client.cancel_order(order_no, stock_code, qty)
+        return self.real_client.cancel_order(order_no, stock_code, qty, exchange_override=exchange_override)
 
     # 테마나 종목 이름 등은 기존 모의 스크립트 그대로 유지 (또는 실전 API 기능 사용)
     def get_stock_name(self, stock_code: str) -> str:

@@ -590,7 +590,7 @@ class KiwoomRealClient:
                 
         return "KRX", order_type, price
 
-    def place_buy_order(self, stock_code: str, quantity: int, price: float = None, order_type: str = "3") -> dict:
+    def place_buy_order(self, stock_code: str, quantity: int, price: float = None, order_type: str = "3", exchange_override: str = None) -> dict:
         """
         실전 매수 주문을 발송합니다. (실거래이므로 각별히 예산 조절 주의 요망)
         """
@@ -600,6 +600,11 @@ class KiwoomRealClient:
         assert "_AL" not in clean_code, "[AI CONTEXT LOCK] FATAL: '_AL' suffix must be stripped before sending a BUY order!"
         
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
+        if exchange_override:
+            dmst_stex_tp = str(exchange_override).strip().upper()
+            if dmst_stex_tp in ("NXT", "SOR") and actual_order_type in ("3", "03") and price is not None:
+                actual_order_type = "00"
+                actual_price = price
         price_int = int(actual_price) if actual_price is not None else None
         
         logger.warning(
@@ -619,7 +624,7 @@ class KiwoomRealClient:
             logger.error(f"Error placing buy order: {e}")
             return None
 
-    def place_sell_order(self, stock_code: str, quantity: int, price: float = None, order_type: str = "3") -> dict:
+    def place_sell_order(self, stock_code: str, quantity: int, price: float = None, order_type: str = "3", exchange_override: str = None) -> dict:
         """
         실전 매도 주문을 발송합니다.
         """
@@ -629,6 +634,11 @@ class KiwoomRealClient:
         assert "_AL" not in clean_code, "[AI CONTEXT LOCK] FATAL: '_AL' suffix must be stripped before sending a SELL order!"
         
         dmst_stex_tp, actual_order_type, actual_price = self._determine_exchange_and_order_type(order_type, price)
+        if exchange_override:
+            dmst_stex_tp = str(exchange_override).strip().upper()
+            if dmst_stex_tp in ("NXT", "SOR") and actual_order_type in ("3", "03") and price is not None:
+                actual_order_type = "00"
+                actual_price = price
         price_int = int(actual_price) if actual_price is not None else None
         
         logger.warning(
@@ -648,9 +658,9 @@ class KiwoomRealClient:
             logger.error(f"Error placing sell order: {e}")
             return None
 
-    def get_1min_candles(self, stock_code: str, last_n_days: int = 1) -> list:
-        """주식 종목의 1분봉 차트 데이터를 조회합니다."""
-        return self._fetch_minute_candles(stock_code, tic_scope="1", last_n_days=last_n_days)
+    def get_1min_candles(self, stock_code: str, last_n_days: int = 3, limit: Optional[int] = 1500) -> list:
+        """주식 종목의 1분봉 차트 데이터를 조회합니다. (TEMA/SMA 연속조회 및 1페이지 캐시 병합 지원)"""
+        return self._fetch_minute_candles(stock_code, tic_scope="1", last_n_days=last_n_days, limit=limit)
 
     def get_2min_candles(self, stock_code: str, last_n_days: int = 2) -> list:
         """주식 종목의 2분봉 차트 데이터를 조회합니다."""
@@ -982,6 +992,7 @@ class KiwoomRealClient:
                     high_prc = abs(float(item.get("high_pric", 0.0)))
                     low_prc = abs(float(item.get("low_pric", 0.0)))
                     volume = int(item.get("trde_qty", 0))
+                    trde_prica = abs(float(item.get("trde_prica", 0.0) or 0.0))
                 except (ValueError, TypeError):
                     continue
                     
@@ -992,7 +1003,8 @@ class KiwoomRealClient:
                     "high": high_prc,
                     "low": low_prc,
                     "close": close_prc,
-                    "volume": volume
+                    "volume": volume,
+                    "trde_prica": trde_prica if trde_prica > 0 else (close_prc * volume) / 1_000_000.0,
                 })
                 
             parsed_candles.sort(key=lambda x: x["time"])
@@ -1215,9 +1227,24 @@ class KiwoomRealClient:
             logger.error(f"Error fetching hoga ask volume for {stock_code}: {e}")
             return None
 
+    def get_orderable_cash_100pct(self) -> float:
+        """
+        미수(신용) 없는 현금 100% 주문가능금액(kt00001 '100stk_ord_alow_amt') 조회.
+        실패 시 kt00018 추정자산에서 안전 폴백.
+        """
+        try:
+            res = self.account_api.deposit_detail_status_request_kt00001(qry_tp="3")
+            if res and res.get("return_code", 0) == 0:
+                amt = float(str(res.get("100stk_ord_alow_amt", "0") or "0"))
+                if amt >= 0:
+                    return amt
+        except Exception as e:
+            logger.debug(f"kt00001 주문가능현금 조회 예외: {e}")
+        return 0.0
+
     def get_unfilled_orders(self) -> list:
         """
-        실전 계좌의 미체결 주문 목록을 조회합니다.
+        실전 계좌의 미체결 주문 목록을 조회합니다. (ka10075 'oso' 및 'ccld_nccld_qry' 응답 모두 호환)
         """
         try:
             result = self.account_api.unfilled_orders_request_ka10075(
@@ -1228,30 +1255,39 @@ class KiwoomRealClient:
             if not result:
                 return []
                 
-            raw_list = result.get("ccld_nccld_qry", [])
+            raw_list = result.get("oso") or result.get("ccld_nccld_qry") or []
             unfilled = []
             for item in raw_list:
-                if item.get("nccld_qty", "0") != "0":
+                qty_str = str(item.get("oso_qty", item.get("nccld_qty", "0")) or "0").strip()
+                try:
+                    u_qty = int(float(qty_str))
+                except ValueError:
+                    u_qty = 0
+                if u_qty > 0:
+                    px_str = str(item.get("ord_pric", item.get("ord_uv", "0")) or "0").lstrip("+-").strip()
                     unfilled.append({
-                        "order_no": item.get("ord_no", "").strip(),
-                        "code": item.get("stk_cd", "").replace("A", "").strip(),
-                        "name": item.get("stk_nm", "").strip(),
-                        "side": item.get("sell_buy_tp_nm", "").strip(),
-                        "unfilled_qty": int(item.get("nccld_qty", "0")),
-                        "order_price": float(item.get("ord_uv", "0") or "0"),
-                        "order_time": item.get("ord_tm", "").strip()
+                        "order_no": str(item.get("ord_no", "")).strip(),
+                        "code": self._sanitize_code(item.get("stk_cd", "")),
+                        "name": str(item.get("stk_nm", "")).strip(),
+                        "side": str(item.get("io_tp_nm", item.get("sell_buy_tp_nm", ""))).strip(),
+                        "unfilled_qty": u_qty,
+                        "order_price": float(px_str or "0"),
+                        "order_time": str(item.get("tm", item.get("ord_tm", ""))).strip(),
+                        "exchange": str(item.get("stex_tp_txt", "")).strip(),
                     })
             return unfilled
         except Exception as e:
             logger.error(f"Error fetching unfilled orders: {e}")
             return []
 
-    def cancel_order(self, order_no: str, stock_code: str, cancel_qty: int) -> dict:
+    def cancel_order(self, order_no: str, stock_code: str, cancel_qty: int, exchange_override: str = None) -> dict:
         """
         미체결 주문을 취소합니다.
         """
         clean_code = self._sanitize_code(stock_code)
         dmst_stex_tp, _, _ = self._determine_exchange_and_order_type("0")
+        if exchange_override:
+            dmst_stex_tp = str(exchange_override).strip().upper()
         logger.warning(f"⚠️ SENDING CANCEL ORDER: No={order_no}, Code={clean_code}, Qty={cancel_qty}, Exchange={dmst_stex_tp}")
         try:
             result = self.order_api.stock_cancel_order_request_kt10003(
@@ -1264,6 +1300,42 @@ class KiwoomRealClient:
         except Exception as e:
             logger.error(f"Error cancelling order {order_no}: {e}")
             return None
+
+    def get_recent_ticks_ka10003(self, stock_code: str, limit: int = 80) -> list:
+        """
+        최근 체결 내역(ka10003)을 1회 조회하여 웹소켓 신규 편입 직후 ExecutionStrengthEngine 워밍업에 사용합니다.
+        반환: 과거->최신 순 틱 리스트 (price, qty, raw_15, time, gangdo, accum_volume)
+        """
+        data_code = self._get_data_code(stock_code)
+        try:
+            res = self.stock_info_api.daily_stock_price_request_ka10003(stock_code=data_code)
+            if not res or not isinstance(res, dict):
+                return []
+            items = res.get("cntr_infr") or []
+            parsed = []
+            for item in items[:max(1, int(limit))]:
+                raw_q = str(item.get("cntr_trde_qty", "0") or "0").strip()
+                raw_p = str(item.get("cur_prc", "0") or "0").strip()
+                try:
+                    price = abs(float(raw_p.lstrip("+-")))
+                    qty = abs(int(float(raw_q.lstrip("+-"))))
+                except (ValueError, TypeError):
+                    continue
+                if price <= 0 or qty <= 0:
+                    continue
+                parsed.append({
+                    "price": price,
+                    "qty": qty,
+                    "raw_15": raw_q,
+                    "time": str(item.get("tm", "") or "").strip(),
+                    "gangdo": abs(float(str(item.get("cntr_str", "0") or "0").lstrip("+-") or 0)),
+                    "accum_volume": abs(int(float(str(item.get("acc_trde_qty", "0") or "0").lstrip("+-") or 0))),
+                })
+            parsed.reverse()
+            return parsed
+        except Exception as e:
+            logger.debug(f"ka10003 체결 내역 조회 예외 ({stock_code}): {e}")
+            return []
 
 KiwoomClient = KiwoomRealClient
 

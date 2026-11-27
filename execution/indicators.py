@@ -23,14 +23,15 @@ def calculate_sma(series: pd.Series, period: int) -> pd.Series:
 
 def calculate_wma(series: pd.Series, period: int) -> pd.Series:
     """가중 이동평균 (WMA / 영웅문 MA(C, 기간, 가중))"""
-    if series is None or len(series) < period:
-        return pd.Series(np.nan, index=getattr(series, 'index', None))
+    if series is None or period <= 0 or len(series) < period:
+        return pd.Series(np.nan, index=getattr(series, 'index', None), dtype=float)
+    vals = np.asarray(series, dtype=float)
     weights = np.arange(1, period + 1, dtype=float)
     w_sum = weights.sum()
-    return series.rolling(window=period, min_periods=period).apply(
-        lambda p: np.dot(p, weights) / w_sum,
-        raw=True
-    )
+    out = np.full(len(vals), np.nan, dtype=float)
+    windows = np.lib.stride_tricks.sliding_window_view(vals, period)
+    out[period - 1:] = (windows @ weights) / w_sum
+    return pd.Series(out, index=series.index, dtype=float)
 
 def calculate_theme_gate_line(df: pd.DataFrame, p1: int = 5, p2: int = 20) -> pd.DataFrame:
     """
@@ -364,6 +365,7 @@ def calculate_120t_tema_indicators(df_120t: pd.DataFrame, current_price: Optiona
     return df
 
 
+calculate_1m_tema_indicators = calculate_120t_tema_indicators
 calculate_3m_tema_indicators = calculate_120t_tema_indicators
 calculate_10m_tema_indicators = calculate_120t_tema_indicators
 
@@ -574,6 +576,131 @@ def calculate_pred_volume_ratio(df_daily: Optional[pd.DataFrame], curr_day_vol: 
 
     vol_ratio_prev = (float(curr_day_vol) / pre_day_vol) * 100.0
     return vol_ratio_prev, pre_day_vol
+
+
+def calculate_daily_seryek_gijun_lines(
+    df_daily: Optional[pd.DataFrame],
+    current_price: Optional[float] = None,
+) -> dict:
+    """
+    대표님 지정 일봉 세력선 · 기준선 · SMA 3-5 골든크로스 · 5일 평균 거래대금 비율 산출:
+      a = avg(c, 5); b = avg(c, 20); d = avg(c, 60);
+      K = valuewhen(1, a>b && b>d && a>d, C);
+      M = valuewhen(1, K(2)<K(1) && K(1)>K, K(1));   # 기준선
+      세력선 = valuewhen(1, crossup(a, M), a);        # 세력선
+    """
+    empty = {
+        "close": 0.0,
+        "sma3": 0.0,
+        "sma5": 0.0,
+        "sma3_gt_5": False,
+        "gc_bars_ago": None,
+        "gijun": 0.0,
+        "seryek": 0.0,
+        "dist_gijun_pct": 999.0,
+        "dist_seryek_pct": 999.0,
+        "today_tv_eok": 0.0,
+        "prev5_tv_eok": 0.0,
+        "tv_ratio_pct": 0.0,
+    }
+    if df_daily is None or len(df_daily) < 10:
+        return empty
+
+    df_d = df_daily.copy()
+    col_map = {col: str(col).lower() for col in df_d.columns}
+    df_d.rename(columns=col_map, inplace=True)
+    if "close" not in df_d.columns:
+        return empty
+
+    if "date" in df_d.columns:
+        df_d = df_d.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    close_s = pd.to_numeric(df_d["close"], errors="coerce").ffill()
+    if close_s.isna().all():
+        return empty
+
+    today_str = datetime.now().strftime("%Y%m%d")
+    if current_price is not None and float(current_price) > 0:
+        cp = float(current_price)
+        if "date" in df_d.columns:
+            last_dt = str(df_d["date"].iloc[-1]).replace("-", "").replace("/", "").strip()[:8]
+            if last_dt == today_str:
+                close_s.iloc[-1] = cp
+            else:
+                close_s = pd.concat([close_s, pd.Series([cp], dtype=float)], ignore_index=True)
+        else:
+            close_s.iloc[-1] = cp
+
+    sma3 = close_s.rolling(3).mean()
+    sma5 = close_s.rolling(5).mean()
+    sma20 = close_s.rolling(20).mean()
+    sma60 = close_s.rolling(60).mean()
+
+    jeongbae = (sma5 > sma20) & (sma20 > sma60) & (sma5 > sma60)
+    k_s = pd.Series(np.where(jeongbae, close_s, np.nan), index=close_s.index).ffill()
+    k1 = k_s.shift(1)
+    k2 = k_s.shift(2)
+    is_peak = (k2 < k1) & (k1 > k_s)
+    gijun_s = pd.Series(np.where(is_peak, k1, np.nan), index=close_s.index).ffill()
+
+    cross_up_seryek = (sma5.shift(1) <= gijun_s.shift(1)) & (sma5 > gijun_s)
+    seryek_s = pd.Series(np.where(cross_up_seryek, sma5, np.nan), index=close_s.index).ffill()
+
+    c_now = float(close_s.iloc[-1])
+    s3 = float(sma3.iloc[-1]) if pd.notna(sma3.iloc[-1]) else 0.0
+    s5 = float(sma5.iloc[-1]) if pd.notna(sma5.iloc[-1]) else 0.0
+    gijun_val = float(gijun_s.iloc[-1]) if pd.notna(gijun_s.iloc[-1]) else 0.0
+    seryek_val = float(seryek_s.iloc[-1]) if pd.notna(seryek_s.iloc[-1]) else 0.0
+
+    sma3_gt_5 = (s3 > s5) and s3 > 0 and s5 > 0
+    gc_bars_ago = None
+    if sma3_gt_5:
+        for idx in range(len(close_s) - 1, max(0, len(close_s) - 30), -1):
+            if (
+                pd.notna(sma3.iloc[idx]) and pd.notna(sma5.iloc[idx])
+                and pd.notna(sma3.iloc[idx - 1]) and pd.notna(sma5.iloc[idx - 1])
+                and float(sma3.iloc[idx - 1]) <= float(sma5.iloc[idx - 1])
+                and float(sma3.iloc[idx]) > float(sma5.iloc[idx])
+            ):
+                gc_bars_ago = (len(close_s) - 1) - idx
+                break
+
+    # 거래대금(백만원) -> 억원 환산 및 직전 5일 평균 대비 비율
+    if "trde_prica" in df_d.columns:
+        tv_m_s = pd.to_numeric(df_d["trde_prica"], errors="coerce").fillna(0.0).abs()
+    elif "volume" in df_d.columns:
+        vol_s = pd.to_numeric(df_d["volume"], errors="coerce").fillna(0.0).abs()
+        raw_c = pd.to_numeric(df_d["close"], errors="coerce").fillna(0.0).abs()
+        tv_m_s = (raw_c * vol_s) / 1_000_000.0
+    else:
+        tv_m_s = pd.Series(dtype=float)
+
+    today_tv_m = float(tv_m_s.iloc[-1]) if len(tv_m_s) >= 1 else 0.0
+    if len(tv_m_s) >= 6:
+        prev5_tv_m = float(tv_m_s.iloc[-6:-1].mean())
+    elif len(tv_m_s) >= 2:
+        prev5_tv_m = float(tv_m_s.iloc[:-1].mean())
+    else:
+        prev5_tv_m = 0.0
+
+    tv_ratio_pct = (today_tv_m / prev5_tv_m * 100.0) if prev5_tv_m > 0 else 0.0
+    dist_g = ((c_now - gijun_val) / gijun_val * 100.0) if gijun_val > 0 else 999.0
+    dist_s = ((c_now - seryek_val) / seryek_val * 100.0) if seryek_val > 0 else 999.0
+
+    return {
+        "close": c_now,
+        "sma3": s3,
+        "sma5": s5,
+        "sma3_gt_5": sma3_gt_5,
+        "gc_bars_ago": gc_bars_ago,
+        "gijun": gijun_val,
+        "seryek": seryek_val,
+        "dist_gijun_pct": dist_g,
+        "dist_seryek_pct": dist_s,
+        "today_tv_eok": today_tv_m / 100.0,
+        "prev5_tv_eok": prev5_tv_m / 100.0,
+        "tv_ratio_pct": tv_ratio_pct,
+    }
 
 
 

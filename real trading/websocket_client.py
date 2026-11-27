@@ -1,4 +1,5 @@
 import asyncio
+import time
 import websockets
 import json
 import logging
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 SOCKET_URL = 'wss://api.kiwoom.com:10000/api/dostk/websocket'
 
 class KiwoomWebSocketClient:
-    def __init__(self, target_condition_name: str | list, on_insert: Callable, on_delete: Callable, on_real_tick: Callable = None):
+    def __init__(self, target_condition_name: str | list, on_insert: Callable, on_delete: Callable, on_real_tick: Callable = None, on_orderbook: Callable = None):
         self.uri = SOCKET_URL
         self.websocket = None
         self.connected = False
@@ -48,10 +49,17 @@ class KiwoomWebSocketClient:
         self._inflight_cnsrreq_event = None
         self._inflight_cnsrreq_resp = None
         self._register_task = None
+        self._loop = None
+        self._subscribed_tick_codes = set()
+        self._focus_ob_code = None
+        self._last_top10_sync_key = None
+        self._last_orderbook = {}
+        self._last_tick_state = {}
         
         self.on_insert = on_insert
         self.on_delete = on_delete
         self.on_real_tick = on_real_tick
+        self.on_orderbook = on_orderbook
 
     @staticmethod
     def _clean_stock_code(raw_code: str) -> str:
@@ -87,6 +95,7 @@ class KiwoomWebSocketClient:
                 stex_tp = self.default_stex_tp
                 cont_yn = "N"
                 next_key = ""
+                cleared_900003_cnt = 0
 
                 for _ in range(8):
                     req = {
@@ -122,6 +131,20 @@ class KiwoomWebSocketClient:
                             await asyncio.sleep(0.35)
                             continue
                         break
+                    if str(rc) == "900003" and cleared_900003_cnt < 3:
+                        cleared_900003_cnt += 1
+                        wait_s = 0.6 * cleared_900003_cnt
+                        logger.warning(
+                            f"🔄 [조건식 '{cond_name}'(seq={seq_str})] 기등록 충돌(900003: {msg}) ➔ CNSRCLR 해제 후 {wait_s:.1f}초 뒤 재등록 ({cleared_900003_cnt}/3)"
+                        )
+                        try:
+                            await self.send_message({"trnm": "CNSRCLR", "seq": seq_str})
+                        except Exception as clr_err:
+                            logger.warning(f"⚠️ CNSRCLR 전송 실패(seq={seq_str}): {clr_err}")
+                        cont_yn = "N"
+                        next_key = ""
+                        await asyncio.sleep(wait_s)
+                        continue
                     if str(rc) == "900001" and stex_tp != "K":
                         logger.warning(f"⚠️ [조건식 '{cond_name}'(seq={seq_str})] stex_tp={stex_tp} 미지원({msg}) ➔ KRX('K')로 폴백 재시도")
                         stex_tp = "K"
@@ -243,15 +266,20 @@ class KiwoomWebSocketClient:
     async def subscribe_real_tick(self, code: str):
         """
         주식체결(0B) 실시간 데이터를 요청합니다.
-        키움 REST OpenAPI 웹소켓 공식 규격(trnm=REG, type=['0B'])을 사용합니다.
+        기존 grp_no='3' 배치 구독을 덮어쓰지 않도록 이미 구독 목록이 있으면 refresh='0'으로 추가합니다.
+        (초기 조건검색 과다 편입으로 세션 구독 한도가 소진되지 않도록 grp_no='3'은 최대 80종목으로 제한하고,
+         Top 10 핵심 감시 풀은 sync_top10_stream(grp_no='5')에서 0B+0D를 전용 보장합니다.)
         """
-        clean_code = str(code).replace("_AL", "").replace("_NX", "").lstrip("A").strip()
-        if not clean_code:
+        clean_code = self._clean_stock_code(code)
+        if not clean_code or clean_code in self._subscribed_tick_codes:
             return
+        if len(self._subscribed_tick_codes) >= 80:
+            return
+        refresh_flag = "0" if self._subscribed_tick_codes else "1"
         req = {
             "trnm": "REG",
             "grp_no": "3",
-            "refresh": "1",
+            "refresh": refresh_flag,
             "data": [
                 {
                     "item": [clean_code],
@@ -259,8 +287,117 @@ class KiwoomWebSocketClient:
                 }
             ]
         }
-        logger.info(f"⚡ [실시간 주식체결(0B) REG 구독 등록] 종목: {clean_code}")
+        self._subscribed_tick_codes.add(clean_code)
+        logger.info(f"⚡ [실시간 주식체결(0B) REG 구독 등록] 종목: {clean_code} (refresh={refresh_flag})")
         await self.send_message(req)
+
+    async def sync_top10_stream(self, codes: list, exchange_hint: str = "KRX"):
+        """
+        Top 10 + 보유 종목 전용 실시간 0B(주식체결)·0D(최우선호가) 스트림을 세션(KRX vs NXT _NX)에 맞춰 동기화합니다.
+        전용 그룹(grp_no='5', refresh='1')을 사용해 1종목 보유 중에도 나머지 Top 9 전 종목의 체결강도를 실시간 누락 없이 계측합니다.
+        """
+        clean_list = []
+        seen = set()
+        for c in (codes or []):
+            cc = self._clean_stock_code(c)
+            if cc and cc.isalnum() and len(cc) == 6 and cc != "000000" and cc not in seen:
+                seen.add(cc)
+                clean_list.append(cc)
+                if len(clean_list) >= 15:
+                    break
+        if not clean_list:
+            return
+
+        ex = "NXT" if str(exchange_hint).upper() == "NXT" else "KRX"
+        items = [f"{cc}_NX" if ex == "NXT" else cc for cc in clean_list]
+        sync_key = (tuple(items), ex)
+        if sync_key == self._last_top10_sync_key:
+            return
+
+        self._last_top10_sync_key = sync_key
+        req = {
+            "trnm": "REG",
+            "grp_no": "5",
+            "refresh": "1",
+            "data": [{"item": items, "type": ["0B", "0D"]}]
+        }
+        logger.info(f"📡 [Top10 실시간 0B+0D 배경계측 동기화({ex})] {len(items)}종목: {items}")
+        await self.send_message(req)
+
+    def sync_top10_stream_sync(self, codes: list, exchange_hint: str = "KRX"):
+        """봇 메인 루프(동기 스레드)에서 Top 10 + 보유 종목 0B/0D 백그라운드 스트림을 안전하게 동기화합니다."""
+        if not codes or not self.connected or not self._loop or self._loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.sync_top10_stream(list(codes), exchange_hint=exchange_hint), self._loop)
+        except Exception as e:
+            logger.debug(f"Top10 0B+0D 동기화 예약 예외: {e}")
+
+    async def sync_custom_stream(self, items: list):
+        """혼합(KRX 6자리 + NXT '_NX') 종목 리스트에 대해 grp_no='5' 0B+0D 스트림을 동기화합니다."""
+        clean_items = []
+        seen = set()
+        for raw in (items or []):
+            s = str(raw or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            clean_items.append(s)
+            if len(clean_items) >= 20:
+                break
+        if not clean_items:
+            return
+        sync_key = ("CUSTOM", tuple(clean_items))
+        if sync_key == self._last_top10_sync_key:
+            return
+        self._last_top10_sync_key = sync_key
+        req = {
+            "trnm": "REG",
+            "grp_no": "5",
+            "refresh": "1",
+            "data": [{"item": clean_items, "type": ["0B", "0D"]}]
+        }
+        logger.info(f"📡 [전용 0B+0D 시세 스트림 동기화] {len(clean_items)}종목: {clean_items}")
+        await self.send_message(req)
+
+    def sync_custom_stream_sync(self, items: list):
+        """동기 루프에서 혼합(KRX + _NX) 0B+0D 스트림을 안전하게 동기화합니다."""
+        if not items or not self.connected or not self._loop or self._loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.sync_custom_stream(list(items)), self._loop)
+        except Exception as e:
+            logger.debug(f"전용 0B+0D 동기화 예약 예외: {e}")
+
+    async def subscribe_focus_orderbook(self, code: str):
+        """
+        집중/보유 1종목에 한해 실시간 호가잔량(0D)을 구독하여 최우선 매도/매수 호가(ask1/bid1)를 확보합니다.
+        (grp_no='4', refresh='1'로 1종목만 교체 구독해 트래픽·0B 그룹 간섭 원천 차단)
+        """
+        clean_code = self._clean_stock_code(code)
+        if not clean_code or self._focus_ob_code == clean_code:
+            return
+        req = {
+            "trnm": "REG",
+            "grp_no": "4",
+            "refresh": "1",
+            "data": [{"item": [clean_code], "type": ["0D"]}]
+        }
+        self._focus_ob_code = clean_code
+        logger.info(f"📘 [집중종목 실시간 호가(0D) REG 구독] 종목: {clean_code}")
+        await self.send_message(req)
+
+    def subscribe_focus_orderbook_sync(self, code: str):
+        """봇 메인 루프(동기 스레드)에서 집중종목 0D 호가 구독을 안전하게 예약합니다."""
+        clean_code = self._clean_stock_code(code)
+        if not clean_code or not self.connected or not self._loop or self._loop.is_closed():
+            return
+        if self._focus_ob_code == clean_code:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.subscribe_focus_orderbook(clean_code), self._loop)
+        except Exception as e:
+            logger.debug(f"집중종목 0D 구독 예약 예외 ({clean_code}): {e}")
 
     async def receive_messages(self):
         while self.keep_running:
@@ -277,6 +414,13 @@ class KiwoomWebSocketClient:
                 if trnm == 'SYSTEM':
                     # 예: R10001 "동일한 App key로 접속이 되었습니다. 기존 세션은 종료가 됩니다"
                     # → 다른 스크립트가 같은 AppKey로 웹소켓 접속 시 봇 세션이 끊김 (자동 재연결됨)
+                    sys_code = str(response.get('code', '') or '').strip()
+                    if sys_code == 'R10001':
+                        now_ts = time.time()
+                        hist = getattr(self, '_r10001_timestamps', [])
+                        hist = [t for t in hist if now_ts - t <= 30.0]
+                        hist.append(now_ts)
+                        self._r10001_timestamps = hist
                     logger.warning(f"⚠️ [웹소켓 SYSTEM] {response.get('code')} {response.get('message')}")
                     continue
                 
@@ -284,6 +428,10 @@ class KiwoomWebSocketClient:
                     if response.get('return_code') != 0:
                         logger.error(f"웹소켓 로그인 실패: {response.get('return_msg')}")
                         await self.disconnect()
+                    elif not self.target_condition_names:
+                        logger.info("📡 웹소켓 로그인 성공! (시세 전용 0B/0D 모드 — 조건검색 생략)")
+                        if self.init_sync_event:
+                            self.init_sync_event.set()
                     else:
                         logger.info("웹소켓 로그인 성공! 조건식 목록을 요청합니다...")
                         req = {
@@ -350,14 +498,19 @@ class KiwoomWebSocketClient:
                     if captured_codes:
                         logger.info(f"🔔 [조건식 '{cond_name}'(seq={seq_str}) 초기 포착] {len(captured_codes)}종목 수신: {captured_codes}")
                         if self.on_real_tick:
-                            # 초기 조건검색 포착 종목도 즉시 실시간 체결(0B) 구독 등록 ➔ 3천만+ 세력 유입 카운팅!
-                            reg_batch_msg = {
-                                "trnm": "REG",
-                                "grp_no": "3",
-                                "refresh": "1",
-                                "data": [{"item": captured_codes, "type": ["0B"]}]
-                            }
-                            asyncio.create_task(self.send_message(reg_batch_msg))
+                            # 다중 조건식(4개) 순차 등록 시 이전 조건식의 0B 구독이 refresh='1'에 덮어쓰이지 않도록 증분 병합 (80종목 한도)
+                            slots_left = max(0, 80 - len(self._subscribed_tick_codes))
+                            new_codes = [c for c in captured_codes if c not in self._subscribed_tick_codes][:slots_left]
+                            if new_codes:
+                                refresh_flag = "0" if self._subscribed_tick_codes else "1"
+                                self._subscribed_tick_codes.update(new_codes)
+                                reg_batch_msg = {
+                                    "trnm": "REG",
+                                    "grp_no": "3",
+                                    "refresh": refresh_flag,
+                                    "data": [{"item": new_codes, "type": ["0B"]}]
+                                }
+                                asyncio.create_task(self.send_message(reg_batch_msg))
                     else:
                         logger.info(f"📡 [조건식 '{cond_name}'(seq={seq_str}) 실시간 대기] 현재 초기 포착 0종목 (신규 편입 시 0.1초 즉시 포착)")
 
@@ -398,15 +551,46 @@ class KiwoomWebSocketClient:
                             code = self._clean_stock_code(raw_code) # 종목코드
                             if not code or not code.isalnum() or code == "000000":
                                 continue
-                            # FID 10: 현재가(부호: 매수/매도), FID 15: 순간체결량, FID 13: 누적거래량, FID 228: 체결강도
+                            # FID 10: 현재가(전일대비 부호), FID 15: 순간체결량('+' 매수체결 / '-' 매도체결), FID 13: 누적거래량, FID 228: 체결강도
                             try:
-                                raw_price = float(values.get('10', 0))
+                                raw_price = float(str(values.get('10', 0) or 0).strip())
                                 current_price = abs(raw_price)
-                                is_buy = (raw_price >= 0)
-                                tick_qty = abs(int(values.get('15', 0)))
-                                accum_volume = int(values.get('13', 0))
-                                tick_time = values.get('20', '') # 체결시간
-                                chegyul_gangdo = abs(float(values.get('228', 0)))
+                                raw_15 = str(values.get('15', '') or '').strip()
+                                tick_qty = abs(int(float(raw_15.lstrip('+-') or 0)))
+                                accum_volume = abs(int(float(str(values.get('13', 0) or 0).lstrip('+-') or 0)))
+                                tick_time = str(values.get('20', '') or '').strip() # 체결시간
+                                chegyul_gangdo = abs(float(str(values.get('228', 0) or 0).lstrip('+-') or 0))
+                                ask1 = abs(float(str(values.get('27', 0) or 0).lstrip('+-') or 0))
+                                bid1 = abs(float(str(values.get('28', 0) or 0).lstrip('+-') or 0))
+                                if (ask1 <= 0 or bid1 <= 0) and code in self._last_orderbook:
+                                    ob_ref = self._last_orderbook[code]
+                                    if (time.time() - ob_ref.get('ts', 0.0)) <= 15.0:
+                                        ask1 = ask1 or float(ob_ref.get('ask1', 0.0) or 0.0)
+                                        bid1 = bid1 or float(ob_ref.get('bid1', 0.0) or 0.0)
+
+                                prev_st = self._last_tick_state.get(code, {})
+                                prev_price = float(prev_st.get('price', 0.0) or 0.0)
+                                prev_is_buy = bool(prev_st.get('is_buy', True))
+
+                                if raw_15.startswith('+'):
+                                    is_buy = True
+                                elif raw_15.startswith('-'):
+                                    is_buy = False
+                                elif ask1 > 0 and bid1 > 0 and current_price > 0:
+                                    if current_price >= ask1:
+                                        is_buy = True
+                                    elif current_price <= bid1:
+                                        is_buy = False
+                                    else:
+                                        mid_q = 0.5 * (ask1 + bid1)
+                                        is_buy = True if current_price > mid_q else (False if current_price < mid_q else (current_price >= prev_price if prev_price > 0 else prev_is_buy))
+                                elif prev_price > 0 and current_price > 0:
+                                    is_buy = True if current_price > prev_price else (False if current_price < prev_price else prev_is_buy)
+                                else:
+                                    is_buy = prev_is_buy
+
+                                if current_price > 0:
+                                    self._last_tick_state[code] = {'price': current_price, 'is_buy': is_buy}
                                 tick_amount = current_price * tick_qty
                                 
                                 if current_price > 0 and self.on_real_tick:
@@ -416,6 +600,9 @@ class KiwoomWebSocketClient:
                                         'qty': tick_qty,
                                         'amount': tick_amount,
                                         'is_buy': is_buy,
+                                        'raw_15': raw_15,
+                                        'ask1': ask1,
+                                        'bid1': bid1,
                                         'gangdo': chegyul_gangdo,
                                         'accum_volume': accum_volume,
                                         'time': tick_time
@@ -427,13 +614,44 @@ class KiwoomWebSocketClient:
                             except Exception as e:
                                 logger.error(f"주식체결 파싱 에러: {e}")
 
+                        elif name in ('주식호가잔량', '호가잔량'):
+                            raw_code = str(values.get('9001') or data_item.get('item') or '')
+                            code = self._clean_stock_code(raw_code)
+                            if not code or not code.isalnum() or code == "000000":
+                                continue
+                            try:
+                                ask1 = abs(float(str(values.get('41', values.get('27', 0)) or 0).lstrip('+-') or 0))
+                                bid1 = abs(float(str(values.get('51', values.get('28', 0)) or 0).lstrip('+-') or 0))
+                                if ask1 > 0 or bid1 > 0:
+                                    self._last_orderbook[code] = {'ask1': ask1, 'bid1': bid1, 'ts': time.time()}
+                                    if self.on_orderbook:
+                                        ob_data = {'code': code, 'ask1': ask1, 'bid1': bid1}
+                                        if asyncio.iscoroutinefunction(self.on_orderbook):
+                                            asyncio.create_task(self.on_orderbook(ob_data))
+                                        else:
+                                            self.on_orderbook(ob_data)
+                            except Exception as e:
+                                logger.debug(f"호가잔량 파싱 에러: {e}")
+
             except websockets.ConnectionClosed:
                 self.connected = False
                 if not self.keep_running:
                     break
-                logger.error("웹소켓 연결이 끊어졌습니다. 3초 후 재연결을 시도합니다.")
-                await asyncio.sleep(3)
+                now_ts = time.time()
+                r10001_hist = [t for t in getattr(self, '_r10001_timestamps', []) if now_ts - t <= 30.0]
+                self._r10001_timestamps = r10001_hist
+                reconnect_wait = 15 if len(r10001_hist) >= 2 else 3
+                if reconnect_wait > 3:
+                    logger.warning(
+                        f"⚠️ [AppKey 중복 접속 R10001 반복({len(r10001_hist)}회/30초)] 무한 핑퐁 방지를 위해 {reconnect_wait}초 후 재연결합니다."
+                    )
+                else:
+                    logger.error("웹소켓 연결이 끊어졌습니다. 3초 후 재연결을 시도합니다.")
+                await asyncio.sleep(reconnect_wait)
                 if self.keep_running:
+                    self._subscribed_tick_codes.clear()
+                    self._focus_ob_code = None
+                    self._last_top10_sync_key = None
                     await self.connect()
             except Exception as e:
                 if not self.keep_running:
@@ -442,6 +660,10 @@ class KiwoomWebSocketClient:
                 await asyncio.sleep(1)
 
     async def run(self):
+        self._loop = asyncio.get_running_loop()
+        self._subscribed_tick_codes.clear()
+        self._focus_ob_code = None
+        self._last_top10_sync_key = None
         await self.connect()
         await self.receive_messages()
 

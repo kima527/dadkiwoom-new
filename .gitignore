@@ -25,6 +25,8 @@ weekend_scanned_picks.json
 backtest_trades.json
 backtest_summary.json
 MovingAveragelineTraid/execution/trade_states.json
+execution/swing_60m_state.json
+logs/
 
 # IDEs & Temporary directories
 .vscode/
