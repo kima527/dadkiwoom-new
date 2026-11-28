@@ -1,8 +1,10 @@
 """
-swing_60m_bot.py - 계좌 1주 마커 감시종목(9종목) 전용 60분봉 TEMA 5-20 1종목 풀매수/전량매도 봇
+swing_60m_bot.py - 계좌 1주 마커 감시종목 + HTS 조건검색식 `Swing60m` 전용 60분봉 TEMA 5-20 1종목 풀매수/전량매도 봇
 
 [핵심 매매 규칙]
-1. 감시 대상: 계좌에 1주 이상 보유한 감시 종목 자동 인식 + `execution/swing_60m_watchlist.json` 병합
+1. 감시 대상: HTS 조건검색식 `Swing60m`(일 SMA3>5 & 전일종가<현재가 & 1분 체결강도>=100) + 계좌 보유 마커 + `swing_60m_watchlist.json`
+   - 정규장(09:00~15:30) `Swing60m` 서버 연동 활성 시: 조건검색 편입(`active=True`) 종목만 신규 진입 허용(미편입 종목은 자동 관망)
+   - 프리/애프터장(08:00~08:50, 15:40~20:00) 또는 조건검색 미등록/오프라인 시: 9종목 감시 풀 + 자체(일 SMA3>5 & 전일종가<현재가) 필터 자동 폴백
    - KRX 전용(042510 라온시큐어, 281740 레이크머티리얼즈, 340450 지씨지놈):
      * 08:00~08:59 프리마켓 제외, 09:00 정규장부터 매매(15:40~20:00 애프터장은 SOR 자동 라우팅)
    - NXT 가능(181710 NHN, 099320 쎄트렉아이, 323280 태성, 065350 신성델타테크, 056190 SFA, 218410 RFHIC):
@@ -13,7 +15,7 @@ swing_60m_bot.py - 계좌 1주 마커 감시종목(9종목) 전용 60분봉 TEMA
      * 실시간 상승률(35점) + 5일 평균 거래대금 대비 비율/규모(30점) + 일봉 기준선·세력선 돌파/SMA3-5(20점) + RVP체결강도·TEMA5기울기(15점)
    - 매수 수량: 미수 없는 현금 100% 주문가능액(`kt00001 100stk_ord_alow_amt`) 기준 풀매수
    - 기본 `1주` 관종 마커 보존: 진입 전 계좌 보유 수량을 `marker_qty`로 잠금 보존
-3. 매도 청산 (전량 시장가 매도 · 기본 1주 마커 제외):
+3. 매도 청산 (전량 시장가 매도 · 기본 1주 마커 제외 · 조건검색 이탈 시에도 청산 추적 유지):
    - 1차 원칙: 60분봉 `TEMA 5-20` 데드크로스(`TEMA5 < TEMA20`) 시 봇 진입 물량 전량 매도
    - 백업 방어: 진입 후 `60분봉 기준선(theme_gijun)` 상단에 안착한 적이 있던 종목이 기준선 하향 이탈 시 즉시 전량 시장가 매도
    - 매도 완료 시 기본 1주 마커만 계좌에 남기고 즉시 슬롯 개방
@@ -23,6 +25,7 @@ import os
 import sys
 import json
 import time
+import asyncio
 import threading
 import logging
 import importlib.util
@@ -506,7 +509,7 @@ def score_60m_entry_candidate(
 
 
 class Swing60mBot:
-    """계좌 보유 마커(1주) 종목 전용 60분봉 TEMA 5-20 1종목 풀매수·전량매도 봇"""
+    """계좌 보유 마커(1주) 종목 + HTS 조건검색식 `Swing60m` 전용 60분봉 TEMA 5-20 1종목 풀매수·전량매도 봇"""
 
     def __init__(
         self,
@@ -515,6 +518,8 @@ class Swing60mBot:
         max_budget_pct: float = 99.2,
         allow_krx_aftermarket: bool = True,
         gijun_buffer_pct: float = 0.002,
+        condition_name: str = "Swing60m",
+        strict_condition: bool = False,
         api: Optional[Any] = None,
     ):
         if not HAS_REAL_API and api is None:
@@ -525,6 +530,8 @@ class Swing60mBot:
         self.max_budget_pct = max(10.0, min(99.8, float(max_budget_pct)))
         self.allow_krx_aftermarket = allow_krx_aftermarket
         self.gijun_buffer_pct = max(0.0, float(gijun_buffer_pct))
+        self.condition_name = (condition_name or "").strip()
+        self.strict_condition = bool(strict_condition)
 
         self.api = api if api is not None else RealAPIAdapter()
         self.krx_map, self.nxt_map = load_watchlist_config()
@@ -535,6 +542,9 @@ class Swing60mBot:
         self._daily_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._m60_cache: Dict[str, Tuple[float, int, pd.DataFrame]] = {}
         self._ka10003_seeded: set[str] = set()
+        self._cond_lock = threading.Lock()
+        self.cond_picks: Dict[str, Dict[str, Any]] = {}
+        self._cond_date: str = datetime.now().strftime("%Y%m%d")
         self.ws_client = None
         self.ws_thread: Optional[threading.Thread] = None
 
@@ -578,6 +588,105 @@ class Swing60mBot:
         except Exception as e:
             logger.error(f"상태 파일 저장 에러: {e}")
 
+    def _reset_cond_picks_if_new_day(self, now_dt: datetime) -> None:
+        cur_date = now_dt.strftime("%Y%m%d")
+        if cur_date != self._cond_date:
+            with self._cond_lock:
+                self.cond_picks.clear()
+                self._cond_date = cur_date
+
+    def _on_cond_insert(self, code: str, cond_name: str = "") -> None:
+        """HTS 조건검색 편입 콜백 (WS 스레드에서 호출됨 — 비블로킹 유지)"""
+        cc = normalize_code(code)
+        if not cc:
+            return
+        label = (cond_name or self.condition_name or "Swing60m").strip()
+        now_ts = time.time()
+        with self._cond_lock:
+            prev = self.cond_picks.get(cc, {})
+            self.cond_picks[cc] = {
+                "code": cc,
+                "cond_name": label,
+                "active": True,
+                "first_inserted_at": float(prev.get("first_inserted_at") or now_ts),
+                "inserted_at": now_ts,
+            }
+        logger.info(f"📡 [{label}] 조건검색 편입: {cc}")
+
+    def _on_cond_delete(self, code: str, cond_name: str = "") -> None:
+        """HTS 조건검색 이탈 콜백 — 신규 진입 후보에서만 제외하며 보유 포지션 청산 추적을 끊지 않음"""
+        cc = normalize_code(code)
+        if not cc:
+            return
+        label = (cond_name or self.condition_name or "Swing60m").strip()
+        with self._cond_lock:
+            entry = self.cond_picks.get(cc)
+            if entry is not None:
+                entry["active"] = False
+                entry["deleted_at"] = time.time()
+            else:
+                self.cond_picks[cc] = {
+                    "code": cc,
+                    "cond_name": label,
+                    "active": False,
+                    "deleted_at": time.time(),
+                }
+        logger.info(f"📡 [{label}] 조건검색 이탈(보유 시 60m 청산감시 유지): {cc}")
+
+    def _is_condition_stream_ready(self) -> bool:
+        """키움 WS에 목표 조건식이 등록되었거나 실시간 포착 이력이 있는지 반환"""
+        if not self.condition_name:
+            return False
+        ws_map = getattr(self.ws_client, "target_condition_map", None) if self.ws_client else None
+        if ws_map:
+            return True
+        with self._cond_lock:
+            return bool(self.cond_picks)
+
+    def _evaluate_condition_gate(
+        self,
+        code: str,
+        venue: str,
+        now_dt: datetime,
+        d_metrics: Dict[str, Any],
+        day_ret_pct: float,
+    ) -> Tuple[bool, str]:
+        """
+        하이브리드 조건검색 게이트:
+        - 정규장(09:00~15:30) + 조건검색 서버 연동 시: `Swing60m` 현재 편입(`active`) 종목만 진입 허용
+        - 장전/애프터마켓(08:00~08:50, 15:40~20:00) 또는 미등록/오프라인 시:
+          `Swing60m` 편입 종목은 즉시 통과, 그 외는 자체 등가 필터(일 SMA3>5 & 전일종가<현재가)로 폴백 평가
+        """
+        if not self.condition_name:
+            return True, "조건미사용"
+
+        cc = normalize_code(code)
+        with self._cond_lock:
+            entry = dict(self.cond_picks.get(cc) or {})
+        is_cond_active = bool(entry.get("active", False))
+        stream_ready = self._is_condition_stream_ready()
+        now_t = now_dt.time()
+        in_regular = dtime(9, 0, 0) <= now_t < dtime(15, 30, 0)
+
+        if self.strict_condition or (stream_ready and in_regular):
+            if is_cond_active:
+                return True, f"{self.condition_name}:편입중"
+            return False, f"{self.condition_name}:미편입"
+
+        if is_cond_active:
+            return True, f"{self.condition_name}:편입중"
+
+        sma_ok = bool(d_metrics.get("sma3_gt_5", False))
+        up_ok = float(day_ret_pct) > 0.0
+        if sma_ok and up_ok:
+            return True, f"폴백:SMA3>5+상승({venue})"
+        reasons = []
+        if not sma_ok:
+            reasons.append("SMA3<=5")
+        if not up_ok:
+            reasons.append("전일종가이하")
+        return False, f"폴백탈락:{'+'.join(reasons)}"
+
     def _start_ws_daemon(self) -> None:
         def _on_tick(tick_data: dict):
             try:
@@ -607,9 +716,9 @@ class Swing60mBot:
                 pass
 
         self.ws_client = KiwoomWebSocketClient(
-            target_condition_name="",
-            on_insert=lambda *a: None,
-            on_delete=lambda *a: None,
+            target_condition_name=self.condition_name,
+            on_insert=self._on_cond_insert,
+            on_delete=self._on_cond_delete,
             on_real_tick=_on_tick,
             on_orderbook=_on_ob,
         )
@@ -624,6 +733,8 @@ class Swing60mBot:
 
         self.ws_thread = threading.Thread(target=_runner, daemon=True, name="Swing60mWS")
         self.ws_thread.start()
+        if self.condition_name and getattr(self.ws_client, "init_sync_event", None) is not None:
+            self.ws_client.init_sync_event.wait(timeout=2.5)
 
     def get_venue(self, code: str) -> str:
         """종목의 시장 구분('KRX' vs 'NXT') 판별"""
@@ -651,7 +762,7 @@ class Swing60mBot:
         return "KRX"
 
     def _get_watched_universe(self, holdings: Dict[str, dict]) -> Dict[str, dict]:
-        """계좌 보유 마커 종목 + 설정 9종목 통합 감시 풀 구성"""
+        """계좌 보유 마커 종목 + 설정 9종목 + 조건검색 `Swing60m` 실시간 편입 종목 통합 감시 풀 구성"""
         universe: Dict[str, dict] = {}
         for code, name in self.nxt_map.items():
             universe[code] = {"code": code, "name": name, "venue": "NXT", "held_qty": 0, "current_price": 0.0}
@@ -676,6 +787,23 @@ class Swing60mBot:
                     "venue": venue,
                     "held_qty": qty,
                     "current_price": float(h.get("current_price", 0) or 0),
+                }
+
+        with self._cond_lock:
+            active_conds = [c for c, item in self.cond_picks.items() if item.get("active", False)]
+        for cc in active_conds:
+            if cc not in universe:
+                venue = self.get_venue(cc)
+                name = cc
+                h_info = holdings.get(cc) if isinstance(holdings, dict) else None
+                if h_info and h_info.get("name"):
+                    name = str(h_info["name"])
+                universe[cc] = {
+                    "code": cc,
+                    "name": name,
+                    "venue": venue,
+                    "held_qty": int((h_info or {}).get("qty", 0) or 0),
+                    "current_price": float((h_info or {}).get("current_price", 0) or 0),
                 }
         return universe
 
@@ -917,6 +1045,7 @@ class Swing60mBot:
 
     def run_cycle(self, now_dt: Optional[datetime] = None) -> None:
         now = now_dt or datetime.now()
+        self._reset_cond_picks_if_new_day(now)
         holdings = self.api.get_account_holdings() or {}
         time.sleep(0.35)
 
@@ -994,9 +1123,20 @@ class Swing60mBot:
                     self._save_state()
             return
 
-        # ── [CASE 2] IDLE 슬롯 비어 있음 ➔ 9종목 전수 평가 후 60m TEMA 5-20 GC 1위 종목 풀매수 ──
+        # ── [CASE 2] IDLE 슬롯 비어 있음 ➔ 조건검색/감시풀 평가 후 60m TEMA 5-20 GC 1위 종목 풀매수 ──
+        in_reg = dtime(9, 0, 0) <= now.time() < dtime(15, 30, 0)
+        cond_stream_ready = self._is_condition_stream_ready()
+        if not self.condition_name:
+            mode_desc = "조건미사용(감시풀 전체)"
+        elif self.strict_condition or (cond_stream_ready and in_reg):
+            with self._cond_lock:
+                n_act = sum(1 for v in self.cond_picks.values() if v.get("active", False))
+            mode_desc = f"HTS 조건식 '{self.condition_name}' 실시간 연동(편입 {n_act}종목)"
+        else:
+            mode_desc = f"시간외/오프라인 자동 폴백(자체 일봉 SMA3>5 & 상승 + '{self.condition_name}')"
+
         logger.info("===============================================================================")
-        logger.info(f" 🔎 [60분봉 스윙 스캔] 감시 {len(universe)}종목 ({now.strftime('%H:%M:%S')}) — 60분봉 TEMA 5-20 GC 1등 탐색")
+        logger.info(f" 🔎 [60분봉 스윙 스캔] 감시 {len(universe)}종목 ({now.strftime('%H:%M:%S')}) | {mode_desc}")
         logger.info("===============================================================================")
 
         gc_candidates = []
@@ -1021,8 +1161,19 @@ class Swing60mBot:
             if d_metrics["prev5_tv_eok"] > 0:
                 self._v_ref_cache[code] = (d_metrics["prev5_tv_eok"] * 1e8) / 390.0
 
-            prev_close = float(df_daily["close"].iloc[-2]) if len(df_daily) >= 2 else float(d_metrics["close"] or 0.0)
+            last_daily_dt = ""
+            if not df_daily.empty and "date" in df_daily.columns:
+                last_daily_dt = str(df_daily["date"].iloc[-1]).replace("-", "").replace("/", "").strip()[:8]
+            if not df_daily.empty and "close" in df_daily.columns:
+                if last_daily_dt == now.strftime("%Y%m%d") and len(df_daily) >= 2:
+                    prev_close = float(df_daily["close"].iloc[-2])
+                else:
+                    prev_close = float(df_daily["close"].iloc[-1])
+            else:
+                prev_close = float(d_metrics["close"] or 0.0)
             day_ret_pct = ((sig60["price"] - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+            cond_ok, cond_tag = self._evaluate_condition_gate(code, venue, now, d_metrics, day_ret_pct)
+
             rvp_raw = self.strength_engine.evaluate_entry_strength(
                 code,
                 df_1m=None,
@@ -1044,15 +1195,15 @@ class Swing60mBot:
             )
             rvp_str = f"RVP:{rvp_info.get('rvp60', 0):.0f}%" if rvp_info.get("rvp_valid") else "RVP:대기"
             logger.info(
-                f"  · [{name}({code})][{venue}{'(거래가능)' if tradable else '(대기:'+sess_label+')'}] "
+                f"  · [{name}({code})][{venue}{'(거래가능)' if tradable else '(대기:'+sess_label+')'}][{cond_tag}] "
                 f"총점:{scores['total']:5.1f} [상승{scores['score_ret']:.0f}·대금{scores['score_tv']:.0f}·일봉{scores['score_daily']:.0f}·수급{scores['score_flow']:.0f}] | "
                 f"현재:{sig60['price']:,.0f}({day_ret_pct:+.2f}%) | 거래비율:{d_metrics['tv_ratio_pct']:.0f}%({d_metrics['today_tv_eok']:.0f}억) | "
                 f"기준:{d_metrics['gijun']:,.0f}({d_metrics['dist_gijun_pct']:+.1f}%) 세력:{d_metrics['seryek']:,.0f}({d_metrics['dist_seryek_pct']:+.1f}%) | "
                 f"{gc_tag} | {rvp_str}"
             )
 
-            # 매수 자격: 현재 세션 거래 가능 + 60m TEMA 5-20 신규 GC + 명백한 매도 투매(RVP < 70%) 아님
-            if not tradable or not sig60["is_entry_gc_ready"]:
+            # 매수 자격: 현재 세션 거래 가능 + 조건검색(또는 폴백) 통과 + 60m TEMA 5-20 신규 GC + 명백한 매도 투매(RVP < 70%) 아님
+            if not tradable or not cond_ok or not sig60["is_entry_gc_ready"]:
                 continue
             if rvp_info.get("rvp_valid") and max(rvp_info.get("rvp60", 0), rvp_info.get("rvp180", 0)) < 70.0:
                 logger.info(f"    ⏭️ [{name}] 60m GC 발생했으나 체결강도 약세(RVP < 70%)로 관망")
@@ -1129,8 +1280,11 @@ class Swing60mBot:
         self._save_state()
 
     def start_loop(self, interval_sec: int = 10) -> None:
+        cond_disp = f"조건검색:{self.condition_name}" if self.condition_name else "조건검색:미사용"
+        if self.strict_condition and self.condition_name:
+            cond_disp += "(엄격)"
         logger.info(
-            f"🚀 [60분봉 TEMA 5-20 전용 스윙 봇 가동] 주기: {interval_sec}초 | "
+            f"🚀 [60분봉 TEMA 5-20 전용 스윙 봇 가동] 주기: {interval_sec}초 | {cond_disp} | "
             f"NXT(08:00~20:00) / KRX(09:00~15:30 + 애프터 SOR) | 1종목 현금 {self.max_budget_pct:.1f}% 풀매수"
         )
         try:
@@ -1157,6 +1311,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-budget-pct", type=float, default=99.2, help="주문가능현금 대비 투자 비중(%%, 기본 99.2)")
     parser.add_argument("--no-ws", action="store_true", help="실시간 웹소켓 비활성화")
     parser.add_argument("--no-aftermarket-krx", action="store_true", help="15:40~20:00 KRX 종목 SOR 매매 비활성화")
+    parser.add_argument("--condition", type=str, default="Swing60m", help="연동할 HTS 조건검색식명 (기본 Swing60m, 빈문자열이면 비활성화)")
+    parser.add_argument("--strict-condition", action="store_true", help="프리/애프터 포함 전 시간 HTS 조건식 편입 종목만 진입 허용")
     args = parser.parse_args()
 
     _lock_fp = None
@@ -1184,6 +1340,8 @@ if __name__ == "__main__":
         enable_ws=(not args.no_ws),
         max_budget_pct=args.max_budget_pct,
         allow_krx_aftermarket=(not args.no_aftermarket_krx),
+        condition_name=args.condition,
+        strict_condition=args.strict_condition,
     )
     if args.once:
         bot.run_cycle()

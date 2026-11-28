@@ -26,11 +26,10 @@ from execution.swing_60m_bot import (
 )
 
 
-def _make_daily_df(closes, base_tv_m=1000.0):
-    start = datetime(2026, 7, 1)
+def _make_daily_df(closes, base_tv_m=1000.0, start_dt=datetime(2026, 9, 13)):
     rows = []
     for i, c in enumerate(closes):
-        dt = (start + timedelta(days=i)).strftime("%Y%m%d")
+        dt = (start_dt + timedelta(days=i)).strftime("%Y%m%d")
         tv = base_tv_m * (3.5 if i == len(closes) - 1 else 1.0)
         rows.append({
             "date": dt,
@@ -287,6 +286,103 @@ def test_kiwoom_unfilled_oso_parsing():
     print("PASS test_kiwoom_unfilled_oso_parsing")
 
 
+def test_swing60m_condition_search_regular_and_fallback():
+    class _DummyWS:
+        target_condition_map = {"12": "Swing60m"}
+
+    fake_api = _FakeAPI()
+    bot = Swing60mBot(dry_run=False, enable_ws=False, api=fake_api, condition_name="Swing60m")
+    bot._clear_active_position()
+    bot.ws_client = _DummyWS()
+
+    dt_0930 = datetime(2026, 11, 26, 9, 30, 0)
+    now_epoch = _t.time()
+    for cd, px in [("323280", 51200.0), ("042510", 51200.0), ("181710", 49500.0), ("005930", 51200.0)]:
+        bot.live_ticks[cd] = {"price": px, "ts": now_epoch}
+        bot.live_orderbooks[cd] = {"ask1": px, "bid1": px, "ts": now_epoch}
+
+    # 1) 정규장(09:30)에 Swing60m 등록되어 있지만 323280/042510 모두 아직 미편입 -> 매수 차단(관망)
+    bot.run_cycle(now_dt=dt_0930)
+    assert len(fake_api.orders) == 0, f"Must wait while Swing60m has 0 active matches: {fake_api.orders}"
+
+    # 2) Swing60m 에 비-마커 종목(005930) 편입 시 계좌 보유 0주여도 감시풀에 자동 합류
+    bot._on_cond_insert("005930", "Swing60m")
+    uni = bot._get_watched_universe(fake_api.get_account_holdings())
+    assert "005930" in uni and uni["005930"]["held_qty"] == 0
+
+    # 3) 라온시큐어(042510)가 Swing60m 편입되면(단 005930은 60m DC 가정) 라온시큐어 즉시 풀매수
+    bot._on_cond_insert("042510", "Swing60m")
+    bot.run_cycle(now_dt=dt_0930)
+    assert len(fake_api.orders) == 1 and fake_api.orders[0][1] == "042510", f"Expected 042510 entry via Swing60m: {fake_api.orders}"
+
+    # 4) 장전/폴백 검증: 08:30에 전일종가 이하(-1.0%) 종목은 폴백 필터에 걸리고, 전일종가 초과+SMA3>5 종목만 매수
+    fake_api2 = _FakeAPI()
+    bot2 = Swing60mBot(dry_run=False, enable_ws=False, api=fake_api2, condition_name="Swing60m")
+    bot2._clear_active_position()
+    dt_0830 = datetime(2026, 11, 26, 8, 30, 0)
+    # 323280 live price 50000 < prev_close 50500 (전일종가 이하) -> 폴백 필터 차단
+    bot2.live_ticks["323280"] = {"price": 50000.0, "ts": now_epoch}
+    bot2.live_orderbooks["323280"] = {"ask1": 50000.0, "bid1": 50000.0, "ts": now_epoch}
+    bot2.live_ticks["181710"] = {"price": 49500.0, "ts": now_epoch}
+    bot2.live_orderbooks["181710"] = {"ask1": 49500.0, "bid1": 49500.0, "ts": now_epoch}
+    bot2.run_cycle(now_dt=dt_0830)
+    assert len(fake_api2.orders) == 0, f"Premarket fallback must filter day_ret <= 0: {fake_api2.orders}"
+
+    # 다시 전일종가 초과(51200 > 50500) + SMA3>5 -> NXT 프리마켓 매수 정상 동작
+    bot2.live_ticks["323280"] = {"price": 51200.0, "ts": now_epoch}
+    bot2.live_orderbooks["323280"] = {"ask1": 51200.0, "bid1": 51200.0, "ts": now_epoch}
+    bot2.run_cycle(now_dt=dt_0830)
+    assert len(fake_api2.orders) == 1 and fake_api2.orders[0][1] == "323280"
+
+    if os.path.exists(os.path.join(CURRENT_DIR, "swing_60m_state.json")):
+        os.remove(os.path.join(CURRENT_DIR, "swing_60m_state.json"))
+    print("PASS test_swing60m_condition_search_regular_and_fallback")
+
+
+def test_swing60m_cond_delete_does_not_affect_exit():
+    class _DummyWS:
+        target_condition_map = {"12": "Swing60m"}
+
+    fake_api = _FakeAPI()
+    fake_api.holdings["323280"]["qty"] = 86
+    bot = Swing60mBot(dry_run=False, enable_ws=False, api=fake_api, condition_name="Swing60m")
+    bot._clear_active_position()
+    bot.ws_client = _DummyWS()
+    bot.state.update({
+        "active_code": "323280",
+        "active_name": "태성",
+        "marker_qty": 1,
+        "bot_qty": 85,
+        "entry_price": 51200.0,
+        "was_above_60m_gijun": False,
+    })
+    bot._save_state()
+
+    # 1) 보유 중 Swing60m 조건식 이탈('D') 발생해도 60m GC 유지 중이면 조기 청산 금지 & 슬롯 유지
+    bot._on_cond_insert("323280", "Swing60m")
+    bot._on_cond_delete("323280", "Swing60m")
+    assert bot.cond_picks["323280"]["active"] is False
+
+    dt_1015 = datetime(2026, 11, 26, 10, 15, 0)
+    bot.live_ticks["323280"] = {"price": 51300.0, "ts": _t.time()}
+    bot.live_orderbooks["323280"] = {"ask1": 51300.0, "bid1": 51300.0, "ts": _t.time()}
+    bot.run_cycle(now_dt=dt_1015)
+    assert len(fake_api.orders) == 0 and bot.state["active_code"] == "323280"
+
+    # 2) 이후 실제 60m TEMA 5-20 데드크로스 발생 시 마커 1주 남기고 85주 정상 전량 매도
+    fake_api.state_mode = "SELL_READY"
+    bot._m60_cache.clear()
+    bot.live_ticks["323280"] = {"price": 49500.0, "ts": _t.time()}
+    bot.run_cycle(now_dt=datetime(2026, 11, 26, 10, 25, 0))
+    assert len(fake_api.orders) == 1
+    s_side, s_code, s_qty, _, _, _ = fake_api.orders[0]
+    assert s_side == "SELL" and s_code == "323280" and s_qty == 85
+
+    if os.path.exists(os.path.join(CURRENT_DIR, "swing_60m_state.json")):
+        os.remove(os.path.join(CURRENT_DIR, "swing_60m_state.json"))
+    print("PASS test_swing60m_cond_delete_does_not_affect_exit")
+
+
 if __name__ == "__main__":
     test_venue_session_rules()
     test_daily_seryek_gijun_formula()
@@ -295,4 +391,6 @@ if __name__ == "__main__":
     test_9stock_leader_ranking()
     test_mocked_full_cycle_marker_preservation()
     test_kiwoom_unfilled_oso_parsing()
-    print("\nALL 7 SWING_60M TESTS PASSED!")
+    test_swing60m_condition_search_regular_and_fallback()
+    test_swing60m_cond_delete_does_not_affect_exit()
+    print("\nALL 9 SWING_60M TESTS PASSED!")
