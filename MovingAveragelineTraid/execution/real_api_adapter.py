@@ -284,13 +284,13 @@ class RealAPIAdapter:
             logger.error(f"30분봉 조회 에러 ({stock_code}): {e}")
             return pd.DataFrame()
 
-    def get_60m_candles(self, stock_code: str, limit: int = 600) -> pd.DataFrame:
-        """실전 60분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (HTS 60분봉 공식 차트 일치)"""
+    def get_60m_candles(self, stock_code: str, limit: int = 900) -> pd.DataFrame:
+        """실전 60분봉 데이터를 가져와서 Pandas DataFrame으로 변환 (opt10080/ka10080 기본 900봉 전체 사용 · HTS 차트 일치)"""
         try:
             raw_candles = []
             if hasattr(self.real_client, '_fetch_minute_candles'):
                 raw_candles = self.real_client._fetch_minute_candles(
-                    stock_code, tic_scope="60", last_n_days=30, limit=limit
+                    stock_code, tic_scope="60", last_n_days=0, limit=limit
                 )
             elif hasattr(self.real_client, 'get_60min_candles'):
                 raw_candles = self.real_client.get_60min_candles(stock_code, last_n_days=30)
