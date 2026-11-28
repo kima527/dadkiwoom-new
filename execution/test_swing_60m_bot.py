@@ -16,14 +16,44 @@ sys.path.insert(0, CURRENT_DIR)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "real trading"))
 
 from execution.indicators import calculate_daily_seryek_gijun_lines
+from execution.order_flow import (
+    ExecutionStrengthEngine,
+    classify_tick_direction,
+    compute_c0_180_scale,
+    get_session_info,
+    is_auction_tick,
+)
 from execution.swing_60m_bot import (
     Swing60mBot,
     get_venue_session_state,
+    get_open_stabilization_block,
     inject_live_price_60m,
     evaluate_60m_signals,
     evaluate_60m_exit,
     score_60m_entry_candidate,
 )
+
+
+def _warmup_rvp(bot, code: str, now_dt: datetime, is_nxt: bool = False, price: float = 51200.0, qty: int = 300, n_ticks: int = 6):
+    now_ts = now_dt.timestamp()
+    for i in range(n_ticks):
+        t_tick = now_ts - 90.0 + i * (80.0 / max(1, n_ticks - 1))
+        tm_s = datetime.fromtimestamp(t_tick).strftime("%H%M%S")
+        bot.strength_engine.on_tick(
+            {
+                "code": code,
+                "price": price,
+                "qty": qty,
+                "raw_15": f"+{qty}",
+                "accum_volume": 10000 + i * qty,
+                "gangdo": 135.0,
+                "time": tm_s,
+            },
+            v_ref_1m=2_500_000.0,
+            now_ts=t_tick,
+            is_nxt=is_nxt,
+            prior_5d_1m_amt=2_500_000.0,
+        )
 
 
 def _make_daily_df(closes, base_tv_m=1000.0, start_dt=datetime(2026, 9, 13)):
@@ -158,6 +188,8 @@ def test_9stock_leader_ranking():
     s1 = score_60m_entry_candidate(18.5, leader_daily, sig_strong, {"rvp_valid": True, "rvp60": 165.0, "rvp180": 140.0})
     s2 = score_60m_entry_candidate(2.5, laggard_daily, sig_weak, {"rvp_valid": True, "rvp60": 95.0, "rvp180": 90.0})
     assert s1["total"] > s2["total"] + 30.0, f"Leader should strongly outscore laggard: {s1} vs {s2}"
+    s_unwarmed = score_60m_entry_candidate(18.5, leader_daily, sig_strong, {"rvp_valid": False, "rvp60": 100.0, "rvp180": 100.0})
+    assert s_unwarmed["score_flow"] == 5.0, f"Unwarmed rvp_valid=False must get 0 RVP pts (only slope 5): {s_unwarmed}"
     print(f"PASS test_9stock_leader_ranking (leader={s1['total']}, laggard={s2['total']})")
 
 
@@ -223,6 +255,7 @@ def test_mocked_full_cycle_marker_preservation():
     bot.live_ticks["181710"] = {"price": 49500.0, "ts": now_epoch}
     for cd in ("323280", "042510", "181710"):
         bot.live_orderbooks[cd] = {"ask1": bot.live_ticks[cd]["price"], "bid1": bot.live_ticks[cd]["price"], "ts": now_epoch}
+    _warmup_rvp(bot, "323280", dt_0830, is_nxt=True, price=51200.0)
 
     bot.run_cycle(now_dt=dt_0830)
     assert len(fake_api.orders) == 1, f"Expected exactly 1 buy order at 08:30, got {fake_api.orders}"
@@ -318,8 +351,9 @@ def test_swing60m_condition_search_regular_and_fallback():
     bot.run_cycle(now_dt=dt_0930)
     assert len(fake_api.orders) == 0, f"0-share stock from Swing60m must never be bought: {fake_api.orders}"
 
-    # 3) 기존 감시 마커 라온시큐어(042510)가 Swing60m 편입되면 라온시큐어 즉시 풀매수
+    # 3) 기존 감시 마커 라온시큐어(042510)가 Swing60m 편입 + 워밍업 완료 시 라온시큐어 즉시 풀매수
     bot._on_cond_insert("042510", "Swing60m")
+    _warmup_rvp(bot, "042510", dt_0930, is_nxt=False, price=51200.0)
     bot.run_cycle(now_dt=dt_0930)
     assert len(fake_api.orders) == 1 and fake_api.orders[0][1] == "042510", f"Expected 042510 entry via Swing60m: {fake_api.orders}"
 
@@ -328,6 +362,7 @@ def test_swing60m_condition_search_regular_and_fallback():
     bot2 = Swing60mBot(dry_run=False, enable_ws=False, api=fake_api2, condition_name="Swing60m")
     bot2._clear_active_position()
     dt_0830 = datetime(2026, 11, 26, 8, 30, 0)
+    _warmup_rvp(bot2, "323280", dt_0830, is_nxt=True, price=51200.0)
     # 323280 live price 50000 < prev_close 50500 (전일종가 이하) -> 폴백 필터 차단
     bot2.live_ticks["323280"] = {"price": 50000.0, "ts": now_epoch}
     bot2.live_orderbooks["323280"] = {"ask1": 50000.0, "bid1": 50000.0, "ts": now_epoch}
@@ -391,6 +426,124 @@ def test_swing60m_cond_delete_does_not_affect_exit():
     print("PASS test_swing60m_cond_delete_does_not_affect_exit")
 
 
+def test_order_flow_auction_gap_ka10003_and_c0_180():
+    # 1) k(T_eff) 0/0 guard & monotonic scaling
+    assert compute_c0_180_scale(0.0) == 1.0
+    assert compute_c0_180_scale(0.05) == 1.0
+    assert compute_c0_180_scale(0.1) == 1.0
+    k60 = compute_c0_180_scale(60.0)
+    k180 = compute_c0_180_scale(180.0)
+    assert 1.20 < k60 < 1.28 and 1.65 < k180 < 1.78, f"Unexpected k(T_eff): {k60}, {k180}"
+
+    # classify_tick_direction signed integer symmetry
+    assert classify_tick_direction(100, price=1000, prev_price=1000) is True
+    assert classify_tick_direction(-100, price=1000, prev_price=1000) is False
+
+    # NXT 08:00:01 continuous open must NOT be rejected; KRX 09:00:15 first tick MUST be rejected
+    assert is_auction_tick("080001", accum_vol=100, tick_qty=100, is_nxt=True, first_session_tick=True) is False
+    assert is_auction_tick("090015", accum_vol=50000, tick_qty=49000, is_nxt=False, first_session_tick=True) is True
+
+    # 2) Bug ①: Gap Recovery must NOT swallow 09:00:15 opening auction block after premarket!
+    eng = ExecutionStrengthEngine()
+    t_0848 = datetime(2026, 11, 26, 8, 48, 0).timestamp()
+    eng.on_tick({"code": "323280", "price": 50000, "qty": 10, "raw_15": "+10", "accum_volume": 100, "time": "084800"}, v_ref_1m=10_000_000, now_ts=t_0848, is_nxt=True)
+    # KRX 09:00:15 opening print jumps accum_volume 100 -> 50000 (auction)
+    t_090015 = datetime(2026, 11, 26, 9, 0, 15).timestamp()
+    eng.on_tick({"code": "323280", "price": 52000, "qty": 49000, "raw_15": "+49000", "accum_volume": 50000, "gangdo": 180.0, "time": "090015"}, v_ref_1m=100_000_000, now_ts=t_090015, is_nxt=False, prior_5d_1m_amt=100_000_000)
+    st = eng.get_state("323280")
+    assert st.tick_count == 0 and st.b_60 == 0.0 and st.s_60 == 0.0, f"Opening auction leaked into RVP! {st.tick_count}, {st.b_60}"
+
+    # Now continuous KRX ticks from 09:00:40..09:01:20 (t_eff = 45s >= 30s)
+    for i in range(6):
+        ti = (datetime(2026, 11, 26, 9, 0, 40) + timedelta(seconds=i * 8)).timestamp()
+        eng.on_tick({"code": "323280", "price": 52100, "qty": 100, "raw_15": "+100", "accum_volume": 50000 + (i + 1) * 100, "time": datetime.fromtimestamp(ti).strftime("%H%M%S")}, v_ref_1m=100_000_000, now_ts=ti, is_nxt=False, prior_5d_1m_amt=100_000_000)
+    m_open = eng.evaluate_entry_strength("323280", df_1m=None, v_ref_1m=100_000_000, now_ts=datetime(2026, 11, 26, 9, 1, 20).timestamp(), is_nxt=False, prior_5d_1m_amt=100_000_000)
+    assert m_open["rvp_valid"] is True and m_open["live_ticks"] == 6
+    assert abs(m_open["c0_180"] / m_open["c0"] - compute_c0_180_scale(45.0)) < 1e-6
+
+    # 3) Bug ③ & Detail #2: ka10003 at 08:03 rejects yesterday 19:59 & uses tick_ts decay
+    eng2 = ExecutionStrengthEngine()
+    t_0803 = datetime(2026, 11, 26, 8, 3, 0).timestamp()
+    sample_ticks = [
+        {"price": 50000, "qty": 500, "raw_15": "+500", "time": "195950", "accum_volume": 90000},   # 전일 애프터 -> 반드시 폐기!
+        {"price": 50000, "qty": 200, "raw_15": "+200", "time": "080010", "accum_volume": 200},     # 170초 전 매수 (감쇠됨)
+        {"price": 50000, "qty": 200, "raw_15": "-200", "time": "080255", "accum_volume": 400},     # 5초 전 매도 (신선함)
+    ]
+    cnt = eng2.seed_from_ka10003("181710", sample_ticks, v_ref_1m=20_000_000, now_ts=t_0803, is_nxt=True, prior_5d_1m_amt=20_000_000)
+    assert cnt == 2, f"Yesterday 19:59 tick must be rejected (expected 2, got {cnt})"
+    st2 = eng2.get_state("181710")
+    assert st2.s_60 > st2.b_60 * 5.0, f"08:02:55 sell must heavily outweigh decayed 08:00:10 buy: s60={st2.s_60}, b60={st2.b_60}"
+
+    # Verify 08:20 smooth Bayesian v_ref blend eliminates step cliff
+    eng3 = ExecutionStrengthEngine()
+    for m_idx in range(19):
+        eng3.on_1m_bar_closed("099320", 3_000_000.0, now_ts=datetime(2026, 11, 26, 8, m_idx + 1, 0).timestamp())
+    v_19 = eng3._get_effective_v_ref(eng3.get_state("099320"), 0.0, 20_000_000.0, datetime(2026, 11, 26, 8, 19, 30).timestamp(), is_nxt=True)[0]
+    eng3.on_1m_bar_closed("099320", 3_000_000.0, now_ts=datetime(2026, 11, 26, 8, 20, 0).timestamp())
+    v_20 = eng3._get_effective_v_ref(eng3.get_state("099320"), 0.0, 20_000_000.0, datetime(2026, 11, 26, 8, 20, 30).timestamp(), is_nxt=True)[0]
+    assert abs(v_20 - v_19) / max(1.0, v_19) < 0.05, f"v_ref must not cliff jump at bar 20: {v_19} -> {v_20}"
+    print("PASS test_order_flow_auction_gap_ka10003_and_c0_180")
+
+
+def test_gc_zero_chase_and_hard_gate_blackout():
+    # 1) Bug ②: gc_bars_ago == 0 spike (+8.8%) must NOT bypass max_chase_pct as 0.0%
+    base_closes = [10000.0] * 35 + [9800, 9600, 9400, 9200, 9100]  # still TEMA5 < TEMA20 up to iloc[-1]
+    df_60 = _make_60m_df(base_closes, start_dt=datetime(2026, 11, 24, 9, 0))
+    next_hr = df_60.index[-1].to_pydatetime() + timedelta(hours=1, minutes=5)
+    sig_spike = evaluate_60m_signals(df_60, current_price=9900.0, now_dt=next_hr)
+    assert sig_spike["is_gc_bull"] and sig_spike["gc_bars_ago"] == 0
+    assert sig_spike["price_vs_gc_pct"] > 7.0 and not sig_spike["is_entry_gc_ready"], (
+        f"gc_bars_ago==0 +8.8% spike must be blocked by max_chase_pct! {sig_spike}"
+    )
+
+    # 2) Opening stabilization blackout (08:01 NXT, 09:01 KRX)
+    assert get_open_stabilization_block(datetime(2026, 11, 26, 8, 1, 0), "NXT")[0] is True
+    assert get_open_stabilization_block(datetime(2026, 11, 26, 9, 1, 0), "KRX")[0] is True
+    assert get_open_stabilization_block(datetime(2026, 11, 26, 8, 4, 0), "NXT")[0] is False
+
+    # 3) Detail #3 Hard Gate: unwarmed (3 ticks < 5) must block even with 60m GC; warmed & 08:01 blackout also blocked
+    fake_api = _FakeAPI()
+    bot = Swing60mBot(dry_run=False, enable_ws=False, api=fake_api)
+    bot._clear_active_position()
+    dt_0830 = datetime(2026, 11, 26, 8, 30, 0)
+    now_epoch = _t.time()
+    bot.live_ticks["323280"] = {"price": 51200.0, "ts": now_epoch}
+    bot.live_ticks["042510"] = {"price": 19200.0, "ts": now_epoch}
+    bot.live_ticks["181710"] = {"price": 49500.0, "ts": now_epoch}
+    for cd in ("323280", "042510", "181710"):
+        bot.live_orderbooks[cd] = {"ask1": bot.live_ticks[cd]["price"], "bid1": bot.live_ticks[cd]["price"], "ts": now_epoch}
+
+    # Only 3 ticks -> Hard Gate must block
+    _warmup_rvp(bot, "323280", dt_0830, is_nxt=True, n_ticks=3)
+    bot.run_cycle(now_dt=dt_0830)
+    assert len(fake_api.orders) == 0, f"Hard Gate must block < 5 ticks unwarmed stock: {fake_api.orders}"
+
+    # Fully warmed at 08:01 -> blocked by opening stabilization blackout
+    dt_0801 = datetime(2026, 11, 26, 8, 1, 0)
+    _warmup_rvp(bot, "323280", dt_0801, is_nxt=True, n_ticks=6)
+    bot.run_cycle(now_dt=dt_0801)
+    assert len(fake_api.orders) == 0, f"Must block 08:01 opening blackout: {fake_api.orders}"
+
+    # Decelerating sell shock (buy early then sudden big sell -> RVP60 < 75%) -> blocked even when warmed
+    fake_api_dump = _FakeAPI()
+    bot_dump = Swing60mBot(dry_run=False, enable_ws=False, api=fake_api_dump)
+    bot_dump._clear_active_position()
+    for cd, px in [("323280", 51200.0), ("042510", 19200.0), ("181710", 49500.0)]:
+        bot_dump.live_ticks[cd] = {"price": px, "ts": now_epoch}
+        bot_dump.live_orderbooks[cd] = {"ask1": px, "bid1": px, "ts": now_epoch}
+    base_t = dt_0830.timestamp()
+    for i in range(4):
+        bot_dump.strength_engine.on_tick({"code": "323280", "price": 51200, "qty": 50, "raw_15": "+50", "accum_volume": 1000 + i * 50, "time": "082800"}, v_ref_1m=2_500_000, now_ts=base_t - 100.0 + i * 10.0, is_nxt=True, prior_5d_1m_amt=2_500_000)
+    for j in range(3):
+        bot_dump.strength_engine.on_tick({"code": "323280", "price": 51200, "qty": 300, "raw_15": "-300", "accum_volume": 1300 + j * 300, "time": "082955"}, v_ref_1m=2_500_000, now_ts=base_t - 5.0 + j, is_nxt=True, prior_5d_1m_amt=2_500_000)
+    bot_dump.run_cycle(now_dt=dt_0830)
+    assert len(fake_api_dump.orders) == 0, f"Deceleration/dump RVP filter must block entry: {fake_api_dump.orders}"
+
+    if os.path.exists(os.path.join(CURRENT_DIR, "swing_60m_state.json")):
+        os.remove(os.path.join(CURRENT_DIR, "swing_60m_state.json"))
+    print("PASS test_gc_zero_chase_and_hard_gate_blackout")
+
+
 if __name__ == "__main__":
     test_venue_session_rules()
     test_daily_seryek_gijun_formula()
@@ -401,4 +554,6 @@ if __name__ == "__main__":
     test_kiwoom_unfilled_oso_parsing()
     test_swing60m_condition_search_regular_and_fallback()
     test_swing60m_cond_delete_does_not_affect_exit()
-    print("\nALL 9 SWING_60M TESTS PASSED!")
+    test_order_flow_auction_gap_ka10003_and_c0_180()
+    test_gc_zero_chase_and_hard_gate_blackout()
+    print("\nALL 11 SWING_60M TESTS PASSED!")

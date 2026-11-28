@@ -25,6 +25,7 @@ import os
 import sys
 import json
 import time
+import queue
 import asyncio
 import threading
 import logging
@@ -47,7 +48,7 @@ from execution.indicators import (
     calculate_all_60m_indicators,
     calculate_daily_seryek_gijun_lines,
 )
-from execution.order_flow import ExecutionStrengthEngine
+from execution.order_flow import ExecutionStrengthEngine, get_session_info
 
 # real trading/config.py 를 sys.modules['config']에 바인딩 (어댑터 로드 이전 필수)
 _real_cfg_path = os.path.join(REAL_TRADING_PATH, "config.py")
@@ -240,6 +241,31 @@ def get_venue_session_state(
     return False, "장운영 시간외", ""
 
 
+def get_open_stabilization_block(
+    now_dt: Optional[datetime],
+    venue: str,
+    blackout_minutes: int = 3,
+) -> Tuple[bool, str]:
+    """
+    개장 극초반(프리마켓 08:00~08:03, 정규장 09:00~09:03) 신규 풀매수 진입 블랙아웃 여부 반환.
+    - 보유 포지션의 청산 감시(60m DC / 기준선 이탈)는 블랙아웃 대상에서 제외해 항상 즉시 대응.
+    """
+    if blackout_minutes <= 0:
+        return False, ""
+    dt = now_dt or datetime.now()
+    if dt.weekday() >= 5:
+        return False, ""
+    now_t = dt.time()
+    v = "KRX" if str(venue).upper() == "KRX" else "NXT"
+    bm = min(15, max(1, int(blackout_minutes)))
+
+    if v == "NXT" and dtime(8, 0, 0) <= now_t < dtime(8, bm, 0):
+        return True, f"프리마켓 개시 {bm}분 안정화 대기(08:{bm:02d}개시)"
+    if dtime(9, 0, 0) <= now_t < dtime(9, bm, 0):
+        return True, f"정규장 시초 {bm}분 안정화 대기(09:{bm:02d}개시)"
+    return False, ""
+
+
 def inject_live_price_60m(
     df_60m: Optional[pd.DataFrame],
     current_price: Optional[float] = None,
@@ -357,14 +383,18 @@ def evaluate_60m_signals(
 
     gc_bars_ago = None
     gc_close = 0.0
+    gc_ref_price = 0.0
     if is_gc_bull:
         for idx in range(len(df_ind) - 1, 0, -1):
             if bool(cross_up_s.iloc[idx]):
                 gc_bars_ago = (len(df_ind) - 1) - idx
                 gc_close = float(closes.iloc[idx])
+                # ② gc_bars_ago == 0 일 때 자기 자신을 기준가로 쓰면 +2.5% 과추격 상한이 항상 0.0%로 우회됨
+                # -> 직전 완성 60분봉 종가(closes[idx - 1]) 대비 이격으로 과추격 엄격 판정!
+                gc_ref_price = float(closes.iloc[idx - 1]) if gc_bars_ago == 0 else gc_close
                 break
 
-    price_vs_gc_pct = ((price_cur - gc_close) / gc_close * 100.0) if gc_close > 0 else 0.0
+    price_vs_gc_pct = ((price_cur - gc_ref_price) / gc_ref_price * 100.0) if gc_ref_price > 0 else 0.0
     is_entry_gc_ready = bool(
         is_gc_bull
         and gc_bars_ago is not None
@@ -487,7 +517,7 @@ def score_60m_entry_candidate(
     rvp_valid = bool(rvp_info.get("rvp_valid", False))
     rvp_val = max(float(rvp_info.get("rvp60", 0.0) or 0.0), float(rvp_info.get("rvp180", 0.0) or 0.0))
     if not rvp_valid:
-        score_rvp = 5.0  # 장초반/워밍업 전 중립 점수 (진입 차단 안 함)
+        score_rvp = 0.0  # 워밍업 미충족 종목 중립 5점 역설 제거 (Hard Gate와 일관 유지)
     elif rvp_val >= 140.0:
         score_rvp = 10.0
     elif rvp_val >= 110.0:
@@ -543,6 +573,9 @@ class Swing60mBot:
         self._m60_cache: Dict[str, Tuple[float, int, pd.DataFrame]] = {}
         self._ka10003_seeded: set[str] = set()
         self._held_codes: set[str] = set()
+        self._last_session_key: str = ""
+        self._tick_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._flow_worker_thread: Optional[threading.Thread] = None
         self._cond_lock = threading.Lock()
         self.cond_picks: Dict[str, Dict[str, Any]] = {}
         self._cond_date: str = datetime.now().strftime("%Y%m%d")
@@ -695,30 +728,72 @@ class Swing60mBot:
         return False, f"폴백탈락:{'+'.join(reasons)}"
 
     def _start_ws_daemon(self) -> None:
+        def _flow_worker():
+            while True:
+                kind, payload = self._tick_queue.get()
+                try:
+                    if kind == "OB":
+                        code, ask1, bid1, ob_ts = payload
+                        self.strength_engine.on_orderbook(code, ask1, bid1, now_ts=ob_ts)
+                    elif kind == "TICK":
+                        tick_data, tick_ts = payload
+                        code = normalize_code(tick_data.get("code", ""))
+                        if not code:
+                            continue
+                        v_ref = self._v_ref_cache.get(code, 5_000_000.0)
+                        now_t = datetime.fromtimestamp(tick_ts).time()
+                        ex_meta = str(tick_data.get("exchange", "") or "").upper()
+                        if ex_meta in ("NXT", "KRX"):
+                            is_nxt_code = (ex_meta == "NXT")
+                        else:
+                            is_nxt_sess = (dtime(8, 0, 0) <= now_t < dtime(8, 50, 0)) or (dtime(15, 40, 0) <= now_t < dtime(20, 0, 0))
+                            is_nxt_code = self.get_venue(code) == "NXT" and is_nxt_sess
+                        self.strength_engine.on_tick(
+                            tick_data,
+                            v_ref_1m=v_ref,
+                            now_ts=tick_ts,
+                            is_nxt=is_nxt_code,
+                            prior_5d_1m_amt=v_ref,
+                        )
+                except Exception:
+                    pass
+
+        if self._flow_worker_thread is None or not self._flow_worker_thread.is_alive():
+            self._flow_worker_thread = threading.Thread(target=_flow_worker, daemon=True, name="Swing60mFlowWorker")
+            self._flow_worker_thread.start()
+
         def _on_tick(tick_data: dict):
             try:
                 code = normalize_code(tick_data.get("code", ""))
                 px = float(tick_data.get("price", 0) or 0)
                 if not code or px <= 0:
                     return
-                self.live_ticks[code] = {"price": px, "ts": time.time()}
-                v_ref = self._v_ref_cache.get(code, 5_000_000.0)
-                now_t = datetime.now().time()
-                is_nxt_sess = (dtime(8, 0, 0) <= now_t < dtime(8, 50, 0)) or (dtime(15, 40, 0) <= now_t < dtime(20, 0, 0))
-                is_nxt_code = self.get_venue(code) == "NXT" and is_nxt_sess
-                self.strength_engine.on_tick(tick_data, v_ref_1m=v_ref, is_nxt=is_nxt_code)
+                now_ts = time.time()
+                self.live_ticks[code] = {"price": px, "ts": now_ts}
+                self._tick_queue.put(("TICK", (tick_data, now_ts)))
             except Exception:
                 pass
 
         def _on_ob(ob_data: dict):
             try:
                 code = normalize_code(ob_data.get("code", ""))
-                if code:
-                    self.live_orderbooks[code] = {
-                        "ask1": float(ob_data.get("ask1", 0) or 0),
-                        "bid1": float(ob_data.get("bid1", 0) or 0),
-                        "ts": time.time(),
-                    }
+                if not code:
+                    return
+                ask1 = float(ob_data.get("ask1", 0) or 0)
+                bid1 = float(ob_data.get("bid1", 0) or 0)
+                if ask1 > 0 and bid1 > 0 and ask1 < bid1:
+                    return
+                ob_ts = time.time()
+                now_t = datetime.fromtimestamp(ob_ts).time()
+                ob_ex = str(ob_data.get("exchange", "") or "").upper()
+                if ob_ex != "NXT" and dtime(8, 50, 0) <= now_t < dtime(9, 0, 0):
+                    return
+                self.live_orderbooks[code] = {
+                    "ask1": ask1,
+                    "bid1": bid1,
+                    "ts": ob_ts,
+                }
+                self._tick_queue.put(("OB", (code, ask1, bid1, ob_ts)))
             except Exception:
                 pass
 
@@ -813,15 +888,32 @@ class Swing60mBot:
                 items.append(code)
         self.ws_client.sync_custom_stream_sync(items)
 
-    def _seed_ka10003_if_needed(self, code: str) -> None:
+    def _seed_ka10003_if_needed(self, code: str, now_dt: Optional[datetime] = None, pref_ex: str = "") -> None:
         if code in self._ka10003_seeded or not hasattr(self.api, "get_recent_ticks_ka10003"):
             return
+        dt = now_dt or datetime.now()
+        now_t = dt.time()
+        # 동시호가 휴지기(08:50~09:00, 15:30~15:40) 중에는 시딩 보류
+        if dtime(8, 50, 0) <= now_t < dtime(9, 0, 0) or dtime(15, 30, 0) <= now_t < dtime(15, 40, 0):
+            return
         try:
-            ticks = self.api.get_recent_ticks_ka10003(code, limit=60)
+            ticks = self.api.get_recent_ticks_ka10003(code, limit=120)
+            v_ref = self._v_ref_cache.get(code, 5_000_000.0)
+            is_ext_sess = (dtime(8, 0, 0) <= now_t < dtime(8, 50, 0)) or (dtime(15, 40, 0) <= now_t < dtime(20, 0, 0))
+            is_nxt_flag = (pref_ex == "NXT") if pref_ex else (self.get_venue(code) == "NXT" and is_ext_sess)
+            inserted = 0
             if ticks:
-                v_ref = self._v_ref_cache.get(code, 5_000_000.0)
-                self.strength_engine.seed_from_ka10003(code, ticks, v_ref_1m=v_ref, is_nxt=(self.get_venue(code) == "NXT"))
-            self._ka10003_seeded.add(code)
+                inserted = self.strength_engine.seed_from_ka10003(
+                    code,
+                    ticks,
+                    v_ref_1m=v_ref,
+                    now_ts=dt.timestamp(),
+                    is_nxt=is_nxt_flag,
+                    prior_5d_1m_amt=v_ref,
+                )
+            _, sess_open_ts, _, _ = get_session_info(dt.timestamp(), is_nxt=is_nxt_flag)
+            if inserted > 0 or sess_open_ts <= 0.0 or (dt.timestamp() - sess_open_ts) > 240.0:
+                self._ka10003_seeded.add(code)
         except Exception:
             pass
 
@@ -1039,6 +1131,10 @@ class Swing60mBot:
     def run_cycle(self, now_dt: Optional[datetime] = None) -> None:
         now = now_dt or datetime.now()
         self._reset_cond_picks_if_new_day(now)
+        sess_key, _, _, _ = get_session_info(now.timestamp(), is_nxt=False)
+        if self._last_session_key and self._last_session_key != sess_key:
+            self._ka10003_seeded.clear()
+        self._last_session_key = sess_key
         holdings = self.api.get_account_holdings() or {}
         time.sleep(0.35)
 
@@ -1138,7 +1234,6 @@ class Swing60mBot:
             venue = info["venue"]
             tradable, sess_label, pref_ex = get_venue_session_state(venue, now, self.allow_krx_aftermarket)
 
-            self._seed_ka10003_if_needed(code)
             df_daily = self._get_daily_df(code)
             df_60m = self._get_60m_df(code)
 
@@ -1147,12 +1242,15 @@ class Swing60mBot:
                 cur_px = float(df_60m["close"].iloc[-1])
 
             d_metrics = calculate_daily_seryek_gijun_lines(df_daily, current_price=cur_px)
+            if d_metrics["prev5_tv_eok"] > 0:
+                self._v_ref_cache[code] = (d_metrics["prev5_tv_eok"] * 1e8) / 390.0
+
+            # 반드시 일봉 기반 _v_ref_cache 계산 후에 ka10003 시딩 호출!
+            self._seed_ka10003_if_needed(code, now_dt=now, pref_ex=pref_ex)
+
             sig60 = evaluate_60m_signals(df_60m, current_price=cur_px, now_dt=now)
             if not sig60["valid"]:
                 continue
-
-            if d_metrics["prev5_tv_eok"] > 0:
-                self._v_ref_cache[code] = (d_metrics["prev5_tv_eok"] * 1e8) / 390.0
 
             last_daily_dt = ""
             if not df_daily.empty and "date" in df_daily.columns:
@@ -1167,17 +1265,27 @@ class Swing60mBot:
             day_ret_pct = ((sig60["price"] - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
             cond_ok, cond_tag = self._evaluate_condition_gate(code, venue, now, d_metrics, day_ret_pct)
 
+            v_ref_val = self._v_ref_cache.get(code, 5_000_000.0)
+            rvp_ts = now.timestamp() if now_dt is not None else time.time()
             rvp_raw = self.strength_engine.evaluate_entry_strength(
                 code,
                 df_1m=None,
-                v_ref_1m=self._v_ref_cache.get(code, 5_000_000.0),
+                v_ref_1m=v_ref_val,
                 is_nxt=(venue == "NXT" and pref_ex == "NXT"),
-                now_ts=time.time(),
+                now_ts=rvp_ts,
+                prior_5d_1m_amt=v_ref_val,
             )
+            rvp_valid = bool(rvp_raw.get("rvp_valid", rvp_raw.get("source") == "LIVE_WS"))
+            rvp60 = float(rvp_raw.get("rvp_60s", 100.0) or 100.0)
+            rvp180 = float(rvp_raw.get("rvp_180s", 100.0) or 100.0)
+            net_buy_3m = float(rvp_raw.get("net_buy_3m", 0.0) or 0.0)
+            live_ticks_cnt = int(rvp_raw.get("live_ticks", 0) or 0)
+            live_cov_sec = float(rvp_raw.get("live_coverage_sec", 0.0) or 0.0)
             rvp_info = {
-                "rvp_valid": (rvp_raw.get("source") == "LIVE_WS"),
-                "rvp60": float(rvp_raw.get("rvp_60s", 100.0) or 100.0),
-                "rvp180": float(rvp_raw.get("rvp_180s", 100.0) or 100.0),
+                "rvp_valid": rvp_valid,
+                "rvp60": rvp60,
+                "rvp180": rvp180,
+                "net_buy_3m": net_buy_3m,
             }
             scores = score_60m_entry_candidate(day_ret_pct, d_metrics, sig60, rvp_info=rvp_info)
 
@@ -1186,7 +1294,11 @@ class Swing60mBot:
                 if sig60["is_entry_gc_ready"]
                 else (f"GC지남({sig60['gc_bars_ago']}봉)" if sig60["is_gc_bull"] else f"60m DC({sig60['gap_pct']:+.2f}%)")
             )
-            rvp_str = f"RVP:{rvp_info.get('rvp60', 0):.0f}%" if rvp_info.get("rvp_valid") else "RVP:대기"
+            rvp_str = (
+                f"RVP:{rvp60:.0f}%({live_ticks_cnt}t/{live_cov_sec:.0f}s)"
+                if rvp_valid
+                else f"RVP:대기({live_ticks_cnt}/5t,{live_cov_sec:.0f}/30s)"
+            )
             logger.info(
                 f"  · [{name}({code})][{venue}{'(거래가능)' if tradable else '(대기:'+sess_label+')'}][{cond_tag}] "
                 f"총점:{scores['total']:5.1f} [상승{scores['score_ret']:.0f}·대금{scores['score_tv']:.0f}·일봉{scores['score_daily']:.0f}·수급{scores['score_flow']:.0f}] | "
@@ -1195,11 +1307,27 @@ class Swing60mBot:
                 f"{gc_tag} | {rvp_str}"
             )
 
-            # 매수 자격: 현재 세션 거래 가능 + 조건검색(또는 폴백) 통과 + 60m TEMA 5-20 신규 GC + 명백한 매도 투매(RVP < 70%) 아님
+            # 매수 자격: 거래 가능 + 조건검색(또는 폴백) + 60m TEMA 5-20 신규 GC + 장초반 안정화 + RVP Hard Gate + 수급 약세/감속 방어
             if not tradable or not cond_ok or not sig60["is_entry_gc_ready"]:
                 continue
-            if rvp_info.get("rvp_valid") and max(rvp_info.get("rvp60", 0), rvp_info.get("rvp180", 0)) < 70.0:
-                logger.info(f"    ⏭️ [{name}] 60m GC 발생했으나 체결강도 약세(RVP < 70%)로 관망")
+
+            stab_blocked, stab_reason = get_open_stabilization_block(now, venue)
+            if stab_blocked:
+                logger.info(f"    ⏭️ [{name}] 60m GC 대기 ({stab_reason})")
+                continue
+
+            if not rvp_valid:
+                logger.info(
+                    f"    ⏭️ [{name}] 60m GC 발생했으나 RVP 워밍업 미충족"
+                    f"({live_ticks_cnt}/5틱 · {live_cov_sec:.0f}/30s) — Hard Gate 대기"
+                )
+                continue
+
+            if rvp60 < 75.0 or (rvp60 < rvp180 * 0.90 and net_buy_3m <= 0.0):
+                logger.info(
+                    f"    ⏭️ [{name}] 60m GC 발생했으나 체결강도 약세/감속"
+                    f"(RVP60:{rvp60:.0f}% · RVP180:{rvp180:.0f}% · 순매수:{net_buy_3m/1e6:+.1f}M)로 관망"
+                )
                 continue
 
             gc_candidates.append({

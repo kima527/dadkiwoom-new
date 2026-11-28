@@ -548,6 +548,7 @@ class KiwoomWebSocketClient:
                                         
                         elif name == '주식체결':
                             raw_code = str(values.get('9001') or data_item.get('item') or '')
+                            tick_exch = 'NXT' if '_NX' in raw_code else 'KRX'
                             code = self._clean_stock_code(raw_code) # 종목코드
                             if not code or not code.isalnum() or code == "000000":
                                 continue
@@ -562,13 +563,14 @@ class KiwoomWebSocketClient:
                                 chegyul_gangdo = abs(float(str(values.get('228', 0) or 0).lstrip('+-') or 0))
                                 ask1 = abs(float(str(values.get('27', 0) or 0).lstrip('+-') or 0))
                                 bid1 = abs(float(str(values.get('28', 0) or 0).lstrip('+-') or 0))
-                                if (ask1 <= 0 or bid1 <= 0) and code in self._last_orderbook:
-                                    ob_ref = self._last_orderbook[code]
+                                ob_key = (code, tick_exch)
+                                if (ask1 <= 0 or bid1 <= 0) and ob_key in self._last_orderbook:
+                                    ob_ref = self._last_orderbook[ob_key]
                                     if (time.time() - ob_ref.get('ts', 0.0)) <= 15.0:
                                         ask1 = ask1 or float(ob_ref.get('ask1', 0.0) or 0.0)
                                         bid1 = bid1 or float(ob_ref.get('bid1', 0.0) or 0.0)
 
-                                prev_st = self._last_tick_state.get(code, {})
+                                prev_st = self._last_tick_state.get(ob_key, {})
                                 prev_price = float(prev_st.get('price', 0.0) or 0.0)
                                 prev_is_buy = bool(prev_st.get('is_buy', True))
 
@@ -590,12 +592,13 @@ class KiwoomWebSocketClient:
                                     is_buy = prev_is_buy
 
                                 if current_price > 0:
-                                    self._last_tick_state[code] = {'price': current_price, 'is_buy': is_buy}
+                                    self._last_tick_state[ob_key] = {'price': current_price, 'is_buy': is_buy}
                                 tick_amount = current_price * tick_qty
                                 
                                 if current_price > 0 and self.on_real_tick:
                                     tick_data = {
                                         'code': code,
+                                        'exchange': tick_exch,
                                         'price': current_price,
                                         'qty': tick_qty,
                                         'amount': tick_amount,
@@ -616,6 +619,7 @@ class KiwoomWebSocketClient:
 
                         elif name in ('주식호가잔량', '호가잔량'):
                             raw_code = str(values.get('9001') or data_item.get('item') or '')
+                            ob_exch = 'NXT' if '_NX' in raw_code else 'KRX'
                             code = self._clean_stock_code(raw_code)
                             if not code or not code.isalnum() or code == "000000":
                                 continue
@@ -623,9 +627,9 @@ class KiwoomWebSocketClient:
                                 ask1 = abs(float(str(values.get('41', values.get('27', 0)) or 0).lstrip('+-') or 0))
                                 bid1 = abs(float(str(values.get('51', values.get('28', 0)) or 0).lstrip('+-') or 0))
                                 if ask1 > 0 or bid1 > 0:
-                                    self._last_orderbook[code] = {'ask1': ask1, 'bid1': bid1, 'ts': time.time()}
+                                    self._last_orderbook[(code, ob_exch)] = {'ask1': ask1, 'bid1': bid1, 'ts': time.time()}
                                     if self.on_orderbook:
-                                        ob_data = {'code': code, 'ask1': ask1, 'bid1': bid1}
+                                        ob_data = {'code': code, 'exchange': ob_exch, 'ask1': ask1, 'bid1': bid1}
                                         if asyncio.iscoroutinefunction(self.on_orderbook):
                                             asyncio.create_task(self.on_orderbook(ob_data))
                                         else:
