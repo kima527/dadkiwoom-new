@@ -290,7 +290,13 @@ def test_swing60m_condition_search_regular_and_fallback():
     class _DummyWS:
         target_condition_map = {"12": "Swing60m"}
 
-    fake_api = _FakeAPI()
+    class _FakeAPIWithExtGC(_FakeAPI):
+        def get_60m_candles(self, code):
+            if code == "005930":
+                return self.m60_gc.copy()
+            return super().get_60m_candles(code)
+
+    fake_api = _FakeAPIWithExtGC()
     bot = Swing60mBot(dry_run=False, enable_ws=False, api=fake_api, condition_name="Swing60m")
     bot._clear_active_position()
     bot.ws_client = _DummyWS()
@@ -305,12 +311,14 @@ def test_swing60m_condition_search_regular_and_fallback():
     bot.run_cycle(now_dt=dt_0930)
     assert len(fake_api.orders) == 0, f"Must wait while Swing60m has 0 active matches: {fake_api.orders}"
 
-    # 2) Swing60m 에 비-마커 종목(005930) 편입 시 계좌 보유 0주여도 감시풀에 자동 합류
+    # 2) Swing60m 에 비-마커 0주 외부 종목(005930, 심지어 60m GC)이 편입돼도 감시풀 합류 및 매수 절대 차단!
     bot._on_cond_insert("005930", "Swing60m")
     uni = bot._get_watched_universe(fake_api.get_account_holdings())
-    assert "005930" in uni and uni["005930"]["held_qty"] == 0
+    assert "005930" not in uni, f"0-share uncurated stock must NEVER enter watched universe: {list(uni)}"
+    bot.run_cycle(now_dt=dt_0930)
+    assert len(fake_api.orders) == 0, f"0-share stock from Swing60m must never be bought: {fake_api.orders}"
 
-    # 3) 라온시큐어(042510)가 Swing60m 편입되면(단 005930은 60m DC 가정) 라온시큐어 즉시 풀매수
+    # 3) 기존 감시 마커 라온시큐어(042510)가 Swing60m 편입되면 라온시큐어 즉시 풀매수
     bot._on_cond_insert("042510", "Swing60m")
     bot.run_cycle(now_dt=dt_0930)
     assert len(fake_api.orders) == 1 and fake_api.orders[0][1] == "042510", f"Expected 042510 entry via Swing60m: {fake_api.orders}"

@@ -2,8 +2,8 @@
 swing_60m_bot.py - 계좌 1주 마커 감시종목 + HTS 조건검색식 `Swing60m` 전용 60분봉 TEMA 5-20 1종목 풀매수/전량매도 봇
 
 [핵심 매매 규칙]
-1. 감시 대상: HTS 조건검색식 `Swing60m`(일 SMA3>5 & 전일종가<현재가 & 1분 체결강도>=100) + 계좌 보유 마커 + `swing_60m_watchlist.json`
-   - 정규장(09:00~15:30) `Swing60m` 서버 연동 활성 시: 조건검색 편입(`active=True`) 종목만 신규 진입 허용(미편입 종목은 자동 관망)
+1. 감시 대상: 계좌 보유 마커(1주+) + `swing_60m_watchlist.json` 9종목 고정 감시 풀 (HTS 조건검색 `Swing60m` 은 감시 풀 내 종목 교집합 필터로만 사용하며 0주 미보유 외부 종목은 절대 합류시키지 않음)
+   - 정규장(09:00~15:30) `Swing60m` 서버 연동 활성 시: 감시 풀 종목 중 `Swing60m` 편입(`active=True`) 종목만 신규 진입 허용(미편입 종목은 관망)
    - 프리/애프터장(08:00~08:50, 15:40~20:00) 또는 조건검색 미등록/오프라인 시: 9종목 감시 풀 + 자체(일 SMA3>5 & 전일종가<현재가) 필터 자동 폴백
    - KRX 전용(042510 라온시큐어, 281740 레이크머티리얼즈, 340450 지씨지놈):
      * 08:00~08:59 프리마켓 제외, 09:00 정규장부터 매매(15:40~20:00 애프터장은 SOR 자동 라우팅)
@@ -542,6 +542,7 @@ class Swing60mBot:
         self._daily_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._m60_cache: Dict[str, Tuple[float, int, pd.DataFrame]] = {}
         self._ka10003_seeded: set[str] = set()
+        self._held_codes: set[str] = set()
         self._cond_lock = threading.Lock()
         self.cond_picks: Dict[str, Dict[str, Any]] = {}
         self._cond_date: str = datetime.now().strftime("%Y%m%d")
@@ -596,7 +597,7 @@ class Swing60mBot:
                 self._cond_date = cur_date
 
     def _on_cond_insert(self, code: str, cond_name: str = "") -> None:
-        """HTS 조건검색 편입 콜백 (WS 스레드에서 호출됨 — 비블로킹 유지)"""
+        """HTS 조건검색 편입 콜백 (WS 스레드에서 호출됨 — 비블로킹 유지, 0주 외부 종목은 감시풀 제외)"""
         cc = normalize_code(code)
         if not cc:
             return
@@ -611,7 +612,10 @@ class Swing60mBot:
                 "first_inserted_at": float(prev.get("first_inserted_at") or now_ts),
                 "inserted_at": now_ts,
             }
-        logger.info(f"📡 [{label}] 조건검색 편입: {cc}")
+        if cc in self.krx_map or cc in self.nxt_map or cc in self._held_codes:
+            logger.info(f"📡 [{label}] 감시종목 조건검색 편입: {cc}")
+        else:
+            logger.debug(f"📡 [{label}] 미관리 0주 종목 편입 수신(감시풀 합류 차단): {cc}")
 
     def _on_cond_delete(self, code: str, cond_name: str = "") -> None:
         """HTS 조건검색 이탈 콜백 — 신규 진입 후보에서만 제외하며 보유 포지션 청산 추적을 끊지 않음"""
@@ -631,7 +635,10 @@ class Swing60mBot:
                     "active": False,
                     "deleted_at": time.time(),
                 }
-        logger.info(f"📡 [{label}] 조건검색 이탈(보유 시 60m 청산감시 유지): {cc}")
+        if cc in self.krx_map or cc in self.nxt_map or cc in self._held_codes:
+            logger.info(f"📡 [{label}] 감시종목 조건검색 이탈(보유 시 60m 청산감시 유지): {cc}")
+        else:
+            logger.debug(f"📡 [{label}] 미관리 0주 종목 이탈 수신: {cc}")
 
     def _is_condition_stream_ready(self) -> bool:
         """키움 WS에 목표 조건식이 등록되었거나 실시간 포착 이력이 있는지 반환"""
@@ -762,18 +769,20 @@ class Swing60mBot:
         return "KRX"
 
     def _get_watched_universe(self, holdings: Dict[str, dict]) -> Dict[str, dict]:
-        """계좌 보유 마커 종목 + 설정 9종목 + 조건검색 `Swing60m` 실시간 편입 종목 통합 감시 풀 구성"""
+        """계좌 보유 마커(1주+) 종목 + 설정 9종목 감시 풀 구성 (0주 외부 종목은 조건검색으로 합류하지 않음)"""
         universe: Dict[str, dict] = {}
         for code, name in self.nxt_map.items():
             universe[code] = {"code": code, "name": name, "venue": "NXT", "held_qty": 0, "current_price": 0.0}
         for code, name in self.krx_map.items():
             universe[code] = {"code": code, "name": name, "venue": "KRX", "held_qty": 0, "current_price": 0.0}
 
+        held_codes: set[str] = set()
         for raw_c, h in (holdings or {}).items():
             cc = normalize_code(raw_c)
             qty = int(h.get("qty", 0) or 0)
             if qty <= 0:
                 continue
+            held_codes.add(cc)
             venue = self.get_venue(cc)
             if cc in universe:
                 universe[cc]["held_qty"] = qty
@@ -788,23 +797,7 @@ class Swing60mBot:
                     "held_qty": qty,
                     "current_price": float(h.get("current_price", 0) or 0),
                 }
-
-        with self._cond_lock:
-            active_conds = [c for c, item in self.cond_picks.items() if item.get("active", False)]
-        for cc in active_conds:
-            if cc not in universe:
-                venue = self.get_venue(cc)
-                name = cc
-                h_info = holdings.get(cc) if isinstance(holdings, dict) else None
-                if h_info and h_info.get("name"):
-                    name = str(h_info["name"])
-                universe[cc] = {
-                    "code": cc,
-                    "name": name,
-                    "venue": venue,
-                    "held_qty": int((h_info or {}).get("qty", 0) or 0),
-                    "current_price": float((h_info or {}).get("current_price", 0) or 0),
-                }
+        self._held_codes = held_codes
         return universe
 
     def _sync_ws_stream(self, universe: Dict[str, dict], now_dt: datetime) -> None:
@@ -1130,8 +1123,8 @@ class Swing60mBot:
             mode_desc = "조건미사용(감시풀 전체)"
         elif self.strict_condition or (cond_stream_ready and in_reg):
             with self._cond_lock:
-                n_act = sum(1 for v in self.cond_picks.values() if v.get("active", False))
-            mode_desc = f"HTS 조건식 '{self.condition_name}' 실시간 연동(편입 {n_act}종목)"
+                n_act = sum(1 for c, v in self.cond_picks.items() if v.get("active", False) and c in universe)
+            mode_desc = f"HTS 조건식 '{self.condition_name}' 실시간 교집합(감시풀 내 편입 {n_act}종목)"
         else:
             mode_desc = f"시간외/오프라인 자동 폴백(자체 일봉 SMA3>5 & 상승 + '{self.condition_name}')"
 
